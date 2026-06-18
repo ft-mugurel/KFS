@@ -1,39 +1,39 @@
 pub mod printk;
 
-pub use printk::{log_level, set_log_level, KernelLogLevel};
+pub use printk::{set_log_level, KernelLogLevel};
 
 #[macro_export]
 macro_rules! printk {
 	($($arg:tt)*) => {
-		$crate::printk::printk::printk_level_to_default($crate::printk::printk::KernelLogLevel::Info, core::format_args!($($arg)*))
+		$crate::printk::printk::printk_level_to_default($crate::printk::printk::KernelLogLevel::Info, &core::format_args!($($arg)*))
 	};
 }
 
 #[macro_export]
 macro_rules! printk_level {
 	($level:expr, $($arg:tt)*) => {
-		$crate::printk::printk::printk_level_to_default($level, core::format_args!($($arg)*))
+		$crate::printk::printk::printk_level_to_default($level, &core::format_args!($($arg)*))
 	};
 }
 
 #[macro_export]
 macro_rules! printk_level_on {
 	($screen_index:expr, $level:expr, $($arg:tt)*) => {
-		$crate::printk::printk::printk_level_to_screen($screen_index, $level, core::format_args!($($arg)*))
+		$crate::printk::printk::printk_level_to_screen($screen_index, $level, &core::format_args!($($arg)*))
 	};
 }
 
 #[macro_export]
 macro_rules! printk_on {
 	($screen_index:expr, $($arg:tt)*) => {
-		$crate::printk::printk::printk_level_to_screen($screen_index, $crate::printk::printk::KernelLogLevel::Info, core::format_args!($($arg)*))
+		$crate::printk::printk::printk_level_to_screen($screen_index, $crate::printk::printk::KernelLogLevel::Info, &core::format_args!($($arg)*))
 	};
 }
 
 #[macro_export]
 macro_rules! pr_debug {
 	($($arg:tt)*) => {
-		$crate::printk::printk::printk_to_debug(core::format_args!($($arg)*))
+		$crate::printk::printk::printk_to_debug(&core::format_args!($($arg)*))
 	};
 }
 

@@ -14,7 +14,6 @@ use crate::x86;
 pub const PAGE_SIZE: usize = 4096;
 pub const USER_SPACE_START: usize = 0x0000_1000;
 pub const KERNEL_SPACE_START: usize = 0xC000_0000;
-pub const USER_SPACE_END: usize = KERNEL_SPACE_START - 1;
 
 fn test_start(name: &str) {
     pr_debug!(

@@ -2,4 +2,8 @@ pub mod keyboard;
 pub mod exceptions;
 pub mod idt;
 pub mod pic;
+pub mod pit;
+pub mod syscalls;
+pub mod task_queue;
+pub mod timer;
 pub mod utils;

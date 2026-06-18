@@ -73,13 +73,26 @@ unsafe extern "C" {
     fn isr_exception_31();
 }
 
-fn is_non_fatal_exception(vector: usize) -> bool {
-    // Let debug traps return so in-kernel diagnostics can continue.
+#[inline(always)]
+const fn is_non_fatal_exception(vector: usize) -> bool {
     matches!(vector, 1 | 3)
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Registers {
+    pub edi: u32,
+    pub esi: u32,
+    pub ebp: u32,
+    pub esp: u32,
+    pub ebx: u32,
+    pub edx: u32,
+    pub ecx: u32,
+    pub eax: u32,
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn exception_common_handler(vector: u32) {
+pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Registers) {
     let idx = vector as usize;
     let name = EXCEPTION_NAMES
         .get(idx)
@@ -88,7 +101,7 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32) {
 
     if idx == 14 {
         let fault_addr = x86::read_cr2();
-        pr_err!("EXCEPTION #{}: {} (cr2={:#x})\n", idx, name, fault_addr);
+        pr_emerg!("EXCEPTION #{}: {} (cr2={:#x})\n", idx, name, fault_addr);
     } else if is_non_fatal_exception(idx) {
         pr_warn!("EXCEPTION #{}: {} (continuing)\n", idx, name);
         return;
@@ -99,7 +112,26 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32) {
     pr_emerg!("fatal CPU exception, halting kernel\n");
     x86::disable_interrupts();
     text_mod::out::switch_screen(DEFAULT_LOG_SCREEN);
-    x86::hlt_loop();
+
+    if !regs.is_null() {
+        let r = &*regs;
+        pr_emerg!(
+            r#"Registers:
+            EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}
+            ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}
+        "#,
+            r.eax,
+            r.ebx,
+            r.ecx,
+            r.edx,
+            r.esi,
+            r.edi,
+            r.ebp,
+            r.esp
+        );
+    }
+    crate::panic::save_stack_trace();
+    crate::panic::clean_registers_and_halt();
 }
 
 pub fn init_exceptions() {

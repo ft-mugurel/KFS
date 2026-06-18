@@ -19,24 +19,7 @@ pub enum KernelLogLevel {
     Debug = 7,
 }
 
-#[allow(non_camel_case_types)]
-pub type KERNEL_LOG_LEVEL = KernelLogLevel;
-
-fn level_from_u8(level: u8) -> KernelLogLevel {
-    match level {
-        0 => KernelLogLevel::Emerg,
-        1 => KernelLogLevel::Alert,
-        2 => KernelLogLevel::Crit,
-        3 => KernelLogLevel::Err,
-        4 => KernelLogLevel::Warning,
-        5 => KernelLogLevel::Notice,
-        6 => KernelLogLevel::Info,
-        7 => KernelLogLevel::Debug,
-        _ => KernelLogLevel::Info,
-    }
-}
-
-fn level_tag(level: KernelLogLevel) -> &'static str {
+const fn level_tag(level: KernelLogLevel) -> &'static str {
     match level {
         KernelLogLevel::Emerg => "[\x1B\x0F;\x14mEMERG\x1Bm] ",
         KernelLogLevel::Alert => "[\x1B\x0F;\x16mALERT\x1Bm] ",
@@ -53,10 +36,6 @@ pub fn set_log_level(level: KernelLogLevel) {
     LOG_LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
-pub fn log_level() -> KernelLogLevel {
-    level_from_u8(LOG_LEVEL.load(Ordering::Relaxed))
-}
-
 fn is_enabled(level: KernelLogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(Ordering::Relaxed)
 }
@@ -64,7 +43,7 @@ fn is_enabled(level: KernelLogLevel) -> bool {
 pub fn printk_level_to_screen(
     screen_index: usize,
     level: KernelLogLevel,
-    args: fmt::Arguments<'_>,
+    args: &fmt::Arguments<'_>,
 ) {
     if !is_enabled(level) {
         return;
@@ -73,7 +52,7 @@ pub fn printk_level_to_screen(
     out::write_fmt_on(screen_index, args);
 }
 
-pub fn printk_level_to_default(level: KernelLogLevel, args: fmt::Arguments<'_>) {
+pub fn printk_level_to_default(level: KernelLogLevel, args: &fmt::Arguments<'_>) {
     if !is_enabled(level) {
         return;
     }
@@ -85,15 +64,12 @@ pub fn printk_level_to_default(level: KernelLogLevel, args: fmt::Arguments<'_>) 
     out::write_fmt_on(startup_config::logging::DEFAULT_LOG_SCREEN, args);
 }
 
-pub fn printk_to_screen(screen_index: usize, args: fmt::Arguments<'_>) {
+#[allow(dead_code)]
+pub fn printk_to_screen(screen_index: usize, args: &fmt::Arguments<'_>) {
     printk_level_to_screen(screen_index, KernelLogLevel::Info, args);
 }
 
-pub fn printk_to_default(args: fmt::Arguments<'_>) {
-    printk_level_to_default(KernelLogLevel::Info, args);
-}
-
-pub fn printk_to_debug(args: fmt::Arguments<'_>) {
+pub fn printk_to_debug(args: &fmt::Arguments<'_>) {
     let screen_index = if is_enabled(KernelLogLevel::Debug) {
         startup_config::logging::DEFAULT_LOG_SCREEN
     } else {

@@ -17,6 +17,7 @@ pub(super) const SCREEN_CONTENT_HEIGHT: usize = startup_config::vga::CONTENT_HEI
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CursorMovement {
+    #[allow(dead_code)]
     None = 0x00,
     Horizontal = 0x01,
     Vertical = 0x02,

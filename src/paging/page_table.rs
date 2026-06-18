@@ -194,7 +194,7 @@ pub fn map_page(virt_addr: u32, phys_addr: u32, flags: u32) -> Result<(), &'stat
     unsafe {
         let entry_ptr = get_page_entry_ptr(virt_addr)?;
         entry_ptr.write((phys_addr & PAGE_FRAME_MASK) | (flags | PAGE_PRESENT));
-        x86::write_cr3(x86::read_cr3());
+        x86::invalidate_page(virt_addr);
     }
 
     pr_debug!(
@@ -239,6 +239,7 @@ pub fn get_page(virt_addr: u32) -> Option<u32> {
     }
 }
 
+#[allow(dead_code)]
 pub fn unmap_page_bootstrap(virt_addr: u32) -> Result<(), &'static str> {
     let pde = pde_index(virt_addr);
     if pde != 0 && pde != kernel_pd_index() {
@@ -270,7 +271,7 @@ pub fn unmap_page(virt_addr: u32) -> Result<(), &'static str> {
         }
 
         entry_ptr.write(0);
-        x86::write_cr3(x86::read_cr3());
+        x86::invalidate_page(virt_addr);
     }
 
     pr_debug!("unmap_page: va={:#x}\n", virt_addr);

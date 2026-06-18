@@ -59,6 +59,7 @@ pub enum KeyCode {
     RightAlt,
     LeftSuper,
     RightSuper,
+    AltGr,
     CapsLock,
     ArrowUp,
     ArrowDown,
@@ -98,6 +99,7 @@ impl Modifiers {
     const ALT: u16 = 1 << 2;
     const SUPER: u16 = 1 << 3;
     const CAPS_LOCK: u16 = 1 << 4;
+    const ALT_GR: u16 = 1 << 5;
 
     pub const fn empty() -> Self {
         Self(0)
@@ -123,8 +125,12 @@ impl Modifiers {
         (self.0 & Self::CAPS_LOCK) != 0
     }
 
+    pub fn alt_gr(self) -> bool {
+        (self.0 & Self::ALT_GR) != 0
+    }
+
     pub fn has_text_blocking_modifier(self) -> bool {
-        self.ctrl() || self.alt() || self.super_key()
+        self.ctrl() || self.alt() || self.super_key() || self.alt_gr()
     }
 
     fn set_flag(&mut self, flag: u16, enabled: bool) {
@@ -156,6 +162,9 @@ impl Modifiers {
             KeyCode::CapsLock if event.pressed => {
                 self.toggle_flag(Self::CAPS_LOCK);
             }
+            KeyCode::AltGr if event.pressed => {
+                self.set_flag(Self::ALT_GR, event.pressed);
+            }
             _ => {}
         }
     }
@@ -183,6 +192,7 @@ pub fn decode_set1_scancode(scancode: u8, extended: bool) -> Option<KeyEvent> {
             0x38 => KeyCode::RightAlt,
             0x5B => KeyCode::LeftSuper,
             0x5C => KeyCode::RightSuper,
+            0x5D => KeyCode::AltGr,
             _ => return None,
         }
     } else {
@@ -242,6 +252,7 @@ pub fn decode_set1_scancode(scancode: u8, extended: bool) -> Option<KeyEvent> {
             0x36 => KeyCode::RightShift,
             0x1D => KeyCode::LeftCtrl,
             0x38 => KeyCode::LeftAlt,
+            0x5D => KeyCode::AltGr,
             0x3A => KeyCode::CapsLock,
             0x3B => KeyCode::F1,
             0x3C => KeyCode::F2,

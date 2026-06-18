@@ -166,9 +166,3 @@ pub(super) fn write_char_on(screen: &mut screen::VirtualScreen, c: char) {
     let outcome = write_raw_byte(screen, byte);
     finalize_write(screen, top_line_before, outcome);
 }
-
-pub(super) fn newline_on(screen: &mut screen::VirtualScreen) {
-    let top_line_before = screen::visible_top_line_of(screen);
-    let outcome = write_raw_byte(screen, b'\n');
-    finalize_write(screen, top_line_before, outcome);
-}

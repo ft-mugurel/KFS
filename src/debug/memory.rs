@@ -5,7 +5,7 @@ use crate::paging::{kernel_heap, page_table, physical, vmem};
 pub const MEMDUMP_DEFAULT_LEN: usize = 128;
 pub const MEMDUMP_MAX_LEN: usize = 512;
 
-pub fn print_memstat(mut emit: impl FnMut(fmt::Arguments<'_>)) {
+pub fn print_memstat(mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     let total_pages = physical::total_physical_pages();
     let free_pages = physical::free_physical_pages();
     let used_pages = total_pages.saturating_sub(free_pages);
@@ -16,11 +16,11 @@ pub fn print_memstat(mut emit: impl FnMut(fmt::Arguments<'_>)) {
     let vstats = vmem::debug_stats();
     let hstats = kernel_heap::debug_stats();
 
-    emit(format_args!(
+    emit(&format_args!(
         "physical: total_pages={} free_pages={} used_pages={} total_kib={} free_kib={}\n",
         total_pages, free_pages, used_pages, total_phys_kib, free_phys_kib
     ));
-    emit(format_args!(
+    emit(&format_args!(
         "vmem: range=[{:#010x}, {:#010x}) total_kib={} free_kib={} allocs={} alloc_bytes={} free_ranges={}\n",
         vstats.range_start,
         vstats.range_end,
@@ -30,60 +30,61 @@ pub fn print_memstat(mut emit: impl FnMut(fmt::Arguments<'_>)) {
         vstats.alloc_bytes,
         vstats.free_ranges
     ));
-    emit(format_args!(
-        "kheap: ready={} chunks={} chunk_bytes={} free_blocks={} free_bytes={} used_blocks={} used_req_bytes={}\n",
+    emit(&format_args!(
+        "kheap: ready={} chunks={} chunk_bytes={} free_blocks={} free_bytes={} used_blocks={} used_req_bytes={} used_usable_bytes={}\n",
         hstats.ready,
         hstats.chunk_count,
         hstats.chunk_bytes,
         hstats.free_block_count,
         hstats.free_bytes,
         hstats.used_block_count,
-        hstats.used_requested_bytes
+        hstats.used_requested_bytes,
+        hstats.used_usable_bytes
     ));
 }
 
-pub fn print_memdebug(mut emit: impl FnMut(fmt::Arguments<'_>)) {
+pub fn print_memdebug(mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     print_memstat(&mut emit);
 
-    emit(format_args!("vmem active allocations:\n"));
+    emit(&format_args!("vmem active allocations:\n"));
     let mut alloc_count = 0usize;
     vmem::debug_for_each_alloc(|base, size, pages| {
         alloc_count += 1;
-        emit(format_args!(
+        emit(&format_args!(
             "  alloc#{:02} base={:#010x} size={} pages={}\n",
             alloc_count, base, size, pages
         ));
     });
     if alloc_count == 0 {
-        emit(format_args!("  (none)\n"));
+        emit(&format_args!("  (none)\n"));
     }
 
-    emit(format_args!("vmem free ranges:\n"));
+    emit(&format_args!("vmem free ranges:\n"));
     let mut free_count = 0usize;
     vmem::debug_for_each_free_range(|base, size| {
         free_count += 1;
         let end = base.saturating_add(size);
-        emit(format_args!(
+        emit(&format_args!(
             "  range#{:02} [{:#010x}, {:#010x}) size={}\n",
             free_count, base, end, size
         ));
     });
     if free_count == 0 {
-        emit(format_args!("  (none)\n"));
+        emit(&format_args!("  (none)\n"));
     }
 }
 
-pub fn debug_page_entry(addr: u32, mut emit: impl FnMut(fmt::Arguments<'_>)) {
+pub fn debug_page_entry(addr: u32, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     let page_base = addr & 0xFFFF_F000;
     match page_table::get_page(page_base) {
         Some(entry) => {
             let phys = entry & 0xFFFF_F000;
             let flags = entry & 0x0000_0FFF;
-            emit(format_args!(
+            emit(&format_args!(
                 "pte: va={:#010x} page={:#010x} entry={:#010x} pa={:#010x} flags={:#05x}\n",
                 addr, page_base, entry, phys, flags
             ));
-            emit(format_args!(
+            emit(&format_args!(
                 "  present={} writable={} user={} huge={}\n",
                 (entry & page_table::PAGE_PRESENT) != 0,
                 (entry & page_table::PAGE_WRITABLE) != 0,
@@ -92,7 +93,7 @@ pub fn debug_page_entry(addr: u32, mut emit: impl FnMut(fmt::Arguments<'_>)) {
             ));
         }
         None => {
-            emit(format_args!(
+            emit(&format_args!(
                 "pte: va={:#010x} page={:#010x} not mapped\n",
                 addr, page_base
             ));
@@ -100,16 +101,16 @@ pub fn debug_page_entry(addr: u32, mut emit: impl FnMut(fmt::Arguments<'_>)) {
     }
 }
 
-pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(fmt::Arguments<'_>)) {
+pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     let end_addr = match (start_addr as usize).checked_add(len) {
         Some(v) if v <= u32::MAX as usize => v as u32,
         _ => {
-            emit(format_args!("address range overflow\n"));
+            emit(&format_args!("address range overflow\n"));
             return;
         }
     };
 
-    emit(format_args!(
+    emit(&format_args!(
         "memdump: [{:#010x}, {:#010x}) len={}\n",
         start_addr, end_addr, len
     ));
@@ -117,26 +118,26 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(fmt
     let mut offset = 0usize;
     while offset < len {
         let line_addr = start_addr.wrapping_add(offset as u32);
-        emit(format_args!("{:#010x}: ", line_addr));
+        emit(&format_args!("{:#010x}: ", line_addr));
 
         let mut ascii = [b'.'; 16];
         for i in 0usize..16 {
             let pos = offset + i;
             if pos >= len {
-                emit(format_args!("   "));
+                emit(&format_args!("   "));
                 continue;
             }
 
             let byte_addr = start_addr.wrapping_add(pos as u32);
             let page_base = byte_addr & 0xFFFF_F000;
             if page_table::get_page(page_base).is_none() {
-                emit(format_args!("?? "));
+                emit(&format_args!("?? "));
                 ascii[i] = b'?';
                 continue;
             }
 
             let value = unsafe { ptr::read_volatile(byte_addr as *const u8) };
-            emit(format_args!("{:02x} ", value));
+            emit(&format_args!("{:02x} ", value));
             ascii[i] = if value.is_ascii_graphic() || value == b' ' {
                 value
             } else {
@@ -144,21 +145,21 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(fmt
             };
         }
 
-        emit(format_args!(" |"));
+        emit(&format_args!(" |"));
         for i in 0usize..16 {
             let pos = offset + i;
             if pos >= len {
                 break;
             }
-            emit(format_args!("{}", ascii[i] as char));
+            emit(&format_args!("{}", ascii[i] as char));
         }
-        emit(format_args!("|\n"));
+        emit(&format_args!("|\n"));
 
         offset = offset.saturating_add(16);
     }
 }
 
-pub fn run_memtest(features: &str, mut emit: impl FnMut(fmt::Arguments<'_>)) {
+pub fn run_memtest(features: &str, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     let mut run_physical = false;
     let mut run_vmem = false;
     let mut run_heap = false;
@@ -187,15 +188,15 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(fmt::Arguments<'_>)) {
                     run_page = true;
                 }
                 _ => {
-                    emit(format_args!("usage: memtest [physical,vmem,heap,page,all]\n"));
-                    emit(format_args!("unknown feature: {}\n", token));
+                    emit(&format_args!("usage: memtest [physical,vmem,heap,page,all]\n"));
+                    emit(&format_args!("unknown feature: {}\n", token));
                     return;
                 }
             }
         }
     }
 
-    emit(format_args!("memtest: running selected tests\n"));
+    emit(&format_args!("memtest: running selected tests\n"));
 
     let mut total = 0usize;
     let mut passed = 0usize;
@@ -204,9 +205,9 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(fmt::Arguments<'_>)) {
         total += 1;
         if memtest_physical_roundtrip() {
             passed += 1;
-            emit(format_args!("  [PASS] physical\n"));
+            emit(&format_args!("  [PASS] physical\n"));
         } else {
-            emit(format_args!("  [FAIL] physical\n"));
+            emit(&format_args!("  [FAIL] physical\n"));
         }
     }
 
@@ -214,9 +215,9 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(fmt::Arguments<'_>)) {
         total += 1;
         if memtest_vmem_roundtrip() {
             passed += 1;
-            emit(format_args!("  [PASS] vmem\n"));
+            emit(&format_args!("  [PASS] vmem\n"));
         } else {
-            emit(format_args!("  [FAIL] vmem\n"));
+            emit(&format_args!("  [FAIL] vmem\n"));
         }
     }
 
@@ -224,9 +225,9 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(fmt::Arguments<'_>)) {
         total += 1;
         if memtest_heap_roundtrip() {
             passed += 1;
-            emit(format_args!("  [PASS] heap\n"));
+            emit(&format_args!("  [PASS] heap\n"));
         } else {
-            emit(format_args!("  [FAIL] heap\n"));
+            emit(&format_args!("  [FAIL] heap\n"));
         }
     }
 
@@ -234,13 +235,13 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(fmt::Arguments<'_>)) {
         total += 1;
         if memtest_page_roundtrip() {
             passed += 1;
-            emit(format_args!("  [PASS] page\n"));
+            emit(&format_args!("  [PASS] page\n"));
         } else {
-            emit(format_args!("  [FAIL] page\n"));
+            emit(&format_args!("  [FAIL] page\n"));
         }
     }
 
-    emit(format_args!(
+    emit(&format_args!(
         "memtest summary: passed={}/{} failed={}\n",
         passed,
         total,

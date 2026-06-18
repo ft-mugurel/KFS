@@ -10,6 +10,7 @@ use crate::interrupts::keyboard::character_map::keycode_to_char;
 use crate::interrupts::keyboard::keycode::{KeyCode, KeyEvent, Modifiers};
 use crate::interrupts::utils::{request_reboot, request_shutdown};
 use crate::printk::{set_log_level, KernelLogLevel};
+use crate::signals::Signal;
 use crate::startup_config;
 use crate::vga::text_mod::out::{
     self, active_screen_accepts_input, change_color, clear, print_char_on, print_on,
@@ -27,6 +28,11 @@ struct ShellState {
     len: usize,
     rendered_len: usize,
     initialized: bool,
+    history: [[u8; MAX_INPUT_LEN]; 16],
+    history_idx: usize,
+    current_history_offset: usize,
+    saved_input: [u8; MAX_INPUT_LEN],
+    saved_len: usize,
 }
 
 impl ShellState {
@@ -37,6 +43,11 @@ impl ShellState {
             len: 0,
             rendered_len: 0,
             initialized: false,
+            history: [[0; MAX_INPUT_LEN]; 16],
+            history_idx: 0,
+            current_history_offset: 0,
+            saved_input: [0; MAX_INPUT_LEN],
+            saved_len: 0,
         }
     }
 
@@ -96,6 +107,80 @@ impl ShellState {
         self.idx += 1;
         true
     }
+    fn add_to_history(&mut self, command: &str) {
+        if command.is_empty() {
+            self.current_history_offset = 0;
+            return;
+        }
+
+        let mut should_add = true;
+        if self.history_idx > 0 {
+            let last_idx = (self.history_idx - 1) % self.history.len();
+            let last_cmd_len = self.history[last_idx]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(MAX_INPUT_LEN);
+            if let Ok(last_cmd_str) = str::from_utf8(&self.history[last_idx][..last_cmd_len]) {
+                if last_cmd_str == command {
+                    should_add = false;
+                }
+            }
+        }
+
+        if should_add {
+            let idx = self.history_idx % self.history.len();
+            self.history[idx].fill(0);
+            let bytes = command.as_bytes();
+            let len = bytes.len().min(MAX_INPUT_LEN);
+            self.history[idx][..len].copy_from_slice(&bytes[..len]);
+            self.history_idx += 1;
+        }
+
+        self.current_history_offset = 0;
+    }
+
+    fn history_up(&mut self) -> bool {
+        let max_offset = self.history_idx.min(self.history.len());
+        if self.history_idx == 0 || self.current_history_offset >= max_offset {
+            return false;
+        }
+
+        if self.current_history_offset == 0 {
+            self.saved_input.copy_from_slice(&self.input);
+            self.saved_len = self.len;
+        }
+
+        let idx = (self.history_idx - 1 - self.current_history_offset) % self.history.len();
+        self.current_history_offset += 1;
+        self.load_from_buffer(self.history[idx]);
+        true
+    }
+
+    fn history_down(&mut self) -> bool {
+        if self.current_history_offset == 0 {
+            return false;
+        }
+
+        if self.current_history_offset == 1 {
+            // Restore the saved un-executed line
+            self.current_history_offset = 0;
+            self.input.copy_from_slice(&self.saved_input);
+            self.len = self.saved_len;
+            self.idx = self.len;
+            return true;
+        }
+
+        self.current_history_offset -= 1;
+        let idx = (self.history_idx - self.current_history_offset) % self.history.len();
+        self.load_from_buffer(self.history[idx]);
+        true
+    }
+
+    fn load_from_buffer(&mut self, buf: [u8; MAX_INPUT_LEN]) {
+        self.input.copy_from_slice(&buf);
+        self.len = buf.iter().position(|&b| b == 0).unwrap_or(MAX_INPUT_LEN);
+        self.idx = self.len;
+    }
 }
 
 struct ShellStateCell(UnsafeCell<ShellState>);
@@ -120,8 +205,17 @@ fn print_char(c: char) {
 }
 
 #[inline]
-fn print_fmt(args: fmt::Arguments<'_>) {
+fn print_fmt(args: &fmt::Arguments<'_>) {
     out::write_fmt_on(SCREEN_INDEX, args);
+}
+
+fn shell_sigint_handler() {
+    print_char('\n');
+    with_shell_state_mut(|state| {
+        state.clear_input();
+        state.current_history_offset = 0;
+    });
+    redraw_input_line();
 }
 
 pub fn init_shell() {
@@ -131,12 +225,16 @@ pub fn init_shell() {
         }
 
         state.initialized = true;
-        print("This is the default screen for the shell\n");
-        print("Use F1-F6 / Shift+<Left/Right Arrow> to switch screens.\n");
+        print(
+            "This is the default screen for the shell \n\
+            Use F1-F6 / Shift+<Left/Right Arrow> to switch screens.\n",
+        );
         print(PROMPT);
         state.rendered_len = PROMPT.len();
         set_cursor_movement_on(SCREEN_INDEX, screen::CursorMovement::Horizontal);
     });
+
+    crate::signals::register_signal_handler(Signal::SIGINT, shell_sigint_handler);
 }
 
 pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
@@ -175,6 +273,20 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
             }
             true
         }
+        KeyCode::ArrowUp => {
+            let changed = with_shell_state_mut(|state| state.history_up());
+            if changed {
+                redraw_input_line();
+            }
+            true
+        }
+        KeyCode::ArrowDown => {
+            let changed = with_shell_state_mut(|state| state.history_down());
+            if changed {
+                redraw_input_line();
+            }
+            true
+        }
         KeyCode::Enter => {
             print_char('\n');
             run_command_line();
@@ -198,7 +310,8 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
             with_shell_state_mut(|state| {
                 if state.idx == 0 || state.input[state.idx - 1] == b' ' {
                     print(
-                        "\nhelp clear echo shutdown reboot screen loglevel color memstat memdebug memdump pte memtest stack\n",
+                        "\nhelp clear echo shutdown reboot screen loglevel color memstat memdebug \n
+                        memdump pte memtest stack\n",
                     );
                     state.clear_input();
                     redraw_input_line();
@@ -222,15 +335,6 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
             if !modifiers.has_text_blocking_modifier() {
                 if let Some(ch) = keycode_to_char(event.key, modifiers) {
                     let _ = try_insert_char(ch);
-                    return true;
-                }
-            } else {
-                if event.key == KeyCode::C && modifiers.ctrl() {
-                    print_char('\n');
-                    with_shell_state_mut(|state| {
-                        state.clear_input();
-                    });
-                    redraw_input_line();
                     return true;
                 }
             }
@@ -299,6 +403,9 @@ fn run_command_line() {
     }
 
     run_command(line);
+    with_shell_state_mut(|state| {
+        state.add_to_history(line);
+    });
 
     if out::is_screen_active(SCREEN_INDEX) {
         print(PROMPT);
@@ -310,26 +417,13 @@ fn run_command_line() {
 }
 
 fn run_command(line: &str) {
-    let mut parts = line.split_whitespace();
+    let mut parts: str::SplitWhitespace<'_> = line.split_whitespace();
     let Some(command) = parts.next() else {
         return;
     };
 
     match command {
-        "help" => {
-            print(
-                "Commands: help clear echo shutdown reboot screen loglevel color memstat memdebug memdump pte memtest stack\n",
-            );
-            print("screen <1-6>\n");
-            print("loglevel <emerg|alert|crit|err|warn|notice|info|debug>\n");
-            print("color <white|gray|red|green|blue|yellow|cyan|magenta>\n");
-            print("memstat\n");
-            print("memdebug\n");
-            print("memdump <addr> [len<=512]\n");
-            print("pte <addr>\n");
-            print("memtest [physical,vmem,heap,page,all]\n");
-            print("stack [words<=64]\n");
-        }
+        "help" => command_help(),
         "clear" => clear(SCREEN_INDEX),
         "echo" => {
             let rest = line[command.len()..].trim_start();
@@ -338,95 +432,13 @@ fn run_command(line: &str) {
         }
         "reboot" => request_reboot(),
         "shutdown" => request_shutdown(),
-        "screen" => {
-            let Some(arg) = parts.next() else {
-                print("usage: screen <1-6>\n");
-                return;
-            };
-
-            let Ok(screen) = arg.parse::<usize>() else {
-                print("invalid screen index\n");
-                return;
-            };
-
-            if !(1..=6).contains(&screen) {
-                print("screen index must be in range 1-6\n");
-                return;
-            }
-
-            switch_screen(screen - 1);
-        }
-        "loglevel" => {
-            let Some(arg) = parts.next() else {
-                print("usage: loglevel <emerg|alert|crit|err|warn|notice|info|debug>\n");
-                return;
-            };
-
-            let Some(level) = parse_log_level(arg) else {
-                print("invalid log level\n");
-                return;
-            };
-
-            set_log_level(level);
-            print("log level updated\n");
-        }
-        "color" => {
-            let Some(arg) = parts.next() else {
-                print("usage: color <white|gray|red|green|blue|yellow|cyan|magenta>\n");
-                return;
-            };
-
-            let Some(color) = parse_color(arg) else {
-                print("invalid color\n");
-                return;
-            };
-
-            change_color(ColorCode::new(color, Color::Black));
-            print("shell color updated\n");
-        }
+        "screen" => command_screen(parts),
+        "loglevel" => command_loglevel(parts),
+        "color" => command_color(parts),
         "memstat" => memory::print_memstat(|args| print_fmt(args)),
         "memdebug" => memory::print_memdebug(|args| print_fmt(args)),
-        "memdump" => {
-            let Some(addr_str) = parts.next() else {
-                print("usage: memdump <addr> [len<=512]\n");
-                return;
-            };
-
-            let Some(addr) = parse_u32(addr_str) else {
-                print("invalid address\n");
-                return;
-            };
-
-            let len = if let Some(len_str) = parts.next() {
-                let Some(parsed) = parse_usize(len_str) else {
-                    print("invalid length\n");
-                    return;
-                };
-                parsed
-            } else {
-                memory::MEMDUMP_DEFAULT_LEN
-            };
-
-            if len == 0 || len > memory::MEMDUMP_MAX_LEN {
-                print("length must be in range 1..=512\n");
-                return;
-            }
-
-            memory::dump_virtual_memory(addr, len, |args| print_fmt(args));
-        }
-        "pte" => {
-            let Some(addr_str) = parts.next() else {
-                print("usage: pte <addr>\n");
-                return;
-            };
-
-            let Some(addr) = parse_u32(addr_str) else {
-                print("invalid address\n");
-                return;
-            };
-
-            memory::debug_page_entry(addr, |args| print_fmt(args));
-        }
+        "memdump" => command_memdump(parts),
+        "pte" => command_pte(parts),
         "memtest" => {
             let features = line[command.len()..].trim();
             memory::run_memtest(features, |args| print_fmt(args));
@@ -449,6 +461,15 @@ fn run_command(line: &str) {
 
             command_stack(words);
         }
+        "layout" => command_layout(parts),
+        "crash" => {
+            unsafe {
+                // SAFETY: This is intentionally crashing the kernel for testing purposes.
+                core::ptr::read_volatile(0xdeadbeef as *const u32);
+            }
+        }
+        "sc_write" => command_sc_write(),
+        "read_test" => command_read_test(),
         _ => {
             print("unknown command: ");
             print(command);
@@ -487,15 +508,31 @@ fn parse_color(name: &str) -> Option<Color> {
 
 fn complete(_partial: &str) -> Option<&'static str> {
     let commands = [
-        "help", "clear", "echo", "reboot", "shutdown", "screen", "loglevel", "color", "memstat",
-        "memdebug", "memdump", "pte", "memtest", "stack",
+        "help",
+        "clear",
+        "echo",
+        "reboot",
+        "shutdown",
+        "screen",
+        "loglevel",
+        "color",
+        "memstat",
+        "memdebug",
+        "memdump",
+        "pte",
+        "memtest",
+        "stack",
+        "crash",
+        "sc_write",
+        "layout",
+        "read_test",
     ];
     let mut matches = commands.iter().filter(|&cmd| cmd.starts_with(_partial));
     let first_match = matches.next()?;
     if matches.next().is_some() {
         print_char('\n');
         print(*first_match);
-        matches.for_each(|&cmd| print_fmt(format_args!(" {}", cmd)));
+        matches.for_each(|&cmd| print_fmt(&format_args!(" {}", cmd)));
         print_char('\n');
         redraw_input_line();
         None
@@ -526,10 +563,189 @@ fn parse_usize(input: &str) -> Option<usize> {
     }
 }
 
+#[inline(always)]
+fn command_help() {
+    print(
+        r#"Commands:
+        help clear echo shutdown reboot screen loglevel color memstat memdebug
+        memdump pte memtest stack crash sc_write layout read_test
+          screen <1-6>
+          loglevel <emerg|alert|crit|err|warn|notice|info|debug>
+          color <white|gray|red|green|blue|yellow|cyan|magenta>
+          memstat
+          memdebug
+          memdump <addr> [len<=512]
+          pte <addr>
+          memtest [physical,vmem,heap,page,all]
+          stack [words<=64]
+          crash
+          sc_write
+          layout <us|tr>
+          read_test
+        "#,
+    );
+}
+
+#[inline(always)]
+fn command_screen(mut parts: str::SplitWhitespace<'_>) {
+    let Some(arg) = parts.next() else {
+        print("usage: screen <1-6>\n");
+        return;
+    };
+
+    let Ok(screen) = arg.parse::<usize>() else {
+        print("invalid screen index\n");
+        return;
+    };
+
+    if !(1..=6).contains(&screen) {
+        print("screen index must be in range 1-6\n");
+        return;
+    }
+
+    switch_screen(screen - 1);
+}
+
+#[inline(always)]
+fn command_loglevel(mut parts: str::SplitWhitespace<'_>) {
+    let Some(arg) = parts.next() else {
+        print("usage: loglevel <emerg|alert|crit|err|warn|notice|info|debug>\n");
+        return;
+    };
+
+    let Some(level) = parse_log_level(arg) else {
+        print("invalid log level\n");
+        return;
+    };
+
+    set_log_level(level);
+    print("log level updated\n");
+}
+
+#[inline(always)]
+fn command_color(mut parts: str::SplitWhitespace<'_>) {
+    let Some(arg) = parts.next() else {
+        print("usage: color <white|gray|red|green|blue|yellow|cyan|magenta>\n");
+        return;
+    };
+
+    let Some(color) = parse_color(arg) else {
+        print("invalid color\n");
+        return;
+    };
+
+    change_color(ColorCode::new(color, Color::Black));
+    print("shell color updated\n");
+}
+
+#[inline(always)]
+fn command_memdump(mut parts: str::SplitWhitespace<'_>) {
+    let Some(addr_str) = parts.next() else {
+        print("usage: memdump <addr> [len<=512]\n");
+        return;
+    };
+
+    let Some(addr) = parse_u32(addr_str) else {
+        print("invalid address\n");
+        return;
+    };
+
+    let len = if let Some(len_str) = parts.next() {
+        let Some(parsed) = parse_usize(len_str) else {
+            print("invalid length\n");
+            return;
+        };
+        parsed
+    } else {
+        memory::MEMDUMP_DEFAULT_LEN
+    };
+
+    if len == 0 || len > memory::MEMDUMP_MAX_LEN {
+        print("length must be in range 1..=512\n");
+        return;
+    }
+
+    memory::dump_virtual_memory(addr, len, |args| print_fmt(args));
+}
+
+#[inline(always)]
+fn command_pte(mut parts: str::SplitWhitespace<'_>) {
+    let Some(addr_str) = parts.next() else {
+        print("usage: pte <addr>\n");
+        return;
+    };
+
+    let Some(addr) = parse_u32(addr_str) else {
+        print("invalid address\n");
+        return;
+    };
+
+    memory::debug_page_entry(addr, |args| print_fmt(args));
+}
+
+#[inline(always)]
 fn command_stack(words: usize) {
     let options = DumpStackOptions { words, trace_frames: stack::DEFAULT_TRACE_FRAMES };
 
     stack::dump_stack_with_options(options, |args| {
-        print_fmt(args);
+        print_fmt(&args);
     });
+}
+
+#[inline(always)]
+fn command_layout(mut parts: str::SplitWhitespace<'_>) {
+    let Some(layout_str) = parts.next() else {
+        print("usage: layout <us|tr>\n");
+        return;
+    };
+
+    let layout = match layout_str {
+        "us" => crate::interrupts::keyboard::character_map::KeyboardLayout::UsQwerty,
+        "tr" => crate::interrupts::keyboard::character_map::KeyboardLayout::TrQwerty,
+        _ => {
+            print("invalid layout\n");
+            return;
+        }
+    };
+
+    crate::interrupts::keyboard::character_map::set_layout(layout);
+    print("keyboard layout updated\n");
+}
+
+#[inline(always)]
+fn command_sc_write() {
+    let msg = "This message was printed using the sc_write command.\n";
+    let fd: i32 = 1; // stdout
+    let buf_ptr = msg.as_ptr();
+    let len = msg.len();
+    unsafe {
+        // 32-bit x86 syscall convention using int 0x80
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 4,
+            in("ebx") fd,
+            in("ecx") buf_ptr,
+            in("edx") len,
+            options(nostack, nomem),
+        );
+    }
+}
+
+#[inline(always)]
+fn command_read_test() {
+    print("Entering blocking read mode.\n");
+    print("Please type your name: ");
+
+    let mut buffer = [0u8; 64];
+
+    // This will block the shell execution until the user presses Enter
+    let len = crate::interrupts::keyboard::api::get_line(&mut buffer);
+
+    if let Ok(input_str) = core::str::from_utf8(&buffer[..len]) {
+        print("Hello, ");
+        print(input_str);
+        print("!\n");
+    } else {
+        print("Invalid input.\n");
+    }
 }

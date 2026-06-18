@@ -1,17 +1,22 @@
 use crate::interrupts::idt::register_interrupt_handler;
+use crate::interrupts::keyboard::api;
+use crate::interrupts::keyboard::character_map::{keycode_to_char, toggle_layout};
 use crate::interrupts::keyboard::keycode::{decode_set1_scancode, KeyCode, KeyEvent, Modifiers};
+use crate::interrupts::task_queue::schedule_task;
 use crate::interrupts::utils::request_shutdown;
 use crate::shell::handle_shell_key_event;
+use crate::signals::Signal;
+use crate::spin::Spinlock;
 use crate::startup_config::pic;
 use crate::vga::text_mod::cursor::{
     disable_cursor, enable_cursor, set_big_cursor, set_cursor_shape, set_small_cursor,
 };
 use crate::vga::text_mod::out::{
-    active_screen_accepts_input, move_cursor_down, move_cursor_left, move_cursor_right,
-    move_cursor_up, scroll_view_down, scroll_view_to_bottom, scroll_view_to_top, scroll_view_up,
-    switch_screen, switch_to_next_screen, switch_to_previous_screen,
+    move_cursor_down, move_cursor_left, move_cursor_right, move_cursor_up, scroll_view_down,
+    scroll_view_to_bottom, scroll_view_to_top, scroll_view_up, switch_screen,
+    switch_to_next_screen, switch_to_previous_screen,
 };
-use crate::x86::io::outb;
+use crate::x86::{inb, outb};
 
 static mut EXTENDED_SCANCODE: bool = false;
 static mut MODIFIERS: Modifiers = Modifiers::empty();
@@ -23,98 +28,177 @@ const PIC_EOI: u8 = pic::EOI;
 
 const KEYBOARD_IRQ_VECTOR: u8 = pic::KEYBOARD_IRQ_VECTOR;
 
-fn handle_key_press(event: KeyEvent, modifiers: Modifiers) -> bool {
-    if event.key == KeyCode::Delete && modifiers.ctrl() && modifiers.alt() {
-        return true;
-    }
-
-    if active_screen_accepts_input() {
-        if handle_shell_key_event(event, modifiers) {
-            return false;
+fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
+    if modifiers.shift() && modifiers.alt() {
+        if event.key == KeyCode::LeftShift || event.key == KeyCode::LeftAlt {
+            toggle_layout();
+            return;
         }
     }
 
     match event.key {
-        KeyCode::ArrowUp => {
-            if modifiers.shift() {
-                scroll_view_up();
-            } else {
-                move_cursor_up();
-            }
+        KeyCode::Delete if modifiers.ctrl() && modifiers.alt() => {
+            request_shutdown();
+            return;
         }
-        KeyCode::ArrowDown => {
-            if modifiers.shift() {
-                scroll_view_down();
-            } else {
-                move_cursor_down();
-            }
+        KeyCode::C if modifiers.ctrl() => {
+            crate::signals::send_signal(Signal::SIGINT);
+            return;
         }
-        KeyCode::ArrowLeft => {
-            if modifiers.shift() {
-                switch_to_previous_screen();
-            } else {
-                move_cursor_left();
-            }
+        KeyCode::F1 => {
+            switch_screen(0);
+            return;
         }
-        KeyCode::ArrowRight => {
-            if modifiers.shift() {
-                switch_to_next_screen();
-            } else {
-                move_cursor_right();
-            }
+        KeyCode::F2 => {
+            switch_screen(1);
+            return;
         }
-        KeyCode::PageUp => scroll_view_to_top(),
-        KeyCode::PageDown => scroll_view_to_bottom(),
-        KeyCode::F1 => switch_screen(0),
-        KeyCode::F2 => switch_screen(1),
-        KeyCode::F3 => switch_screen(2),
-        KeyCode::F4 => switch_screen(3),
-        KeyCode::F5 => switch_screen(4),
-        KeyCode::F6 => switch_screen(5),
-        KeyCode::F7 => set_big_cursor(),
-        KeyCode::F8 => set_small_cursor(),
-        KeyCode::F9 => set_cursor_shape(0, 15),
-        KeyCode::F10 => disable_cursor(),
-        KeyCode::F11 => enable_cursor(),
-        _ => {}
+        KeyCode::F3 => {
+            switch_screen(2);
+            return;
+        }
+        KeyCode::F4 => {
+            switch_screen(3);
+            return;
+        }
+        KeyCode::F5 => {
+            switch_screen(4);
+            return;
+        }
+        KeyCode::F6 => {
+            switch_screen(5);
+            return;
+        }
+        KeyCode::F7 => {
+            set_big_cursor();
+            return;
+        }
+        KeyCode::F8 => {
+            set_small_cursor();
+            return;
+        }
+        KeyCode::F9 => {
+            set_cursor_shape(0, 15);
+            return;
+        }
+        KeyCode::F10 => {
+            disable_cursor();
+            return;
+        }
+        KeyCode::F11 => {
+            enable_cursor();
+            return;
+        }
+        KeyCode::PageUp => {
+            scroll_view_to_top();
+            return;
+        }
+        KeyCode::PageDown => {
+            scroll_view_to_bottom();
+            return;
+        }
+        _ => {} // Not a global hotkey, continue down to the router
     }
 
-    false
+    if api::get_input_mode() == api::InputMode::Blocking {
+        if !modifiers.has_text_blocking_modifier() {
+            
+            if let Some(c) = keycode_to_char(event.key, modifiers) {
+                api::push_char(c);
+            }
+        }
+    } else {
+        if handle_shell_key_event(event, modifiers) {
+            return;
+        }
+
+        match event.key {
+            KeyCode::ArrowUp => {
+                if modifiers.shift() {
+                    scroll_view_up();
+                } else {
+                    move_cursor_up();
+                }
+            }
+            KeyCode::ArrowDown => {
+                if modifiers.shift() {
+                    scroll_view_down();
+                } else {
+                    move_cursor_down();
+                }
+            }
+            KeyCode::ArrowLeft => {
+                if modifiers.shift() {
+                    switch_to_previous_screen();
+                } else {
+                    move_cursor_left();
+                }
+            }
+            KeyCode::ArrowRight => {
+                if modifiers.shift() {
+                    switch_to_next_screen();
+                } else {
+                    move_cursor_right();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn process_keyboard_event() {
+    while let Some(scancode) = pop_scancode() {
+        unsafe {
+            if scancode == SCANCODE_EXTENDED_PREFIX {
+                EXTENDED_SCANCODE = true;
+            } else {
+                if let Some(event) = decode_set1_scancode(scancode, EXTENDED_SCANCODE) {
+                    let mut modifiers = MODIFIERS;
+                    modifiers.update_for_event(event);
+                    MODIFIERS = modifiers;
+                    if event.pressed {
+                        handle_key_press(event, modifiers);
+                    }
+                }
+                EXTENDED_SCANCODE = false;
+            }
+        }
+    }
+}
+
+static RAW_SCANCODE_QUEUE: Spinlock<[u8; 32]> = Spinlock::new([0; 32]);
+static mut QUEUE_HEAD: usize = 0;
+static mut QUEUE_TAIL: usize = 0;
+
+fn push_scancode(code: u8) {
+    let mut queue = RAW_SCANCODE_QUEUE.lock();
+    unsafe {
+        let next_head = (QUEUE_HEAD + 1) % 32;
+        if next_head != QUEUE_TAIL {
+            queue[QUEUE_HEAD] = code;
+            QUEUE_HEAD = next_head;
+        }
+    }
+}
+
+fn pop_scancode() -> Option<u8> {
+    let queue = RAW_SCANCODE_QUEUE.lock();
+    unsafe {
+        if QUEUE_HEAD == QUEUE_TAIL {
+            return None;
+        }
+        let code = queue[QUEUE_TAIL];
+        QUEUE_TAIL = (QUEUE_TAIL + 1) % 32;
+        Some(code)
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn keyboard_interrupt_handler() {
-    let mut should_shutdown = false;
-
-    // Read scancode from PS/2 keyboard data port (0x60)
-    let scancode: u8 = unsafe {
-        let mut code: u8;
-        core::arch::asm!("in al, dx", out("al") code, in("dx") PIC_KEYBOARD_DATA_PORT);
-        code
-    };
-
-    unsafe {
-        if scancode == SCANCODE_EXTENDED_PREFIX {
-            EXTENDED_SCANCODE = true;
-        } else {
-            if let Some(event) = decode_set1_scancode(scancode, EXTENDED_SCANCODE) {
-                let mut modifiers = MODIFIERS;
-                modifiers.update_for_event(event);
-                MODIFIERS = modifiers;
-                if event.pressed {
-                    should_shutdown = handle_key_press(event, modifiers);
-                }
-            }
-            EXTENDED_SCANCODE = false;
-        }
-    }
-
-    // Send End of Interrupt (EOI) to master PIC
+    // read and unblock the port
+    push_scancode(inb(PIC_KEYBOARD_DATA_PORT));
+    schedule_task(process_keyboard_event);
     outb(PIC_MASTER_COMMAND_PORT, PIC_EOI);
-
-    if should_shutdown {
-        request_shutdown();
-    }
 }
 
 unsafe extern "C" {
@@ -123,4 +207,7 @@ unsafe extern "C" {
 
 pub fn init_keyboard() {
     register_interrupt_handler(KEYBOARD_IRQ_VECTOR, isr_keyboard); // IRQ1 = IDT index 32 + 1 = 33
+    while (inb(pic::KEYBOARD_COMMAND_PORT) & 0x1) != 0 {
+        inb(pic::KEYBOARD_DATA_PORT);
+    }
 }

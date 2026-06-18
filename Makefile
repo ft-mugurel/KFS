@@ -12,17 +12,23 @@ RESET   	=	\033[0m
 # **************************************************************************** #
 # 💾 VARIABLES
 # **************************************************************************** #
+BUILD_DIR       = build
+ISO_DIR         = $(BUILD_DIR)/iso
+TARGET_DIR      = target/i686-kernel
 
-KERNEL_OUT	=	 ./target/i686-kernel/release/libkernel.a
-KERNEL_DEBUG_OUT	=	 ./target/i686-kernel/debug/libkernel.a
+KERNEL_BIN      = $(BUILD_DIR)/kernel.bin
+KERNEL_REL_LIB  = $(TARGET_DIR)/release/libkernel.a
+KERNEL_DBG_LIB  = $(TARGET_DIR)/debug/libkernel.a
 
-ISO_OUT		=	build/kernel.iso
-ISO_FULL_OUT	=	build/kernel-full.iso
+ISO_OUT         = $(BUILD_DIR)/kernel.iso
+ISO_FULL_OUT    = $(BUILD_DIR)/kernel-full.iso
 
-BOOT		=	./multiboot/header.asm
-LINKER		=	linker/linker.ld
+LINKER          = linker/linker.ld
 
-FLAGS		=	-fno-builtin -fno-builtin -fno-builtin -nostdlib -nodefaultlibs
+# Automatically find ALL assembly files in the asm directory
+ASM_DIR         = asm
+ASM_SRCS        = $(wildcard $(ASM_DIR)/*.asm)
+ASM_OBJS        = $(patsubst $(ASM_DIR)/%.asm, $(BUILD_DIR)/%.o, $(ASM_SRCS))
 
 # **************************************************************************** #
 # 
@@ -63,90 +69,90 @@ ifeq ($(RUSTC),)
 	$(error "rustc not found, please install it.")
 endif
 
+# Macros
+
+define link_kernel
+	@echo -e "$(YELLOW)[~] Linking Stage 1...$(RESET)"
+	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) $(1)
+	@echo -e "$(YELLOW)[~] Generating kallsyms map...$(RESET)"
+	@nm -n $(KERNEL_BIN) | awk '$$2 ~ /[tTwW]/ { if ($$3 != "") print $$1 " " $$3 }' > $(BUILD_DIR)/kallsyms.map
+	@echo -e "$(YELLOW)[~] Rebuilding Rust with embedded symbols...$(RESET)"
+	@$(CARGO) build $(CARGO_ARGS) $(2)
+	@echo -e "$(YELLOW)[~] Linking Stage 2 (Final)...$(RESET)"
+	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) $(1)
+endef
+
 # **************************************************************************** #
 # 📖 RULES
 # **************************************************************************** #
 
 all: run-iso
 
-SRCS = $(shell find src -name "*.rs")
+$(BUILD_DIR)/%.o: $(ASM_DIR)/%.asm
+	@mkdir -p $(BUILD_DIR)
+	@$(NASM) -f elf32 $< -o $@
+	@echo -e "$(CYAN)[+] NASM compiled: $<$(RESET)"
 
-generate-kallsyms:
-	@nm -n build/kernel.bin | awk '$$2 ~ /[tTwW]/ { if ($$3 != "") print $$1 " " $$3 }' > build/kallsyms.map
+build: CARGO_ARGS = --no-default-features
+build: $(ASM_OBJS)
+	@echo -e "$(BOLD)$(CYAN)[~] Building Release Kernel...$(RESET)"
+	@$(CARGO) build --release
+	$(call link_kernel, $(KERNEL_REL_LIB), --release)
+	@echo -e "$(BOLD)$(GREEN)[✓] RELEASE KERNEL BUILD DONE$(RESET)"
 
-build: 	${SRCS}
-	@mkdir -p build
-	@${NASM} -f elf32 ${BOOT} -o build/boot.o
-	@${CARGO} build --no-default-features --release
-	@echo -e "$(BOLD)$(GREEN)[✓] KERNEL BUILD DONE$(RESET)"
-	@${LD} -m elf_i386 -T ${LINKER} -o build/kernel.bin build/boot.o  ${KERNEL_OUT}
-	@$(MAKE) generate-kallsyms
-	@${CARGO} build --no-default-features --release
-	@${LD} -m elf_i386 -T ${LINKER} -o build/kernel.bin build/boot.o  ${KERNEL_OUT}
-	@echo -e "$(BOLD)$(GREEN)[✓] KERNEL LINK DONE$(RESET)"
+build_debug: $(ASM_OBJS)
+	@echo -e "$(BOLD)$(YELLOW)[~] Building Debug Kernel...$(RESET)"
+	@$(CARGO) build
+	$(call link_kernel, $(KERNEL_DBG_LIB), )
+	@echo -e "$(BOLD)$(GREEN)[✓] DEBUG KERNEL BUILD DONE$(RESET)"
 
-build_debug: ${SRCS}
-	@echo -e "$(BOLD)$(YELLOW)[✓] KERNEL DEBUG MODE ON$(RESET)"
-	@mkdir -p build
-	@${NASM} -f elf32 ${BOOT} -o build/boot.o
-	@${CARGO} build
-	@echo -e "$(BOLD)$(GREEN)[✓] KERNEL BUILD DONE$(RESET)"
-	@${LD} -m elf_i386 -T ${LINKER} -o build/kernel.bin build/boot.o  ${KERNEL_DEBUG_OUT}
-	@$(MAKE) generate-kallsyms
-	@${CARGO} build
-	@${LD} -m elf_i386 -T ${LINKER} -o build/kernel.bin build/boot.o  ${KERNEL_DEBUG_OUT}
-	@echo -e "$(BOLD)$(GREEN)[✓] KERNEL LINK DONE$(RESET)"
+# Reusable ISO preparation step
+$(ISO_DIR)/boot/grub/grub.cfg:
+	@mkdir -p $(ISO_DIR)/boot/grub
+	@cp grub/grub.cfg $(ISO_DIR)/boot/grub/
 
 run: build
-	@${QEMU_SYSTEM} -kernel ./build/kernel.bin -monitor stdio
+	@$(QEMU_SYSTEM) -kernel $(KERNEL_BIN) -monitor stdio
 	@echo -e "\n$(BOLD)$(CYAN)[✓] KERNEL EXIT DONE$(RESET)"
 
 debug: build_debug
-	@${QEMU_SYSTEM} -kernel ${KERNEL_OUT} -s -S &
+	@$(QEMU_SYSTEM) -kernel $(KERNEL_BIN) -s -S &
 	@gdb -x .gdbinit
 	@echo -e "\n$(BOLD)$(CYAN)[✓] KERNEL DEBUG EXIT DONE$(RESET)"
 
-iso: build
-	@mkdir -p build/iso/boot/grub
-	@cp grub/grub.cfg build/iso/boot/grub
-	@cp build/kernel.bin build/iso/boot
-	@${GRUB_MKRESCUE} -o ${ISO_OUT} build/iso --directory=${GRUB_MODULE_DIR} \
-		--modules="multiboot" --locales="" --fonts="" --themes=""
-	@echo -e "$(BOLD)$(GREEN)[✓] KERNEL ISO BUILD$(RESET)"
+iso: build $(ISO_DIR)/boot/grub/grub.cfg
+	@cp $(KERNEL_BIN) $(ISO_DIR)/boot/
+	@$(GRUB_MKRESCUE) -o $(ISO_OUT) $(ISO_DIR) --directory=$(GRUB_MODULE_DIR) \
+		--modules="multiboot" --locales="" --fonts="" --themes="" 2>/dev/null
+	@echo -e "$(BOLD)$(GREEN)[✓] ISO BUILD DONE: $(ISO_OUT)$(RESET)"
 
-iso-full: build
-	@mkdir -p build/iso/boot/grub
-	@cp grub/grub.cfg build/iso/boot/grub
-	@cp build/kernel.bin build/iso/boot
-	@${GRUB_MKRESCUE} -o ${ISO_FULL_OUT} build/iso --directory=${GRUB_MODULE_DIR} --modules="multiboot"
-	@echo -e "$(BOLD)$(GREEN)[✓] KERNEL FULL ISO BUILD$(RESET)"
+iso-full: build $(ISO_DIR)/boot/grub/grub.cfg
+	@cp $(KERNEL_BIN) $(ISO_DIR)/boot/
+	@$(GRUB_MKRESCUE) -o $(ISO_FULL_OUT) $(ISO_DIR) --directory=$(GRUB_MODULE_DIR) --modules="multiboot" 2>/dev/null
+	@echo -e "$(BOLD)$(GREEN)[✓] FULL ISO BUILD DONE: $(ISO_FULL_OUT)$(RESET)"
 
 run-iso: iso
-	@${QEMU_SYSTEM} -m 4G \
-		-drive format=raw,file=${ISO_OUT},media=cdrom \
-		-boot order=d
-	@echo -e "\n$(BOLD)$(CYAN)[✓] KERNEL EXIT DONE$(RESET)"
+	@$(QEMU_SYSTEM) -m 4G -drive format=raw,file=$(ISO_OUT),media=cdrom -boot order=d
+	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
 run-iso-full: iso-full
-	@${QEMU_SYSTEM} -m 4G \
-		-drive format=raw,file=${ISO_FULL_OUT},media=cdrom \
-		-boot order=d
-	@echo -e "\n$(BOLD)$(CYAN)[✓] KERNEL EXIT DONE$(RESET)"
+	@$(QEMU_SYSTEM) -m 4G -drive format=raw,file=$(ISO_FULL_OUT),media=cdrom -boot order=d
+	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
 run-iso-term: iso
-	@${QEMU_SYSTEM} -m 4G \
-		-drive format=raw,file=${ISO_OUT},media=cdrom \
+	@$(QEMU_SYSTEM) -m 4G \
+		-drive format=raw,file=$(ISO_OUT),media=cdrom \
 		-boot order=d -nographic
-	@echo -e "\n$(BOLD)$(CYAN)[✓] KERNEL EXIT DONE$(RESET)"
+	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
 clean:
-	@rm -rf build/
-	@echo -e "$(BOLD)$(RED)[♻︎] DELETE KERNEL DONE$(RESET)"
+	@rm -rf $(BUILD_DIR)/
+	@echo -e "$(BOLD)$(RED)[♻︎] DELETED BUILD ARTIFACTS$(RESET)"
 
 fclean: clean
-	@${CARGO} clean
-	@echo -e "$(BOLD)$(RED)[♻︎] DELETE BUILD/ DONE$(RESET)"
+	@$(CARGO) clean
+	@echo -e "$(BOLD)$(RED)[♻︎] DELETED CARGO TARGETS$(RESET)"
 
 re: clean all
 
-.PHONY: all clean fclean re
+.PHONY: all build build_debug iso iso-full run debug run-iso run-iso-full run-iso-term clean fclean re

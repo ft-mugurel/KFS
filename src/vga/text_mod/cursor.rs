@@ -1,5 +1,5 @@
 use super::screen;
-use crate::x86::io::{inb, outb};
+use crate::x86::{inb, outb};
 
 const VGA_CMD_PORT: u16 = 0x3D4;
 const VGA_DATA_PORT: u16 = 0x3D5;
@@ -10,12 +10,10 @@ pub(super) struct ScreenCursor {
     pub y: u16,
 }
 
-#[allow(dead_code)]
 pub fn set_big_cursor() {
     write_cursor_shape(0x00, 0x0F);
 }
 
-#[allow(dead_code)]
 pub fn set_small_cursor() {
     write_cursor_shape(0x0E, 0x0F);
 }
@@ -52,14 +50,12 @@ pub fn set_cursor(x: u16, y: u16) {
     outb(VGA_DATA_PORT, (position & 0xFF) as u8);
 }
 
-#[allow(dead_code)]
 pub fn disable_cursor() {
     outb(VGA_CMD_PORT, 0x0A);
     let cursor_start = inb(VGA_DATA_PORT);
     outb(VGA_DATA_PORT, cursor_start | 0x20);
 }
 
-#[allow(dead_code)]
 pub fn enable_cursor() {
     outb(VGA_CMD_PORT, 0x0A);
     let cursor_start = inb(VGA_DATA_PORT);

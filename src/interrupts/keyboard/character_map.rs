@@ -1,43 +1,72 @@
-use crate::interrupts::keyboard::keycode::{KeyCode, Modifiers};
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::interrupts::keyboard::keycode::{
+    KeyCode::{self, A},
+    Modifiers,
+};
 
 #[derive(Clone, Copy)]
 pub struct Glyph {
     base: char,
-    shifted: char,
+    lvl2: char,
+    lvl3: Option<char>,
+    lvl5: Option<char>,
     is_letter: bool,
 }
 
-#[derive(Clone, Copy)]
-pub enum KeyboardLayout {
-    UsQwerty,
-}
-
-const DEFAULT_LAYOUT: KeyboardLayout = KeyboardLayout::UsQwerty;
-
-pub fn keycode_to_char_for_layout(
-    key: KeyCode,
-    modifiers: Modifiers,
-    layout: KeyboardLayout,
-) -> Option<char> {
-    let glyph = match layout {
-        KeyboardLayout::UsQwerty => us_qwerty::glyph_for_key(key),
-    }?;
-
-    let shifted = if glyph.is_letter {
-        modifiers.shift() ^ modifiers.caps_lock()
-    } else {
-        modifiers.shift()
-    };
-
-    if shifted {
-        Some(glyph.shifted)
-    } else {
-        Some(glyph.base)
+impl Glyph {
+    const fn new_l2(base: char, lvl2: char, is_letter: bool) -> Self {
+        Self { base, lvl2, lvl3: None, lvl5: None, is_letter }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum KeyboardLayout {
+    UsQwerty = 0,
+    TrQwerty = 1,
+    GbQwerty = 2,
+
+    LayoutEnd = 3,
+}
+
+static ACTIVE_LAYOUT: AtomicU8 = AtomicU8::new(KeyboardLayout::UsQwerty as u8);
+
+pub fn set_layout(layout: KeyboardLayout) {
+    ACTIVE_LAYOUT.store(layout as u8, Ordering::Relaxed);
+}
+
+pub fn get_layout() -> KeyboardLayout {
+    match ACTIVE_LAYOUT.load(Ordering::Relaxed) {
+        0 => KeyboardLayout::UsQwerty,
+        1 => KeyboardLayout::TrQwerty,
+        2 => KeyboardLayout::GbQwerty,
+        _ => unreachable!(),
+    }
+}
+
+pub fn toggle_layout() {
+    ACTIVE_LAYOUT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            let next = (current + 1) % (KeyboardLayout::LayoutEnd as u8);
+            Some(next)
+        })
+        .ok();
+}
+
 pub fn keycode_to_char(key: KeyCode, modifiers: Modifiers) -> Option<char> {
-    keycode_to_char_for_layout(key, modifiers, DEFAULT_LAYOUT)
+    let layout = get_layout();
+    let glyph = match layout {
+        KeyboardLayout::UsQwerty => us_qwerty::glyph_for_key(key),
+        KeyboardLayout::TrQwerty => tr_qwerty::glyph_for_key(key),
+        KeyboardLayout::GbQwerty => gb_qwerty::glyph_for_key(key),
+        _ => None,
+    }?;
+
+    if modifiers.shift() ^ (modifiers.caps_lock() && glyph.is_letter) {
+        Some(glyph.lvl2)
+    } else {
+        Some(glyph.base)
+    }
 }
 
 mod us_qwerty {
@@ -46,60 +75,187 @@ mod us_qwerty {
 
     pub(super) fn glyph_for_key(key: KeyCode) -> Option<Glyph> {
         let glyph = match key {
-            KeyCode::Backspace => Glyph { base: '\x08', shifted: '\x08', is_letter: false },
-            KeyCode::Tab => Glyph { base: '\t', shifted: '\t', is_letter: false },
-            KeyCode::Enter => Glyph { base: '\n', shifted: '\n', is_letter: false },
-            KeyCode::Space => Glyph { base: ' ', shifted: ' ', is_letter: false },
-            KeyCode::Digit1 => Glyph { base: '1', shifted: '!', is_letter: false },
-            KeyCode::Digit2 => Glyph { base: '2', shifted: '@', is_letter: false },
-            KeyCode::Digit3 => Glyph { base: '3', shifted: '#', is_letter: false },
-            KeyCode::Digit4 => Glyph { base: '4', shifted: '$', is_letter: false },
-            KeyCode::Digit5 => Glyph { base: '5', shifted: '%', is_letter: false },
-            KeyCode::Digit6 => Glyph { base: '6', shifted: '^', is_letter: false },
-            KeyCode::Digit7 => Glyph { base: '7', shifted: '&', is_letter: false },
-            KeyCode::Digit8 => Glyph { base: '8', shifted: '*', is_letter: false },
-            KeyCode::Digit9 => Glyph { base: '9', shifted: '(', is_letter: false },
-            KeyCode::Digit0 => Glyph { base: '0', shifted: ')', is_letter: false },
-            KeyCode::Minus => Glyph { base: '-', shifted: '_', is_letter: false },
-            KeyCode::Equal => Glyph { base: '=', shifted: '+', is_letter: false },
-            KeyCode::LeftBracket => Glyph { base: '[', shifted: '{', is_letter: false },
-            KeyCode::RightBracket => Glyph { base: ']', shifted: '}', is_letter: false },
-            KeyCode::Backslash => Glyph { base: '\\', shifted: '|', is_letter: false },
-            KeyCode::Semicolon => Glyph { base: ';', shifted: ':', is_letter: false },
-            KeyCode::Apostrophe => Glyph { base: '\'', shifted: '"', is_letter: false },
-            KeyCode::Grave => Glyph { base: '`', shifted: '~', is_letter: false },
-            KeyCode::Comma => Glyph { base: ',', shifted: '<', is_letter: false },
-            KeyCode::Dot => Glyph { base: '.', shifted: '>', is_letter: false },
-            KeyCode::Slash => Glyph { base: '/', shifted: '?', is_letter: false },
-            KeyCode::A => Glyph { base: 'a', shifted: 'A', is_letter: true },
-            KeyCode::B => Glyph { base: 'b', shifted: 'B', is_letter: true },
-            KeyCode::C => Glyph { base: 'c', shifted: 'C', is_letter: true },
-            KeyCode::D => Glyph { base: 'd', shifted: 'D', is_letter: true },
-            KeyCode::E => Glyph { base: 'e', shifted: 'E', is_letter: true },
-            KeyCode::F => Glyph { base: 'f', shifted: 'F', is_letter: true },
-            KeyCode::G => Glyph { base: 'g', shifted: 'G', is_letter: true },
-            KeyCode::H => Glyph { base: 'h', shifted: 'H', is_letter: true },
-            KeyCode::I => Glyph { base: 'i', shifted: 'I', is_letter: true },
-            KeyCode::J => Glyph { base: 'j', shifted: 'J', is_letter: true },
-            KeyCode::K => Glyph { base: 'k', shifted: 'K', is_letter: true },
-            KeyCode::L => Glyph { base: 'l', shifted: 'L', is_letter: true },
-            KeyCode::M => Glyph { base: 'm', shifted: 'M', is_letter: true },
-            KeyCode::N => Glyph { base: 'n', shifted: 'N', is_letter: true },
-            KeyCode::O => Glyph { base: 'o', shifted: 'O', is_letter: true },
-            KeyCode::P => Glyph { base: 'p', shifted: 'P', is_letter: true },
-            KeyCode::Q => Glyph { base: 'q', shifted: 'Q', is_letter: true },
-            KeyCode::R => Glyph { base: 'r', shifted: 'R', is_letter: true },
-            KeyCode::S => Glyph { base: 's', shifted: 'S', is_letter: true },
-            KeyCode::T => Glyph { base: 't', shifted: 'T', is_letter: true },
-            KeyCode::U => Glyph { base: 'u', shifted: 'U', is_letter: true },
-            KeyCode::V => Glyph { base: 'v', shifted: 'V', is_letter: true },
-            KeyCode::W => Glyph { base: 'w', shifted: 'W', is_letter: true },
-            KeyCode::X => Glyph { base: 'x', shifted: 'X', is_letter: true },
-            KeyCode::Y => Glyph { base: 'y', shifted: 'Y', is_letter: true },
-            KeyCode::Z => Glyph { base: 'z', shifted: 'Z', is_letter: true },
+            KeyCode::Backspace => Glyph::new_l2('\x08', '\x08', false),
+            KeyCode::Tab => Glyph::new_l2('\t', '\t', false),
+            KeyCode::Enter => Glyph::new_l2('\n', '\n', false),
+            KeyCode::Space => Glyph::new_l2(' ', ' ', false),
+            KeyCode::Digit1 => Glyph::new_l2('1', '!', false),
+            KeyCode::Digit2 => Glyph::new_l2('2', '@', false),
+            KeyCode::Digit3 => Glyph::new_l2('3', '#', false),
+            KeyCode::Digit4 => Glyph::new_l2('4', '$', false),
+            KeyCode::Digit5 => Glyph::new_l2('5', '%', false),
+            KeyCode::Digit6 => Glyph::new_l2('6', '^', false),
+            KeyCode::Digit7 => Glyph::new_l2('7', '&', false),
+            KeyCode::Digit8 => Glyph::new_l2('8', '*', false),
+            KeyCode::Digit9 => Glyph::new_l2('9', '(', false),
+            KeyCode::Digit0 => Glyph::new_l2('0', ')', false),
+            KeyCode::Minus => Glyph::new_l2('-', '_', false),
+            KeyCode::Equal => Glyph::new_l2('=', '+', false),
+            KeyCode::LeftBracket => Glyph::new_l2('[', '{', false),
+            KeyCode::RightBracket => Glyph::new_l2(']', '}', false),
+            KeyCode::Backslash => Glyph::new_l2('\\', '|', false),
+            KeyCode::Semicolon => Glyph::new_l2(';', ':', false),
+            KeyCode::Apostrophe => Glyph::new_l2('\'', '"', false),
+            KeyCode::Grave => Glyph::new_l2('`', '~', false),
+            KeyCode::Comma => Glyph::new_l2(',', '<', false),
+            KeyCode::Dot => Glyph::new_l2('.', '>', false),
+            KeyCode::Slash => Glyph::new_l2('/', '?', false),
+            KeyCode::A => Glyph::new_l2('a', 'A', true),
+            KeyCode::B => Glyph::new_l2('b', 'B', true),
+            KeyCode::C => Glyph::new_l2('c', 'C', true),
+            KeyCode::D => Glyph::new_l2('d', 'D', true),
+            KeyCode::E => Glyph::new_l2('e', 'E', true),
+            KeyCode::F => Glyph::new_l2('f', 'F', true),
+            KeyCode::G => Glyph::new_l2('g', 'G', true),
+            KeyCode::H => Glyph::new_l2('h', 'H', true),
+            KeyCode::I => Glyph::new_l2('i', 'I', true),
+            KeyCode::J => Glyph::new_l2('j', 'J', true),
+            KeyCode::K => Glyph::new_l2('k', 'K', true),
+            KeyCode::L => Glyph::new_l2('l', 'L', true),
+            KeyCode::M => Glyph::new_l2('m', 'M', true),
+            KeyCode::N => Glyph::new_l2('n', 'N', true),
+            KeyCode::O => Glyph::new_l2('o', 'O', true),
+            KeyCode::P => Glyph::new_l2('p', 'P', true),
+            KeyCode::Q => Glyph::new_l2('q', 'Q', true),
+            KeyCode::R => Glyph::new_l2('r', 'R', true),
+            KeyCode::S => Glyph::new_l2('s', 'S', true),
+            KeyCode::T => Glyph::new_l2('t', 'T', true),
+            KeyCode::U => Glyph::new_l2('u', 'U', true),
+            KeyCode::V => Glyph::new_l2('v', 'V', true),
+            KeyCode::W => Glyph::new_l2('w', 'W', true),
+            KeyCode::X => Glyph::new_l2('x', 'X', true),
+            KeyCode::Y => Glyph::new_l2('y', 'Y', true),
+            KeyCode::Z => Glyph::new_l2('z', 'Z', true),
             _ => return None,
         };
 
+        Some(glyph)
+    }
+}
+
+mod tr_qwerty {
+    use crate::interrupts::keyboard::character_map::Glyph;
+    use crate::interrupts::keyboard::keycode::KeyCode;
+
+    pub(super) fn glyph_for_key(key: KeyCode) -> Option<Glyph> {
+        let glyph = match key {
+            KeyCode::Backspace => Glyph::new_l2('\x08', '\x08', false),
+            KeyCode::Tab => Glyph::new_l2('\t', '\t', false),
+            KeyCode::Enter => Glyph::new_l2('\n', '\n', false),
+            KeyCode::Space => Glyph::new_l2(' ', ' ', false),
+            KeyCode::Digit1 => Glyph::new_l2('1', '!', false),
+            KeyCode::Digit2 => Glyph::new_l2('2', '\'', false),
+            KeyCode::Digit3 => Glyph::new_l2('3', '^', false),
+            KeyCode::Digit4 => Glyph::new_l2('4', '+', false),
+            KeyCode::Digit5 => Glyph::new_l2('5', '%', false),
+            KeyCode::Digit6 => Glyph::new_l2('6', '&', false),
+            KeyCode::Digit7 => Glyph::new_l2('7', '/', false),
+            KeyCode::Digit8 => Glyph::new_l2('8', '(', false),
+            KeyCode::Digit9 => Glyph::new_l2('9', ')', false),
+            KeyCode::Digit0 => Glyph::new_l2('0', '=', false),
+            KeyCode::Minus => Glyph::new_l2('*', '?', false),
+            KeyCode::Equal => Glyph::new_l2('-', '_', false),
+            KeyCode::LeftBracket => Glyph::new_l2('ğ', 'Ğ', true),
+            KeyCode::RightBracket => Glyph::new_l2('ü', 'Ü', true),
+            KeyCode::Backslash => Glyph::new_l2('<', '>', false),
+            KeyCode::Semicolon => Glyph::new_l2('ş', 'Ş', true),
+            KeyCode::Apostrophe => Glyph::new_l2('i', 'İ', true),
+            KeyCode::Grave => Glyph::new_l2('"', 'é', false),
+            KeyCode::Comma => Glyph::new_l2('ö', 'Ö', false),
+            KeyCode::Dot => Glyph::new_l2('ç', 'Ç', false),
+            KeyCode::Slash => Glyph::new_l2('.', ':', false),
+            KeyCode::A => Glyph::new_l2('a', 'A', true),
+            KeyCode::B => Glyph::new_l2('b', 'B', true),
+            KeyCode::C => Glyph::new_l2('c', 'C', true),
+            KeyCode::D => Glyph::new_l2('d', 'D', true),
+            KeyCode::E => Glyph::new_l2('e', 'E', true),
+            KeyCode::F => Glyph::new_l2('f', 'F', true),
+            KeyCode::G => Glyph::new_l2('g', 'G', true),
+            KeyCode::H => Glyph::new_l2('h', 'H', true),
+            KeyCode::I => Glyph::new_l2('i', 'I', true),
+            KeyCode::J => Glyph::new_l2('j', 'J', true),
+            KeyCode::K => Glyph::new_l2('k', 'K', true),
+            KeyCode::L => Glyph::new_l2('l', 'L', true),
+            KeyCode::M => Glyph::new_l2('m', 'M', true),
+            KeyCode::N => Glyph::new_l2('n', 'N', true),
+            KeyCode::O => Glyph::new_l2('o', 'O', true),
+            KeyCode::P => Glyph::new_l2('p', 'P', true),
+            KeyCode::Q => Glyph::new_l2('q', 'Q', true),
+            KeyCode::R => Glyph::new_l2('r', 'R', true),
+            KeyCode::S => Glyph::new_l2('s', 'S', true),
+            KeyCode::T => Glyph::new_l2('t', 'T', true),
+            KeyCode::U => Glyph::new_l2('u', 'U', true),
+            KeyCode::V => Glyph::new_l2('v', 'V', true),
+            KeyCode::W => Glyph::new_l2('w', 'W', true),
+            KeyCode::X => Glyph::new_l2('x', 'X', true),
+            KeyCode::Y => Glyph::new_l2('y', 'Y', true),
+            KeyCode::Z => Glyph::new_l2('z', 'Z', true),
+            _ => return None,
+        };
+
+        Some(glyph)
+    }
+}
+
+mod gb_qwerty {
+    use crate::interrupts::keyboard::character_map::Glyph;
+    use crate::interrupts::keyboard::keycode::KeyCode;
+
+    pub(super) fn glyph_for_key(key: KeyCode) -> Option<Glyph> {
+        let glyph = match key {
+            KeyCode::Backspace => Glyph::new_l2('\x08', '\x08', false),
+            KeyCode::Tab => Glyph::new_l2('\t', '\t', false),
+            KeyCode::Enter => Glyph::new_l2('\n', '\n', false),
+            KeyCode::Space => Glyph::new_l2(' ', ' ', false),
+            KeyCode::Digit1 => Glyph::new_l2('1', '!', false),
+            KeyCode::Digit2 => Glyph::new_l2('2', '"', false),
+            KeyCode::Digit3 => Glyph::new_l2('3', '£', false),
+            KeyCode::Digit4 => Glyph::new_l2('4', '$', false),
+            KeyCode::Digit5 => Glyph::new_l2('5', '%', false),
+            KeyCode::Digit6 => Glyph::new_l2('6', '^', false),
+            KeyCode::Digit7 => Glyph::new_l2('7', '&', false),
+            KeyCode::Digit8 => Glyph::new_l2('8', '*', false),
+            KeyCode::Digit9 => Glyph::new_l2('9', '(', false),
+            KeyCode::Digit0 => Glyph::new_l2('0', ')', false),
+            KeyCode::Minus => Glyph::new_l2('-', '_', false),
+            KeyCode::Equal => Glyph::new_l2('=', '+', false),
+            KeyCode::LeftBracket => Glyph::new_l2('[', '{', false),
+            KeyCode::RightBracket => Glyph::new_l2(']', '}', false),
+            KeyCode::Backslash => Glyph::new_l2('\\', '|', false),
+            KeyCode::Semicolon => Glyph::new_l2(';', ':', false),
+            KeyCode::Apostrophe => Glyph::new_l2('\'', '@', false),
+            KeyCode::Grave => Glyph::new_l2('`', '~', false),
+            KeyCode::Comma => Glyph::new_l2(',', '<', false),
+            KeyCode::Dot => Glyph::new_l2('.', '>', false),
+            KeyCode::Slash => Glyph::new_l2('/', '?', false),
+            KeyCode::A => Glyph::new_l2('a', 'A', true),
+            KeyCode::B => Glyph::new_l2('b', 'B', true),
+            KeyCode::C => Glyph::new_l2('c', 'C', true),
+            KeyCode::D => Glyph::new_l2('d', 'D', true),
+            KeyCode::E => Glyph::new_l2('e', 'E', true),
+            KeyCode::F => Glyph::new_l2('f', 'F', true),
+            KeyCode::G => Glyph::new_l2('g', 'G', true),
+            KeyCode::H => Glyph::new_l2('h', 'H', true),
+            KeyCode::I => Glyph::new_l2('i', 'I', true),
+            KeyCode::J => Glyph::new_l2('j', 'J', true),
+            KeyCode::K => Glyph::new_l2('k', 'K', true),
+            KeyCode::L => Glyph::new_l2('l', 'L', true),
+            KeyCode::M => Glyph::new_l2('m', 'M', true),
+            KeyCode::N => Glyph::new_l2('n', 'N', true),
+            KeyCode::O => Glyph::new_l2('o', 'O', true),
+            KeyCode::P => Glyph::new_l2('p', 'P', true),
+            KeyCode::Q => Glyph::new_l2('q', 'Q', true),
+            KeyCode::R => Glyph::new_l2('r', 'R', true),
+            KeyCode::S => Glyph::new_l2('s', 'S', true),
+            KeyCode::T => Glyph::new_l2('t', 'T', true),
+            KeyCode::U => Glyph::new_l2('u', 'U', true),
+            KeyCode::V => Glyph::new_l2('v', 'V', true),
+            KeyCode::W => Glyph::new_l2('w', 'W', true),
+            KeyCode::X => Glyph::new_l2('x', 'X', true),
+            KeyCode::Y => Glyph::new_l2('y', 'Y', true),
+            KeyCode::Z => Glyph::new_l2('z', 'Z', true),
+            _ => return None,
+        };
         Some(glyph)
     }
 }

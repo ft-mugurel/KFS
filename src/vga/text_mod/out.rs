@@ -57,27 +57,6 @@ impl Color {
             _ => Color::White,
         }
     }
-
-    pub fn u8_to_string(code: u8) -> &'static str {
-        match code {
-            0 => "Black",
-            1 => "Blue",
-            2 => "Green",
-            3 => "Cyan",
-            4 => "Red",
-            5 => "Magenta",
-            6 => "Brown",
-            7 => "LightGray",
-            8 => "DarkGray",
-            9 => "LightBlue",
-            10 => "LightGreen",
-            11 => "LightCyan",
-            12 => "LightRed",
-            13 => "Pink",
-            14 => "Yellow",
-            _ => "White",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,15 +67,19 @@ impl ColorCode {
     pub const fn new(foreground: Color, background: Color) -> ColorCode {
         ColorCode((background as u8) << 4 | (foreground as u8))
     }
+    #[inline(always)]
     pub fn foreground(&self) -> Color {
         Color::from_u8(self.0 & 0x0F)
     }
+    #[inline(always)]
     pub fn background(&self) -> Color {
         Color::from_u8((self.0 >> 4) & 0x0F)
     }
+    #[inline(always)]
     pub fn set_foreground(&mut self, foreground: Color) {
         self.0 = (self.0 & 0xF0) | (foreground as u8 & 0x0F);
     }
+    #[inline(always)]
     pub fn set_background(&mut self, background: Color) {
         self.0 = (self.0 & 0x0F) | ((background as u8 & 0x0F) << 4);
     }
@@ -107,8 +90,8 @@ impl Display for ColorCode {
         write!(
             f,
             "ColorCode(fg: {:?}, bg: {:?})",
-            Color::from_u8(self.0 & 0x0F),
-            Color::from_u8((self.0 >> 4) & 0x0F)
+            self.foreground(),
+            self.background()
         )
     }
 }
@@ -131,14 +114,6 @@ pub fn set_screen_accepts_input(screen_index: usize, accepts_input: bool) {
     });
 }
 
-pub fn screen_accepts_input(screen_index: usize) -> bool {
-    if let Some(accepts_input) = screen::with_screen(screen_index, |screen| screen.accepts_input) {
-        accepts_input
-    } else {
-        false
-    }
-}
-
 pub fn active_cursor_position() -> (u16, u16) {
     if let Some((x, y)) = screen::with_active_screen(|screen| (screen.cursor.x, screen.cursor.y)) {
         (x, y)
@@ -155,12 +130,6 @@ pub fn set_cursor_position_on(screen_index: usize, x: u16, y: u16) {
 
 pub fn change_color(color: ColorCode) {
     screen::with_active_screen_mut(|screen| {
-        screen.set_color(color);
-    });
-}
-
-pub fn change_color_on(screen_index: usize, color: ColorCode) {
-    screen::with_screen_mut(screen_index, |screen| {
         screen.set_color(color);
     });
 }
@@ -183,22 +152,16 @@ pub fn print_on(screen_index: usize, str: &str) {
     });
 }
 
-pub fn write_fmt_on(screen_index: usize, args: fmt::Arguments<'_>) {
+pub fn write_fmt_on(screen_index: usize, args: &fmt::Arguments<'_>) {
     screen::with_screen_mut(screen_index, |screen| {
         let mut formatter = ScreenFormatter { screen };
-        let _ = formatter.write_fmt(args);
+        let _ = formatter.write_fmt(*args);
     });
 }
 
 pub fn print_char_on(screen_index: usize, c: char) {
     screen::with_screen_mut(screen_index, |screen| {
         super::print::write_char_on(screen, c);
-    });
-}
-
-pub fn newline_on(screen_index: usize) {
-    screen::with_screen_mut(screen_index, |screen| {
-        super::print::newline_on(screen);
     });
 }
 
