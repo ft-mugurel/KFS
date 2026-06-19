@@ -52,12 +52,6 @@ pub fn execute_tasks() {
         };
 
         if let Some(task) = task_opt {
-            crate::printk_level_on!(
-                1,
-                crate::printk::printk::KernelLogLevel::Warning,
-                "Executing scheduled task at address: {:#010x}\n",
-                task as usize
-            );
             task();
         } else {
             break;

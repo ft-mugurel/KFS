@@ -131,10 +131,9 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
     if !regs.is_null() {
         let r = &*regs;
         pr_emerg!(
-            r#"Registers:
-            EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}
-            ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}
-        "#,
+            "Registers:\n\
+            EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}\n\
+            ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}\n",
             r.eax,
             r.ebx,
             r.ecx,

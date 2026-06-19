@@ -4,6 +4,7 @@ pub enum ProcessState {
     Running,
     Sleeping,
     Zombie,
+    Thread,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -13,17 +14,44 @@ pub struct Context {
     pub cr3: u32, // physical address of page directory
 }
 
-impl Context {
-    pub const fn new() -> Self {
-        Self { esp: 0, cr3: 0 }
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessMemory {
+    pub code_base: u32,
+    pub code_size: u32,
+    pub stack_base: u32,
+    pub stack_limit: u32,
+    pub heap_base: u32,
+    pub heap_brk: u32,
+}
+
+pub const MAX_CHILDREN: usize = 16;
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessFamily {
+    pub parent_pid: u32,
+    pub children: [u32; MAX_CHILDREN],
+    pub child_count: usize,
+}
+
+pub const MAX_SIGNALS: usize = 32;
+pub const SIGNAL_QUEUE_SIZE: usize = 16;
+#[derive(Clone, Copy)]
+pub struct SignalQueue {
+    pub pending: [u8; SIGNAL_QUEUE_SIZE],
+    pub head: usize,
+    pub tail: usize,
+    pub handlers: [u32; MAX_SIGNALS],
 }
 
 pub struct TaskStruct {
     pub pid: u32,
-    pub parent_pid: u32,
+    pub uid: u32,
     pub state: ProcessState,
     pub context: Context,
+
+    pub memory: ProcessMemory,
+    pub family: ProcessFamily,
+    pub signals: SignalQueue,
+
 	pub kernel_stack_top: u32,
     pub kernel_stack_bottom: u32,
     pub tty_id: usize,

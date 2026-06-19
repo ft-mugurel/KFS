@@ -45,6 +45,7 @@ const COMMANDS: &[&str] = &[
     "signal",
     "spawn",
     "wait",
+    "kill",
 ];
 
 struct ShellState {
@@ -525,6 +526,7 @@ fn run_command(line: &str) {
             }
         }
         "wait" => command_wait(),
+        "kill" => command_kill(parts),
         _ => {
             print("unknown command: ");
             print(command);
@@ -813,6 +815,17 @@ fn command_wait() {
             in("eax") 7, // syscall number for wait
             options(nostack, nomem),
         );
+        let status: i32;
+        core::arch::asm!(
+            "mov {}, eax",
+            out(reg) status,
+            options(nostack, nomem),
+        );
+        if status >= 0 {
+            print_fmt(&format_args!("Reaped child process with PID {}.\n", status));
+        } else {
+            print("No child processes to wait for.\n");
+        }
     }
 }
 
@@ -850,5 +863,38 @@ fn command_signal(mut parts: str::SplitWhitespace<'_>) {
         crate::signals::send_signal(signal);
     } else {
         crate::signals::schedule_signal(signal, delay_ms);
+    }
+}
+
+#[inline(always)]
+fn command_kill(mut parts: str::SplitWhitespace<'_>) {
+    let Some(pid_str) = parts.next() else {
+        print("usage: kill <pid> <signal>\n");
+        return;
+    };
+    let Some(sig_str) = parts.next() else {
+        print("usage: kill <pid> <signal>\n");
+        return;
+    };
+
+    let pid = parse_usize(pid_str).unwrap_or(0);
+    let sig = parse_usize(sig_str).unwrap_or(0);
+
+    unsafe {
+        let mut result: u32;
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 37,       // sys_kill
+            in("ebx") pid,
+            in("ecx") sig,
+            lateout("eax") result,
+            options(nostack, nomem),
+        );
+
+        if result == 0 {
+            print("Signal queued successfully.\n");
+        } else {
+            print("Failed to send signal. Invalid PID?\n");
+        }
     }
 }

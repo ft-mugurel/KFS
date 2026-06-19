@@ -5,7 +5,7 @@ use crate::gdt::gdt::{USER_CODE_SEL, USER_DATA_SEL};
 use crate::paging::page_table;
 use crate::paging::physical;
 use crate::sched::scheduler::PROCESS_TABLE;
-use crate::sched::task::{Context, ContextFrame, ProcessState, TaskStruct};
+use crate::sched::task::{ContextFrame, ProcessState, TaskStruct};
 use core::mem::size_of;
 
 static mut TEST_USER_KERNEL_STACK: [u8; 4096] = [0; 4096];
@@ -67,19 +67,24 @@ pub fn create_user_process(entry_point: fn()) -> bool {
         frame.user_esp = USER_STACK_VADDR - 4;
         frame.user_ss = user_data;
 
-        let new_task = TaskStruct {
-            pid: 2,
-            parent_pid: 0,
-            state: ProcessState::Ready,
-            context: Context {
-                esp: frame_ptr as u32,
-                cr3: new_cr3, // The Scheduler handles the hardware CR3 swap!
-            },
-            kernel_stack_top: k_stack_top,
-            kernel_stack_bottom: k_stack_bottom,
-            tty_id: 2,
-            wakeup_time: 0,
-        };
+        let mut new_task: TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
+        new_task.pid = 2;
+        new_task.uid = 1000;
+        new_task.state = ProcessState::Ready;
+        new_task.context.esp = frame_ptr as u32;
+        new_task.context.cr3 = new_cr3;
+
+        // V.2 Memory Tracking Initialization
+        new_task.memory.code_base = USER_CODE_VADDR;
+        new_task.memory.code_size = 4096;
+        new_task.memory.stack_base = USER_STACK_VADDR;
+        new_task.memory.stack_limit = USER_STACK_VADDR - 4096;
+        new_task.memory.heap_base = 0x4000_0000;
+        new_task.memory.heap_brk = 0x4000_0000;
+
+        new_task.kernel_stack_top = k_stack_top;
+        new_task.kernel_stack_bottom = k_stack_bottom;
+        new_task.tty_id = 2;
 
         PROCESS_TABLE[2] = Some(new_task);
         crate::pr_info!("Spawned Isolated User Process PID 2\n");

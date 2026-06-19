@@ -195,13 +195,7 @@ fn pop_scancode() -> Option<u8> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn keyboard_interrupt_handler() {
-    // read and unblock the port
     push_scancode(inb(PIC_KEYBOARD_DATA_PORT));
-    crate::printk_level_on!(
-        1,
-        crate::printk::printk::KernelLogLevel::Warning,
-        "Keyboard interrupt received. Scancode pushed to queue.\n"
-    );
     schedule_task(process_keyboard_event);
     outb(PIC_MASTER_COMMAND_PORT, PIC_EOI);
 }
