@@ -1,12 +1,13 @@
 use crate::interrupts::task_queue::execute_tasks;
 use crate::spin::Spinlock;
 use crate::startup_config::shell::SCREEN_INDEX;
-use crate::vga::text_mod::out::{active_cursor_position, print_char_on, set_cursor_position_on};
+use crate::vga::text_mod::out::{active_cursor_position, active_screen_index, print_char_on, set_cursor_position_on};
 use core::arch::asm;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
 const BUF_SIZE: usize = 256;
+const NUM_TTYS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -33,26 +34,30 @@ struct KeyboardBuffer {
     tail: usize,
 }
 
-static KBD_BUFFER: Spinlock<KeyboardBuffer> =
-    Spinlock::new(KeyboardBuffer { data: ['\0'; BUF_SIZE], head: 0, tail: 0 });
+const EMPTY_BUFFER: KeyboardBuffer = KeyboardBuffer { data: ['\0'; BUF_SIZE], head: 0, tail: 0 };
+static TTY_BUFFERS: Spinlock<[KeyboardBuffer; NUM_TTYS]> = Spinlock::new([EMPTY_BUFFER; NUM_TTYS]);
 
 pub(crate) fn push_char(c: char) {
-    let mut buf = KBD_BUFFER.lock();
+    let active_tty = active_screen_index();
+
+    let mut buffers = TTY_BUFFERS.lock();
+    let buf = &mut buffers[active_tty];
+
     let next_head = (buf.head + 1) % BUF_SIZE;
     if next_head != buf.tail {
-        let head = buf.head;
-        buf.data[head] = c;
+        buf.data[buf.head] = c;
         buf.head = next_head;
     }
 }
 
-pub fn get_char() -> char {
+pub fn get_char_for_tty(tty_id: usize) -> char {
     loop {
-        // We need to call this here, bc we don't have a separate scheduling right now.
-        execute_tasks();
+        crate::interrupts::task_queue::execute_tasks();
 
         let c = {
-            let mut buf = KBD_BUFFER.lock();
+            let mut buffers = TTY_BUFFERS.lock();
+            let buf = &mut buffers[tty_id];
+            
             if buf.head != buf.tail {
                 let val = buf.data[buf.tail];
                 buf.tail = (buf.tail + 1) % BUF_SIZE;
@@ -66,20 +71,17 @@ pub fn get_char() -> char {
             return ch;
         }
 
-        unsafe {
-            asm!("hlt");
-        }
+        unsafe { core::arch::asm!("hlt"); }
     }
 }
 
-pub fn get_line(buffer: &mut [u8]) -> usize {
-
+pub fn get_line(tty_id: usize, buffer: &mut [u8]) -> usize {
     set_input_mode(InputMode::Blocking);
 
     let mut idx = 0;
 
     loop {
-        let c = get_char();
+        let c = get_char_for_tty(tty_id);
 
         if c == '\n' {
             print_char_on(SCREEN_INDEX, '\n');

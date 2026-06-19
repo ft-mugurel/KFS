@@ -80,7 +80,7 @@ const fn is_non_fatal_exception(vector: usize) -> bool {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct Registers {
+pub struct ExceptionStackFrame {
     pub edi: u32,
     pub esi: u32,
     pub ebp: u32,
@@ -89,10 +89,15 @@ pub struct Registers {
     pub edx: u32,
     pub ecx: u32,
     pub eax: u32,
+    pub interrupt_number: u32,
+    pub error_code: u32,
+    pub eip: u32,
+    pub cs: u32,
+    pub eflags: u32,
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Registers) {
+pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const ExceptionStackFrame) {
     let idx = vector as usize;
     let name = EXCEPTION_NAMES
         .get(idx)
@@ -100,8 +105,18 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Regi
         .unwrap_or("Unknown Exception");
 
     if idx == 14 {
+        let frame = &*regs;
+        let present = (frame.error_code & 0b001) != 0;
+        let write = (frame.error_code & 0b010) != 0;
+        let user = (frame.error_code & 0b100) != 0;
         let fault_addr = x86::read_cr2();
         pr_emerg!("EXCEPTION #{}: {} (cr2={:#x})\n", idx, name, fault_addr);
+        pr_emerg!(
+            "Page Fault Details: present={}, write={}, user={}\n",
+            present,
+            write,
+            user
+        );
     } else if is_non_fatal_exception(idx) {
         pr_warn!("EXCEPTION #{}: {} (continuing)\n", idx, name);
         return;

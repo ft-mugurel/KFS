@@ -3,7 +3,7 @@ use super::page_table;
 use super::physical;
 use crate::{pr_debug, pr_warn};
 
-const VMALLOC_START: u32 = KERNEL_SPACE_START as u32 + 0x0020_0000;
+const VMALLOC_START: u32 = KERNEL_SPACE_START as u32 + 0x0040_0000;
 const VMALLOC_END: u32 = KERNEL_SPACE_START as u32 + 0x0100_0000;
 const VMALLOC_SIZE: usize = (VMALLOC_END - VMALLOC_START) as usize;
 const MAX_VIRTUAL_ALLOCS: usize = 128;

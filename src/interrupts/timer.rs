@@ -1,6 +1,7 @@
 use crate::interrupts::idt::register_interrupt_handler;
 use crate::interrupts::pit::init_pit;
 use crate::pr_debug;
+use crate::sched::scheduler::schedule;
 use crate::signals::process_scheduled_signals;
 use crate::startup_config::pic;
 use crate::x86::outb;
@@ -12,7 +13,7 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn timer_interrupt_handler() {
+pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
     unsafe {
         TICKS = TICKS.wrapping_add(1);
     }
@@ -21,6 +22,8 @@ pub unsafe extern "C" fn timer_interrupt_handler() {
 
     // Send End of Interrupt (EOI) to master PIC
     outb(pic::MASTER_COMMAND_PORT, pic::EOI);
+
+    schedule(old_esp)
 }
 
 pub fn init_timer() {
@@ -30,4 +33,8 @@ pub fn init_timer() {
     );
     init_pit(crate::startup_config::power::CONFIG_HZ);
     register_interrupt_handler(pic::TIMER_IRQ_VECTOR, isr_timer);
+}
+
+pub fn get_ticks() -> u64 {
+    unsafe { TICKS }
 }

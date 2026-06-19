@@ -2,11 +2,11 @@ use crate::startup_config::pic;
 use crate::x86::outb;
 
 #[inline(always)]
-unsafe fn io_wait() {
+fn io_wait() {
     outb(0x80, 0);
 }
 
-pub(crate) unsafe fn init_pic() {
+pub(crate) fn init_pic() {
     // Master PIC: Başlangıç komutları
     outb(pic::MASTER_COMMAND_PORT, pic::ICW1_INIT); // ICW1: Başlangıç
     io_wait();

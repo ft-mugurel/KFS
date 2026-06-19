@@ -14,6 +14,11 @@ fn execute_shutdown() {
 }
 
 pub(crate) fn request_shutdown() {
+    crate::printk_level_on!(
+        1,
+        crate::printk::printk::KernelLogLevel::Warning,
+        "Shutdown requested. Scheduling shutdown task.\n"
+    );
     schedule_task(execute_shutdown);
 }
 

@@ -13,14 +13,39 @@ use crate::printk::{set_log_level, KernelLogLevel};
 use crate::signals::Signal;
 use crate::startup_config;
 use crate::vga::text_mod::out::{
-    self, active_screen_accepts_input, change_color, clear, print_char_on, print_on,
-    set_cursor_movement_on, switch_screen, Color, ColorCode,
+    active_cursor_position, active_screen_accepts_input, change_color, clear, is_screen_active,
+    print_char_on, print_on, scroll_view_to_bottom, set_cursor_movement_on, set_cursor_position_on,
+    set_screen_accepts_input, switch_screen, switch_to_next_screen, switch_to_previous_screen,
+    write_fmt_on, Color, ColorCode,
 };
 use crate::vga::text_mod::screen;
 
 const PROMPT: &str = "mysh > ";
 const MAX_INPUT_LEN: usize = startup_config::shell::MAX_INPUT_LEN;
 const SCREEN_INDEX: usize = startup_config::shell::SCREEN_INDEX;
+const COMMANDS: &[&str] = &[
+    "help",
+    "clear",
+    "echo",
+    "reboot",
+    "shutdown",
+    "screen",
+    "loglevel",
+    "color",
+    "memstat",
+    "memdebug",
+    "memdump",
+    "pte",
+    "memtest",
+    "stack",
+    "crash",
+    "sc_write",
+    "layout",
+    "read_test",
+    "signal",
+    "spawn",
+    "wait",
+];
 
 struct ShellState {
     input: [u8; MAX_INPUT_LEN],
@@ -206,7 +231,7 @@ fn print_char(c: char) {
 
 #[inline]
 fn print_fmt(args: &fmt::Arguments<'_>) {
-    out::write_fmt_on(SCREEN_INDEX, args);
+    write_fmt_on(SCREEN_INDEX, args);
 }
 
 fn shell_sigint_handler() {
@@ -235,10 +260,11 @@ pub fn init_shell() {
     });
 
     crate::signals::register_signal_handler(Signal::SIGINT, shell_sigint_handler);
+    set_screen_accepts_input(SCREEN_INDEX, true);
 }
 
 pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
-    if !out::is_screen_active(SCREEN_INDEX) || !active_screen_accepts_input() {
+    if !is_screen_active(SCREEN_INDEX) || !active_screen_accepts_input() {
         return false;
     }
 
@@ -259,7 +285,7 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
         }
         KeyCode::ArrowLeft => {
             if modifiers.shift() {
-                out::switch_to_previous_screen();
+                switch_to_previous_screen();
             } else if with_shell_state_mut(|state| state.idx_left()) {
                 redraw_input_line();
             }
@@ -267,7 +293,7 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
         }
         KeyCode::ArrowRight => {
             if modifiers.shift() {
-                out::switch_to_next_screen();
+                switch_to_next_screen();
             } else if with_shell_state_mut(|state| state.idx_right()) {
                 redraw_input_line();
             }
@@ -309,10 +335,11 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
         KeyCode::Tab => {
             with_shell_state_mut(|state| {
                 if state.idx == 0 || state.input[state.idx - 1] == b' ' {
-                    print(
-                        "\nhelp clear echo shutdown reboot screen loglevel color memstat memdebug \n
-                        memdump pte memtest stack\n",
-                    );
+                    print("\n");
+                    for cmd in COMMANDS {
+                        print_fmt(&format_args!("{} ", cmd));
+                    }
+                    print("\n");
                     state.clear_input();
                     redraw_input_line();
                     return;
@@ -322,12 +349,25 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
                     .rposition(|&b| b == b' ')
                     .map_or(0, |pos| pos + 1);
                 let partial = str::from_utf8(&state.input[start..state.idx]).unwrap_or("");
-                if let Some(completion) = complete(partial) {
-                    for c in completion[partial.len()..].chars() {
+                let (common_prefix, match_count) = longest_common_prefix(partial);
+                if match_count == 0 {
+                    return;
+                }
+
+                let missing_prefix = &common_prefix[partial.len()..];
+                if !missing_prefix.is_empty() {
+                    for c in missing_prefix.chars() {
                         state.push_char(c);
                     }
-                    redraw_input_line();
+                } else if match_count > 1 {
+                    print("\n");
+                    for cmd in COMMANDS.iter().filter(|&&cmd| cmd.starts_with(partial)) {
+                        print_fmt(&format_args!("{} ", cmd));
+                    }
+                    print("\n");
                 }
+
+                redraw_input_line();
             });
             true
         }
@@ -343,6 +383,35 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
     }
 }
 
+fn longest_common_prefix(partial: &str) -> (&'static str, usize) {
+    let mut matches = COMMANDS
+        .iter()
+        .copied()
+        .filter(|cmd| cmd.starts_with(partial));
+
+    let Some(first) = matches.next() else {
+        return ("", 0);
+    };
+
+    let mut count = 1;
+    let mut prefix_len = first.len();
+
+    for cmd in matches {
+        count += 1;
+        let mut common_len = 0;
+        for (b1, b2) in first[..prefix_len].bytes().zip(cmd.bytes()) {
+            if b1 == b2 {
+                common_len += 1;
+            } else {
+                break;
+            }
+        }
+        prefix_len = common_len;
+    }
+
+    (&first[..prefix_len], count)
+}
+
 fn try_insert_char(c: char) -> bool {
     let inserted = with_shell_state_mut(|state| state.push_char(c));
     if inserted {
@@ -352,7 +421,7 @@ fn try_insert_char(c: char) -> bool {
 }
 
 fn redraw_input_line() {
-    let (cursor_x, cursor_y) = out::active_cursor_position();
+    let (cursor_x, cursor_y) = active_cursor_position();
 
     with_shell_state_mut(|state| {
         let old_rendered_len = state.rendered_len;
@@ -374,10 +443,10 @@ fn redraw_input_line() {
         let cursor_offset = PROMPT.len() + state.idx;
         let new_cursor_x = (cursor_offset % screen::VGA_WIDTH) as u16;
         let new_cursor_y = cursor_y + (cursor_offset / screen::VGA_WIDTH) as u16;
-        out::set_cursor_position_on(SCREEN_INDEX, new_cursor_x, new_cursor_y);
+        set_cursor_position_on(SCREEN_INDEX, new_cursor_x, new_cursor_y);
         state.rendered_len = new_rendered_len;
         let _ = cursor_x;
-        out::scroll_view_to_bottom();
+        scroll_view_to_bottom();
     });
 }
 
@@ -407,7 +476,7 @@ fn run_command_line() {
         state.add_to_history(line);
     });
 
-    if out::is_screen_active(SCREEN_INDEX) {
+    if is_screen_active(SCREEN_INDEX) {
         print(PROMPT);
         with_shell_state_mut(|state| {
             state.idx = 0;
@@ -423,7 +492,7 @@ fn run_command(line: &str) {
     };
 
     match command {
-        "help" => command_help(),
+        "help" => command_help(parts),
         "clear" => clear(SCREEN_INDEX),
         "echo" => {
             let rest = line[command.len()..].trim_start();
@@ -439,37 +508,23 @@ fn run_command(line: &str) {
         "memdebug" => memory::print_memdebug(|args| print_fmt(args)),
         "memdump" => command_memdump(parts),
         "pte" => command_pte(parts),
-        "memtest" => {
-            let features = line[command.len()..].trim();
-            memory::run_memtest(features, |args| print_fmt(args));
-        }
-        "stack" => {
-            let words = if let Some(words_str) = parts.next() {
-                let Some(parsed) = parse_usize(words_str) else {
-                    print("invalid word count\n");
-                    return;
-                };
-                parsed
-            } else {
-                stack::DEFAULT_DUMP_WORDS
-            };
-
-            if words == 0 || words > stack::MAX_DUMP_WORDS {
-                print("word count must be in range 1..=64\n");
-                return;
-            }
-
-            command_stack(words);
-        }
+        "memtest" => memory::run_memtest(line[command.len()..].trim(), |args| print_fmt(args)),
+        "stack" => command_stack(parts),
         "layout" => command_layout(parts),
-        "crash" => {
-            unsafe {
-                // SAFETY: This is intentionally crashing the kernel for testing purposes.
-                core::ptr::read_volatile(0xdeadbeef as *const u32);
-            }
-        }
+        "crash" => unsafe {
+            core::ptr::read_volatile(0xdeadbeef as *const u32);
+        },
         "sc_write" => command_sc_write(),
         "read_test" => command_read_test(),
+        "signal" => command_signal(parts),
+        "spawn" => {
+            if crate::sched::create_user_process(crate::user_process) {
+                print("Successfully spawned Ring 3 process on PID 2.\n");
+            } else {
+                print("Error: PID 2 is already running!\n");
+            }
+        }
+        "wait" => command_wait(),
         _ => {
             print("unknown command: ");
             print(command);
@@ -506,46 +561,16 @@ fn parse_color(name: &str) -> Option<Color> {
     }
 }
 
-fn complete(_partial: &str) -> Option<&'static str> {
-    let commands = [
-        "help",
-        "clear",
-        "echo",
-        "reboot",
-        "shutdown",
-        "screen",
-        "loglevel",
-        "color",
-        "memstat",
-        "memdebug",
-        "memdump",
-        "pte",
-        "memtest",
-        "stack",
-        "crash",
-        "sc_write",
-        "layout",
-        "read_test",
-    ];
-    let mut matches = commands.iter().filter(|&cmd| cmd.starts_with(_partial));
-    let first_match = matches.next()?;
-    if matches.next().is_some() {
-        print_char('\n');
-        print(*first_match);
-        matches.for_each(|&cmd| print_fmt(&format_args!(" {}", cmd)));
-        print_char('\n');
-        redraw_input_line();
-        None
-    } else {
-        Some(first_match)
-    }
+fn strip_hex_prefix(input: &str) -> Option<&str> {
+    let input = input.trim();
+    input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
 }
 
 fn parse_u32(input: &str) -> Option<u32> {
-    if let Some(hex) = input
-        .strip_prefix("0x")
-        .or_else(|| input.strip_prefix("0X"))
-    {
+    let input = input.trim();
+    if let Some(hex) = strip_hex_prefix(input) {
         u32::from_str_radix(hex, 16).ok()
     } else {
         input.parse::<u32>().ok()
@@ -553,10 +578,8 @@ fn parse_u32(input: &str) -> Option<u32> {
 }
 
 fn parse_usize(input: &str) -> Option<usize> {
-    if let Some(hex) = input
-        .strip_prefix("0x")
-        .or_else(|| input.strip_prefix("0X"))
-    {
+    let input = input.trim();
+    if let Some(hex) = strip_hex_prefix(input) {
         usize::from_str_radix(hex, 16).ok()
     } else {
         input.parse::<usize>().ok()
@@ -564,26 +587,43 @@ fn parse_usize(input: &str) -> Option<usize> {
 }
 
 #[inline(always)]
-fn command_help() {
-    print(
-        r#"Commands:
-        help clear echo shutdown reboot screen loglevel color memstat memdebug
-        memdump pte memtest stack crash sc_write layout read_test
-          screen <1-6>
-          loglevel <emerg|alert|crit|err|warn|notice|info|debug>
-          color <white|gray|red|green|blue|yellow|cyan|magenta>
-          memstat
-          memdebug
-          memdump <addr> [len<=512]
-          pte <addr>
-          memtest [physical,vmem,heap,page,all]
-          stack [words<=64]
-          crash
-          sc_write
-          layout <us|tr>
-          read_test
-        "#,
-    );
+fn command_help(mut parts: str::SplitWhitespace<'_>) {
+    let Some(topic) = parts.next() else {
+        print(
+            "Available commands:\n\
+            help clear echo shutdown reboot screen loglevel color memstat memdebug\n\
+            memdump pte memtest stack crash sc_write layout read_test signal\n\
+            spawn\n",
+        );
+        print("Type 'help <command>' for more details on a specific command.\n");
+        return;
+    };
+
+    match topic {
+        "help" => print("help [command]\n  Show this help message or details about a specific command.\n"),
+        "clear" => print("clear\n  Clear the shell screen.\n"),
+        "echo" => print("echo <message>\n  Print the message to the shell.\n"),
+        "reboot" => print("reboot\n  Reboot the system.\n"),
+        "shutdown" => print("shutdown\n  Shut down the system.\n"),
+        "screen" => print("screen <1-6>\n  Switch to a different screen (virtual terminal).\n"),
+        "loglevel" => print("loglevel <emerg|alert|crit|err|warn|notice|info|debug>\n  Set the kernel log level.\n"),
+        "color" => print("color <white|gray|red|green|blue|yellow|cyan|magenta>\n  Change the shell text color.\n"),
+        "memstat" => print("memstat\n  Display memory usage statistics.\n"),
+        "memdebug" => print("memdebug\n  Display detailed memory allocator debug information.\n"),
+        "memdump" => print("memdump <addr> [len<=512]\n  Dump virtual memory starting at addr for len bytes (default 128).\n"),
+        "pte" => print("pte <addr>\n  Display the page table entry for the given virtual address.\n"),
+        "memtest" => print("memtest [physical,vmem,heap,page,all]\n  Run memory tests on different memory regions.\n"),
+        "stack" => print("stack [words<=64]\n  Dump the current stack contents (default 32 words).\n"),
+        "crash" => print("crash\n  Intentionally crash the kernel for testing purposes.\n"),
+        "sc_write" => print("sc_write\n  Test syscall write by printing a message directly from a syscall.\n"),
+        "layout" => print("layout <us|tr>\n  Change keyboard layout to US QWERTY or Turkish QWERTY.\n"),
+        "read_test" => print("read_test\n  Test blocking read by prompting for user input and echoing it back.\n"),
+        "signal" => print("signal <signum|signal_name> [delay_ms]\n  Send a signal to the shell process, optionally with a delay in milliseconds.\n"),
+        "spawn" => print("spawn\n  Spawn a user process (Ring 3) on PID 2. If PID 2 is already running, it will not spawn a new process.\n"),
+        "wait" => print("wait\n  Wait for a child process to exit and reap it if it's a zombie.\n"),
+        "sleep" => print("sleep <milliseconds>\n  Put the shell process to sleep for the specified duration.\n"),
+        _ => print("Unknown command. Type 'help' for a list of commands.\n"),
+    }
 }
 
 #[inline(always)]
@@ -684,7 +724,22 @@ fn command_pte(mut parts: str::SplitWhitespace<'_>) {
 }
 
 #[inline(always)]
-fn command_stack(words: usize) {
+fn command_stack(mut parts: str::SplitWhitespace<'_>) {
+    let words = if let Some(words_str) = parts.next() {
+        let Some(parsed) = parse_usize(words_str) else {
+            print("invalid word count\n");
+            return;
+        };
+        parsed
+    } else {
+        stack::DEFAULT_DUMP_WORDS
+    };
+
+    if words == 0 || words > stack::MAX_DUMP_WORDS {
+        print("word count must be in range 1..=64\n");
+        return;
+    }
+
     let options = DumpStackOptions { words, trace_frames: stack::DEFAULT_TRACE_FRAMES };
 
     stack::dump_stack_with_options(options, |args| {
@@ -739,7 +794,7 @@ fn command_read_test() {
     let mut buffer = [0u8; 64];
 
     // This will block the shell execution until the user presses Enter
-    let len = crate::interrupts::keyboard::api::get_line(&mut buffer);
+    let len = crate::interrupts::keyboard::api::get_line(SCREEN_INDEX, &mut buffer);
 
     if let Ok(input_str) = core::str::from_utf8(&buffer[..len]) {
         print("Hello, ");
@@ -747,5 +802,53 @@ fn command_read_test() {
         print("!\n");
     } else {
         print("Invalid input.\n");
+    }
+}
+
+#[inline(always)]
+fn command_wait() {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 7, // syscall number for wait
+            options(nostack, nomem),
+        );
+    }
+}
+
+#[inline(always)]
+fn command_signal(mut parts: str::SplitWhitespace<'_>) {
+    let Some(sig_str) = parts.next() else {
+        print("usage: signal <signum|signal_name> [delay_ms]\n");
+        return;
+    };
+
+    let sig = if let Ok(num) = sig_str.parse::<u8>() {
+        Signal::from_u8(num)
+    } else {
+        Signal::from_name(sig_str)
+    };
+
+    let Some(signal) = sig else {
+        print("invalid signal\n");
+        return;
+    };
+
+    let delay_ms = if let Some(delay_str) = parts.next() {
+        match delay_str.parse::<u64>() {
+            Ok(delay) => delay,
+            Err(_) => {
+                print("invalid delay\n");
+                return;
+            }
+        }
+    } else {
+        0
+    };
+
+    if delay_ms == 0 {
+        crate::signals::send_signal(signal);
+    } else {
+        crate::signals::schedule_signal(signal, delay_ms);
     }
 }

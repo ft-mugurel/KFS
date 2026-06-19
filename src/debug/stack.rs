@@ -4,9 +4,9 @@ use crate::debug::kallsyms;
 use crate::paging::page_table;
 use crate::x86;
 
-pub const DEFAULT_DUMP_WORDS: usize = 16;
+pub const DEFAULT_DUMP_WORDS: usize = 10;
 pub const MAX_DUMP_WORDS: usize = 64;
-pub const DEFAULT_TRACE_FRAMES: usize = 16;
+pub const DEFAULT_TRACE_FRAMES: usize = 10;
 pub const MAX_TRACE_FRAMES: usize = 32;
 const MAX_SYMBOL_OFFSET: u32 = 0x2000;
 const DEFAULT_SCAN_WORDS: usize = 128;
@@ -37,43 +37,43 @@ pub fn dump_stack_with_options(
     options: DumpStackOptions,
     mut emit: impl FnMut(fmt::Arguments<'_>),
 ) {
-    let words = options.words.clamp(1, MAX_DUMP_WORDS);
+    // let words = options.words.clamp(1, MAX_DUMP_WORDS);
     let trace_frames = options.trace_frames.clamp(1, MAX_TRACE_FRAMES);
 
-    let esp = x86::read_esp();
+    // let esp = x86::read_esp();
     let ebp = x86::read_ebp();
 
-    emit(format_args!("------------[ cut here ]------------\n"));
-    emit(format_args!("Kernel stack dump\n"));
-    emit(format_args!("ESP: {:#010x} EBP: {:#010x}\n", esp, ebp));
-    emit(format_args!("Stack:\n"));
+    // emit(format_args!("------------[ cut here ]------------\n"));
+    // emit(format_args!("Kernel stack dump\n"));
+    // emit(format_args!("ESP: {:#010x} EBP: {:#010x}\n", esp, ebp));
+    // emit(format_args!("Stack:\n"));
 
-    for i in 0..words {
-        let offset = match (i as u32).checked_mul(4) {
-            Some(v) => v,
-            None => break,
-        };
+    // for i in 0..words {
+    //     let offset = match (i as u32).checked_mul(4) {
+    //         Some(v) => v,
+    //         None => break,
+    //     };
 
-        let addr = match esp.checked_add(offset) {
-            Some(v) => v,
-            None => {
-                emit(format_args!("  <address overflow>\n"));
-                break;
-            }
-        };
+    //     let addr = match esp.checked_add(offset) {
+    //         Some(v) => v,
+    //         None => {
+    //             emit(format_args!("  <address overflow>\n"));
+    //             break;
+    //         }
+    //     };
 
-        let marker = if addr == ebp { " <ebp>" } else { "" };
-        if !is_mapped_u32(addr) {
-            emit(format_args!("  {:#010x}: ????????{}\n", addr, marker));
-            continue;
-        }
+    //     let marker = if addr == ebp { " <ebp>" } else { "" };
+    //     if !is_mapped_u32(addr) {
+    //         emit(format_args!("  {:#010x}: ????????{}\n", addr, marker));
+    //         continue;
+    //     }
 
-        let value = unsafe { ptr::read_volatile(addr as *const u32) };
-        emit(format_args!(
-            "  {:#010x}: {:#010x}{}\n",
-            addr, value, marker
-        ));
-    }
+    //     let value = unsafe { ptr::read_volatile(addr as *const u32) };
+    //     emit(format_args!(
+    //         "  {:#010x}: {:#010x}{}\n",
+    //         addr, value, marker
+    //     ));
+    // }
 
     emit(format_args!("Call Trace (frame walk):\n"));
     let mut frame = ebp;
@@ -112,7 +112,7 @@ pub fn dump_stack_with_options(
 
         frame = next;
     }
-
+/* 
     emit(format_args!("Call Trace (stack scan):\n"));
     let mut emitted = 0usize;
     let mut last_name: Option<&str> = None;
@@ -166,10 +166,10 @@ pub fn dump_stack_with_options(
             break;
         }
     }
-
     if emitted == 0 {
         emit(format_args!("  <no additional symbolized entries>\n"));
     }
+    */
 }
 
 fn emit_trace_entry(emit: &mut impl FnMut(fmt::Arguments<'_>), depth: usize, ret: u32) {

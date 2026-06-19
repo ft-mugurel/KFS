@@ -13,7 +13,7 @@ const TABLE_FLAGS: u32 = PAGE_PRESENT | PAGE_WRITABLE;
 const PAGE_FRAME_MASK: u32 = 0xFFFF_F000;
 const PAGE_TABLE_ALLOC_LIMIT: u64 = 0x0040_0000;
 
-#[repr(align(4096))]
+#[repr(C, align(4096))]
 struct PageDirectory([u32; ENTRIES_PER_TABLE]);
 
 #[repr(align(4096))]
@@ -22,6 +22,28 @@ struct PageTable([u32; ENTRIES_PER_TABLE]);
 static mut BOOT_PAGE_DIRECTORY: PageDirectory = PageDirectory([0; ENTRIES_PER_TABLE]);
 static mut BOOT_LOW_TABLE: PageTable = PageTable([0; ENTRIES_PER_TABLE]);
 static mut BOOT_KERNEL_TABLE: PageTable = PageTable([0; ENTRIES_PER_TABLE]);
+pub static mut PAGING_INITIALIZED: bool = false;
+
+#[inline]
+fn phys_to_virt(phys: u32) -> *mut u32 {
+    (phys + KERNEL_SPACE_START as u32) as *mut u32
+}
+
+fn active_pd_ptr() -> *mut u32 {
+    unsafe {
+        if !PAGING_INITIALIZED {
+            // During init_paging, force all mappings into the permanent static directory
+            return (&raw mut BOOT_PAGE_DIRECTORY.0) as *mut u32;
+        }
+        // After boot, dynamically route to the hardware CR3 (for user processes)
+        let cr3 = x86::read_cr3() & PAGE_FRAME_MASK;
+        phys_to_virt(cr3)
+    }
+}
+
+pub fn mark_paging_initialized() {
+    unsafe { PAGING_INITIALIZED = true; }
+}
 
 fn kernel_pd_index() -> usize {
     (KERNEL_SPACE_START >> 22) as usize
@@ -61,7 +83,7 @@ fn fill_kernel_low_alias_table() {
 }
 
 fn zero_page_table(table_phys: u32) {
-    let pt_ptr = table_phys as *mut u32;
+    let pt_ptr = phys_to_virt(table_phys);
     for i in 0usize..ENTRIES_PER_TABLE {
         unsafe { pt_ptr.add(i).write(0) };
     }
@@ -86,7 +108,7 @@ fn validate_virtual_address(virt_addr: u32, flags: u32) -> Result<(), &'static s
 }
 
 fn ensure_page_table(pde_index: usize) -> Result<u32, &'static str> {
-    let pd_ptr = (unsafe { &raw mut BOOT_PAGE_DIRECTORY.0 }) as *mut u32;
+    let pd_ptr = active_pd_ptr();
     let pde = unsafe { pd_ptr.add(pde_index).read() };
 
     if (pde & PAGE_PRESENT) != 0 {
@@ -97,14 +119,12 @@ fn ensure_page_table(pde_index: usize) -> Result<u32, &'static str> {
         .ok_or("no low physical frame available for page table")?;
 
     zero_page_table(table_phys);
-    unsafe { pd_ptr.add(pde_index).write(table_phys | TABLE_FLAGS) };
+    unsafe {
+        pd_ptr
+            .add(pde_index)
+            .write(table_phys | TABLE_FLAGS | PAGE_USER)
+    };
     x86::write_cr3(x86::read_cr3());
-
-    pr_debug!(
-        "created page table for pde={} at phys={:#x}\n",
-        pde_index,
-        table_phys
-    );
 
     Ok(table_phys)
 }
@@ -112,20 +132,20 @@ fn ensure_page_table(pde_index: usize) -> Result<u32, &'static str> {
 fn get_page_entry_ptr(virt_addr: u32) -> Result<*mut u32, &'static str> {
     let pde = pde_index(virt_addr);
     let pt_phys = ensure_page_table(pde)?;
-    let pt_ptr = pt_phys as *mut u32;
+    let pt_ptr = phys_to_virt(pt_phys);
     Ok(unsafe { pt_ptr.add(pte_index(virt_addr)) })
 }
 
 fn lookup_page_entry_ptr(virt_addr: u32) -> Option<*mut u32> {
     unsafe {
         let pde = pde_index(virt_addr);
-        let pd_ptr = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32;
+        let pd_ptr = active_pd_ptr();
         let pde_entry = pd_ptr.add(pde).read();
         if (pde_entry & PAGE_PRESENT) == 0 {
             return None;
         }
-
-        let pt_ptr = (pde_entry & PAGE_FRAME_MASK) as *mut u32;
+        let pt_phys = pde_entry & PAGE_FRAME_MASK;
+        let pt_ptr = phys_to_virt(pt_phys);
         Some(pt_ptr.add(pte_index(virt_addr)))
     }
 }
@@ -276,4 +296,20 @@ pub fn unmap_page(virt_addr: u32) -> Result<(), &'static str> {
 
     pr_debug!("unmap_page: va={:#x}\n", virt_addr);
     Ok(())
+}
+
+pub fn create_user_address_space() -> Option<u32> {
+    unsafe {
+        let pd_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
+        zero_page_table(pd_phys);
+
+        let new_pd_ptr = phys_to_virt(pd_phys);
+        let boot_pd_ptr = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32;
+
+        for i in 0..ENTRIES_PER_TABLE {
+            new_pd_ptr.add(i).write(boot_pd_ptr.add(i).read());
+        }
+
+        Some(pd_phys)
+    }
 }

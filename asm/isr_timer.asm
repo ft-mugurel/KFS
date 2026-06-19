@@ -3,8 +3,34 @@ extern timer_interrupt_handler
 
 section .text
 isr_timer:
-    pushad                      ; Save all 32-bit general-purpose registers
-    cld                         ; Clear direction flag (C calling convention)
+    ; 1. Save data segments
+    push ds
+    push es
+    push fs
+    push gs
+    
+    ; 2. Save general purpose registers
+    pushad                      
+    
+    ; 3. Setup kernel data segments for the Rust handler
+    ; (0x10 is your KERNEL_DATA_SELECTOR)
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    
+    push esp                    ; Pass the current stack pointer to Rust
+    cld                         
     call timer_interrupt_handler
-    popad                       ; Restore all 32-bit general-purpose registers
-    iretd                       ; 32-bit Interrupt return
+    add esp, 4                  
+    
+    mov esp, eax                ; THE PIVOT
+    
+    ; 4. Restore everything from the NEW stack
+    popad                       
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    iretd                       ; Jump to Ring 3!

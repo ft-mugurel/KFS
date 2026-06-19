@@ -1,9 +1,6 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::interrupts::keyboard::keycode::{
-    KeyCode::{self, A},
-    Modifiers,
-};
+use crate::interrupts::keyboard::keycode::{KeyCode, Modifiers};
 
 #[derive(Clone, Copy)]
 pub struct Glyph {

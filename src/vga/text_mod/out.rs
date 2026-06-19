@@ -230,6 +230,10 @@ pub fn is_screen_active(screen_index: usize) -> bool {
     screen::active_screen_index() == screen_index
 }
 
+pub fn active_screen_index() -> usize {
+    screen::active_screen_index()
+}   
+
 pub fn set_cursor_movement_on(screen_index: usize, mode: screen::CursorMovement) {
     screen::with_screen_mut(screen_index, |screen| {
         screen.cursor_movement = mode;

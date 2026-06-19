@@ -632,5 +632,6 @@ pub fn init_paging(multiboot_magic: u32, multiboot_info_addr: u32) {
         page_table::bootstrap_directory_phys_addr()
     );
 
+    page_table::mark_paging_initialized();
     run_bootstrap_self_tests();
 }

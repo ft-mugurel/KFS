@@ -8,7 +8,7 @@ fn panic(info: &PanicInfo) -> ! {
 	crate::disable_interrupts();
     crate::pr_emerg!("KERNEL PANIC\n");
     crate::pr_emerg!("{}\n", info);
-    save_stack_trace();
+    // save_stack_trace();
     switch_screen(DEFAULT_LOG_SCREEN);
     unsafe { crate::x86::clean_registers_and_halt() };
 }

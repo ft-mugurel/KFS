@@ -81,7 +81,7 @@ impl TaskStateSegment {
     }
 }
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 const GDT_ENTRIES_COUNT: usize = 8;
 const GDT_LIMIT_BYTES: u32 = 0xfffff; // 4GiB
@@ -89,8 +89,8 @@ const GDT_LIMIT: u32 = (GDT_LIMIT_BYTES >> 12) - 1;
 
 pub const KERNEL_CODE_SEL: u16 = (1 << 3) | 0;
 pub const KERNEL_DATA_SEL: u16 = (2 << 3) | 0;
-// pub const USER_CODE_SEL: u16 = (4 << 3) | 3;
-// pub const USER_DATA_SEL: u16 = (5 << 3) | 3;
+pub const USER_CODE_SEL: u16 = (4 << 3) | 3;
+pub const USER_DATA_SEL: u16 = (5 << 3) | 3;
 pub const TSS_SEL: u16 = (7 << 3) | 0;
 
 // Mirror Linux arch/x86/include/asm/desc_defs.h flags.
@@ -195,7 +195,13 @@ pub fn load_gdt() {
         asm!(
             "ltr ax",
             in("ax") TSS_SEL,
-            options(nomem, nostack, preserves_flags)
+            options(nostack, preserves_flags)
         );
+    }
+}
+
+pub fn set_kernel_stack(stack_top: u32) {
+    unsafe {
+        TSS.esp0 = stack_top;
     }
 }
