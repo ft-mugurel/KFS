@@ -103,9 +103,52 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         .get(idx)
         .copied()
         .unwrap_or("Unknown Exception");
+    let frame = &*regs;
+
+    if (frame.cs & 0x03) == 3 {
+        let sig_num = match idx {
+            0 => 8,        // Divide by Zero -> SIGFPE
+            6 => 4,        // Invalid Opcode -> SIGILL
+            13 | 14 => 11, // GPF or Page Fault -> SIGSEGV
+            _ => 9,        // Unknown fatal fault -> SIGKILL
+        };
+
+        let current_pid = crate::sched::scheduler::CURRENT_PID;
+        crate::pr_info!(
+            "PID {} killed by hardware exception {} (Signal {})\n",
+            current_pid,
+            idx,
+            sig_num
+        );
+
+        if idx == 14 {
+            let fault_addr = x86::read_cr2();
+            crate::pr_info!("Segmentation Fault at {:#x}\n", fault_addr);
+        }
+        let task = crate::sched::scheduler::PROCESS_TABLE[current_pid]
+            .as_mut()
+            .unwrap();
+        task.state = crate::sched::task::ProcessState::Zombie;
+
+        crate::x86::write_cr3(crate::paging::page_table::bootstrap_directory_phys_addr());
+
+        let next_esp = crate::sched::scheduler::schedule(frame.esp);
+
+        // Force a context switch directly from the exception handler
+        core::arch::asm!(
+            "mov esp, {}",
+            "popad",
+            "pop gs",
+            "pop fs",
+            "pop es",
+            "pop ds",
+            "iretd",
+            in(reg) next_esp,
+            options(noreturn)
+        );
+    }
 
     if idx == 14 {
-        let frame = &*regs;
         let present = (frame.error_code & 0b001) != 0;
         let write = (frame.error_code & 0b010) != 0;
         let user = (frame.error_code & 0b100) != 0;
@@ -128,22 +171,20 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
     x86::disable_interrupts();
     text_mod::out::switch_screen(DEFAULT_LOG_SCREEN);
 
-    if !regs.is_null() {
-        let r = &*regs;
-        pr_emerg!(
-            "Registers:\n\
-            EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}\n\
-            ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}\n",
-            r.eax,
-            r.ebx,
-            r.ecx,
-            r.edx,
-            r.esi,
-            r.edi,
-            r.ebp,
-            r.esp
-        );
-    }
+    pr_emerg!(
+        "Registers:\n\
+        EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}\n\
+        ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}\n",
+        frame.eax,
+        frame.ebx,
+        frame.ecx,
+        frame.edx,
+        frame.esi,
+        frame.edi,
+        frame.ebp,
+        frame.esp
+    );
+
     crate::panic::save_stack_trace();
     crate::panic::clean_registers_and_halt();
 }

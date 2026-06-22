@@ -5,31 +5,34 @@ use crate::gdt::gdt::{USER_CODE_SEL, USER_DATA_SEL};
 use crate::paging::page_table;
 use crate::paging::physical;
 use crate::sched::scheduler::PROCESS_TABLE;
-use crate::sched::task::{ContextFrame, ProcessState, TaskStruct};
+use crate::sched::task::{ContextFrame, EMPTY_VMA, MAX_VMAS, ProcessState, TaskStruct};
 use core::mem::size_of;
 
 static mut TEST_USER_KERNEL_STACK: [u8; 4096] = [0; 4096];
 
-// Standard x86 User Memory Layout
 pub const USER_CODE_VADDR: u32 = 0x08048000;
+pub const USER_DATA_VADDR: u32 = 0x0804A000;
+pub const USER_BSS_VADDR:  u32 = 0x0804B000;
 pub const USER_STACK_VADDR: u32 = 0xBFFFF000;
 
-pub fn create_user_process(entry_point: fn()) -> bool {
+pub fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -> bool {
     unsafe {
-        if PROCESS_TABLE[2].is_some() {
+        let tty_id = 1;
+        if PROCESS_TABLE[tty_id].is_some() {
             return false;
         }
-
+        #[allow(static_mut_refs)]
         let k_stack_bottom = TEST_USER_KERNEL_STACK.as_ptr() as u32;
         let k_stack_top = k_stack_bottom + 4096;
 
         let frame_ptr = (k_stack_top - size_of::<ContextFrame>() as u32) as *mut ContextFrame;
         core::ptr::write_bytes(frame_ptr, 0, 1);
 
-        // --- 1. Build the True Isolated Memory Space ---
-        let new_cr3 =
-            page_table::create_user_address_space().expect("Failed to create Address Space");
         let old_cr3 = crate::x86::read_cr3();
+        let new_cr3 = 
+        // page_table::create_user_address_space()
+            page_table::clone_address_space(old_cr3)
+            .expect("Failed to create Address Space");
 
         crate::x86::disable_interrupts();
 
@@ -42,15 +45,35 @@ pub fn create_user_process(entry_point: fn()) -> bool {
             page_table::PAGE_PRESENT | page_table::PAGE_USER | page_table::PAGE_WRITABLE;
         page_table::map_page(USER_CODE_VADDR, code_frame, user_flags).unwrap();
         page_table::map_page(USER_STACK_VADDR - 4096, stack_frame, user_flags).unwrap();
+        let data_frame = physical::alloc_physical_page().unwrap();
+        page_table::map_page(USER_DATA_VADDR, data_frame, user_flags).unwrap();
+        
+        // 2. Map and Zero the BSS Sector
+        let bss_frame = physical::alloc_physical_page().unwrap();
+        page_table::map_page(USER_BSS_VADDR, bss_frame, user_flags).unwrap();
+        core::ptr::write_bytes(USER_BSS_VADDR as *mut u8, 0, 4096);
 
         let code_ptr = USER_CODE_VADDR as *mut u8;
-        core::ptr::copy_nonoverlapping(entry_point as *const u8, code_ptr, 1024);
+        core::ptr::copy_nonoverlapping(entry_point as *const u8, code_ptr, entry_size);
+
+        // exit even if the user didn't call exit, to avoid returning to the kernel
+        let trampoline_vaddr = USER_CODE_VADDR + 2048;
+        let trampoline_ptr = trampoline_vaddr as *mut u8;
+        let exit_payload: [u8; 12] = [
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xBB, 0x00, 0x00, 0x00, 0x00, // mov ebx, 0
+            0xCD, 0x80                    // int 0x80
+        ];
+        core::ptr::copy_nonoverlapping(exit_payload.as_ptr(), trampoline_ptr, 12);
+
+        let stack_top_ptr = (USER_STACK_VADDR - 4) as *mut u32;
+        stack_top_ptr.write(trampoline_vaddr);
 
         crate::x86::write_cr3(old_cr3);
 
         crate::x86::enable_interrupts();
 
-        // --- 2. Setup Ring 3 Execution Frame ---
+        // Ring 3 Execution Frame
         let frame = &mut *frame_ptr;
         let user_data = (USER_DATA_SEL | 3) as u32;
 
@@ -59,7 +82,6 @@ pub fn create_user_process(entry_point: fn()) -> bool {
         frame.fs = user_data;
         frame.gs = user_data;
 
-        // CRITICAL: Set EIP to the mapped virtual address, NOT the kernel pointer!
         frame.eip = USER_CODE_VADDR;
         frame.cs = (USER_CODE_SEL | 3) as u32;
         frame.eflags = 0x202;
@@ -74,20 +96,24 @@ pub fn create_user_process(entry_point: fn()) -> bool {
         new_task.context.esp = frame_ptr as u32;
         new_task.context.cr3 = new_cr3;
 
-        // V.2 Memory Tracking Initialization
+        // Memory Tracking Initialization
         new_task.memory.code_base = USER_CODE_VADDR;
         new_task.memory.code_size = 4096;
+        new_task.memory.data_base = USER_DATA_VADDR;
+        new_task.memory.data_size = 4096;
+        new_task.memory.bss_base = USER_BSS_VADDR;
+        new_task.memory.bss_size = 4096;
         new_task.memory.stack_base = USER_STACK_VADDR;
         new_task.memory.stack_limit = USER_STACK_VADDR - 4096;
         new_task.memory.heap_base = 0x4000_0000;
         new_task.memory.heap_brk = 0x4000_0000;
+        new_task.memory.vmas = [EMPTY_VMA; MAX_VMAS];
 
         new_task.kernel_stack_top = k_stack_top;
         new_task.kernel_stack_bottom = k_stack_bottom;
-        new_task.tty_id = 2;
 
-        PROCESS_TABLE[2] = Some(new_task);
-        crate::pr_info!("Spawned Isolated User Process PID 2\n");
+        PROCESS_TABLE[tty_id] = Some(new_task);
+        crate::pr_info!("Spawned Isolated User Process PID {}\n", tty_id);
         true
     }
 }

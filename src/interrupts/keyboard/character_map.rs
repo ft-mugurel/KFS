@@ -6,14 +6,12 @@ use crate::interrupts::keyboard::keycode::{KeyCode, Modifiers};
 pub struct Glyph {
     base: char,
     lvl2: char,
-    lvl3: Option<char>,
-    lvl5: Option<char>,
     is_letter: bool,
 }
 
 impl Glyph {
     const fn new_l2(base: char, lvl2: char, is_letter: bool) -> Self {
-        Self { base, lvl2, lvl3: None, lvl5: None, is_letter }
+        Self { base, lvl2, is_letter }
     }
 }
 

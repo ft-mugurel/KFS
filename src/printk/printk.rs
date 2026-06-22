@@ -21,14 +21,14 @@ pub enum KernelLogLevel {
 
 const fn level_tag(level: KernelLogLevel) -> &'static str {
     match level {
-        KernelLogLevel::Emerg => "[\x1B\x0F;\x14mEMERG\x1Bm] ",
-        KernelLogLevel::Alert => "[\x1B\x0F;\x16mALERT\x1Bm] ",
-        KernelLogLevel::Crit => "[\x1B\x0F;\x1CmCRIT\x1Bm] ",
+        KernelLogLevel::Emerg => "[\x1B\x0F;\x14mEMG\x1Bm] ",
+        KernelLogLevel::Alert => "[\x1B\x0F;\x16mALR\x1Bm] ",
+        KernelLogLevel::Crit => "[\x1B\x0F;\x1CmCRT\x1Bm] ",
         KernelLogLevel::Err => "[\x1B\x04mERR\x1Bm] ",
-        KernelLogLevel::Warning => "[\x1B\x0EmWARN\x1Bm] ",
-        KernelLogLevel::Notice => "[\x1B\x09mNOTICE\x1Bm] ",
-        KernelLogLevel::Info => "[\x1B\x07mINFO\x1Bm] ",
-        KernelLogLevel::Debug => "[\x1B\x08mDEBUG\x1Bm] ",
+        KernelLogLevel::Warning => "[\x1B\x0EmWRN\x1Bm] ",
+        KernelLogLevel::Notice => "[\x1B\x09mNTC\x1Bm] ",
+        KernelLogLevel::Info => "[\x1B\x07mINF\x1Bm] ",
+        KernelLogLevel::Debug => "[\x1B\x08mDBG\x1Bm] ",
     }
 }
 
@@ -56,12 +56,7 @@ pub fn printk_level_to_default(level: KernelLogLevel, args: &fmt::Arguments<'_>)
     if !is_enabled(level) {
         return;
     }
-
-    out::print_on(
-        startup_config::logging::DEFAULT_LOG_SCREEN,
-        level_tag(level),
-    );
-    out::write_fmt_on(startup_config::logging::DEFAULT_LOG_SCREEN, args);
+    printk_level_to_screen(startup_config::logging::DEFAULT_LOG_SCREEN, level, args);
 }
 
 #[allow(dead_code)]

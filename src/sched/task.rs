@@ -15,14 +15,31 @@ pub struct Context {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct Vma {
+    pub base: u32,
+    pub size: u32,
+    pub flags: u32,
+    pub used: bool,
+}
+
+pub const MAX_VMAS: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ProcessMemory {
     pub code_base: u32,
     pub code_size: u32,
+    pub data_base: u32,
+    pub data_size: u32,
+    pub bss_base: u32,
+    pub bss_size: u32,
     pub stack_base: u32,
     pub stack_limit: u32,
     pub heap_base: u32,
     pub heap_brk: u32,
+    pub vmas: [Vma; MAX_VMAS],
 }
+
+pub const EMPTY_VMA: Vma = Vma { base: 0, size: 0, flags: 0, used: false };
 
 pub const MAX_CHILDREN: usize = 16;
 #[derive(Debug, Clone, Copy)]
@@ -34,7 +51,7 @@ pub struct ProcessFamily {
 
 pub const MAX_SIGNALS: usize = 32;
 pub const SIGNAL_QUEUE_SIZE: usize = 16;
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct SignalQueue {
     pub pending: [u8; SIGNAL_QUEUE_SIZE],
     pub head: usize,
@@ -42,6 +59,8 @@ pub struct SignalQueue {
     pub handlers: [u32; MAX_SIGNALS],
 }
 
+pub const MAX_FDS_PER_PROCESS: usize = 16;
+#[derive(Debug, Clone, Copy)]
 pub struct TaskStruct {
     pub pid: u32,
     pub uid: u32,
@@ -51,10 +70,10 @@ pub struct TaskStruct {
     pub memory: ProcessMemory,
     pub family: ProcessFamily,
     pub signals: SignalQueue,
+    pub fd_tbl: [Option<crate::fs::vfs::FileDescriptor>; MAX_FDS_PER_PROCESS],
 
-	pub kernel_stack_top: u32,
+    pub kernel_stack_top: u32,
     pub kernel_stack_bottom: u32,
-    pub tty_id: usize,
     pub wakeup_time: u64,
 }
 

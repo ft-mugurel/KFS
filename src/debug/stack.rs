@@ -15,21 +15,22 @@ const MAX_SCAN_WORDS: usize = 256;
 #[derive(Clone, Copy)]
 pub struct DumpStackOptions {
     pub words: usize,
-    pub trace_frames: usize,
+    pub frames: usize,
+    pub print_stack_values: bool,
+    pub walk_frames: bool,
+    pub scan_stack: bool,
 }
 
 impl Default for DumpStackOptions {
     fn default() -> Self {
         Self {
             words: DEFAULT_DUMP_WORDS,
-            trace_frames: DEFAULT_TRACE_FRAMES,
+            frames: DEFAULT_TRACE_FRAMES,
+            print_stack_values: true,
+            walk_frames: true,
+            scan_stack: true,
         }
     }
-}
-
-#[inline(never)]
-pub fn dump_stack(mut emit: impl FnMut(fmt::Arguments<'_>)) {
-    dump_stack_with_options(DumpStackOptions::default(), &mut emit);
 }
 
 #[inline(never)]
@@ -37,44 +38,58 @@ pub fn dump_stack_with_options(
     options: DumpStackOptions,
     mut emit: impl FnMut(fmt::Arguments<'_>),
 ) {
-    // let words = options.words.clamp(1, MAX_DUMP_WORDS);
-    let trace_frames = options.trace_frames.clamp(1, MAX_TRACE_FRAMES);
+    let words = options.words.clamp(1, MAX_DUMP_WORDS);
+    let trace_frames = options.frames.clamp(1, MAX_TRACE_FRAMES);
 
-    // let esp = x86::read_esp();
+    let esp = x86::read_esp();
     let ebp = x86::read_ebp();
 
-    // emit(format_args!("------------[ cut here ]------------\n"));
-    // emit(format_args!("Kernel stack dump\n"));
-    // emit(format_args!("ESP: {:#010x} EBP: {:#010x}\n", esp, ebp));
-    // emit(format_args!("Stack:\n"));
+    emit(format_args!("------------[ cut here ]------------\n"));
+    emit(format_args!("Kernel stack dump\n"));
+    emit(format_args!("ESP: {:#010x} EBP: {:#010x}\n", esp, ebp));
 
-    // for i in 0..words {
-    //     let offset = match (i as u32).checked_mul(4) {
-    //         Some(v) => v,
-    //         None => break,
-    //     };
+    if options.print_stack_values {
+        emit(format_args!("Stack:\n"));
+        for i in 0..words {
+            let offset = match (i as u32).checked_mul(4) {
+                Some(v) => v,
+                None => break,
+            };
+            let addr = match esp.checked_add(offset) {
+                Some(v) => v,
+                None => {
+                    emit(format_args!("  <address overflow>\n"));
+                    break;
+                }
+            };
+            let marker = if addr == ebp { " <ebp>" } else { "" };
+            if !is_mapped_u32(addr) {
+                emit(format_args!("  {:#010x}: ????????{}\n", addr, marker));
+                continue;
+            }
+            let value = unsafe { ptr::read_volatile(addr as *const u32) };
+            emit(format_args!(
+                "  {:#010x}: {:#010x}{}\n",
+                addr, value, marker
+            ));
+        }
+    }
 
-    //     let addr = match esp.checked_add(offset) {
-    //         Some(v) => v,
-    //         None => {
-    //             emit(format_args!("  <address overflow>\n"));
-    //             break;
-    //         }
-    //     };
+    let mut walked = 0usize;
+    if options.walk_frames {
+        walked += walk_stack_frames(&mut emit, ebp, trace_frames);
+    }
 
-    //     let marker = if addr == ebp { " <ebp>" } else { "" };
-    //     if !is_mapped_u32(addr) {
-    //         emit(format_args!("  {:#010x}: ????????{}\n", addr, marker));
-    //         continue;
-    //     }
+    if options.scan_stack {
+        scan_stack(&mut emit, esp, words, trace_frames, walked);
+    }
+}
 
-    //     let value = unsafe { ptr::read_volatile(addr as *const u32) };
-    //     emit(format_args!(
-    //         "  {:#010x}: {:#010x}{}\n",
-    //         addr, value, marker
-    //     ));
-    // }
-
+fn walk_stack_frames(
+    emit: &mut impl FnMut(fmt::Arguments<'_>),
+    ebp: u32,
+    trace_frames: usize,
+) -> usize {
     emit(format_args!("Call Trace (frame walk):\n"));
     let mut frame = ebp;
     let mut walked = 0usize;
@@ -94,7 +109,7 @@ pub fn dump_stack_with_options(
 
         let next = unsafe { ptr::read_volatile(frame as *const u32) };
         let ret = unsafe { ptr::read_volatile((frame.wrapping_add(4)) as *const u32) };
-        emit_trace_entry(&mut emit, depth, ret);
+        emit_trace_entry(emit, depth, ret);
         walked += 1;
 
         if next <= frame {
@@ -112,7 +127,17 @@ pub fn dump_stack_with_options(
 
         frame = next;
     }
-/* 
+
+    walked
+}
+
+fn scan_stack(
+    emit: &mut impl FnMut(fmt::Arguments<'_>),
+    esp: u32,
+    words: usize,
+    trace_frames: usize,
+    walked: usize,
+) {
     emit(format_args!("Call Trace (stack scan):\n"));
     let mut emitted = 0usize;
     let mut last_name: Option<&str> = None;
@@ -153,11 +178,7 @@ pub fn dump_stack_with_options(
 
         emit(format_args!(
             "  [s{:02}] {:#010x} <{}+0x{:x}> (from {:#010x})\n",
-            emitted,
-            candidate,
-            name,
-            sym_off,
-            slot
+            emitted, candidate, name, sym_off, slot
         ));
         last_name = Some(name);
         emitted += 1;
@@ -169,7 +190,6 @@ pub fn dump_stack_with_options(
     if emitted == 0 {
         emit(format_args!("  <no additional symbolized entries>\n"));
     }
-    */
 }
 
 fn emit_trace_entry(emit: &mut impl FnMut(fmt::Arguments<'_>), depth: usize, ret: u32) {

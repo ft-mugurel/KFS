@@ -1,8 +1,6 @@
-use crate::interrupts::task_queue::execute_tasks;
 use crate::spin::Spinlock;
 use crate::startup_config::shell::SCREEN_INDEX;
 use crate::vga::text_mod::out::{active_cursor_position, active_screen_index, print_char_on, set_cursor_position_on};
-use core::arch::asm;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 

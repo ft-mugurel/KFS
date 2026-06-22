@@ -25,8 +25,31 @@ static mut BOOT_KERNEL_TABLE: PageTable = PageTable([0; ENTRIES_PER_TABLE]);
 pub static mut PAGING_INITIALIZED: bool = false;
 
 #[inline]
-fn phys_to_virt(phys: u32) -> *mut u32 {
+pub fn phys_to_virt(phys: u32) -> *mut u32 {
     (phys + KERNEL_SPACE_START as u32) as *mut u32
+}
+
+pub unsafe fn get_physical_address(vaddr: u32) -> Option<u32> {
+    let pd_phys = crate::x86::read_cr3();
+    let pd_virt = phys_to_virt(pd_phys) as *const u32;
+
+    let pde_idx = (vaddr >> 22) as usize;
+    let pte_idx = ((vaddr >> 12) & 0x3FF) as usize;
+
+    let pde = pd_virt.add(pde_idx).read();
+    if (pde & PAGE_PRESENT) == 0 {
+        return None;
+    }
+
+    let pt_phys = pde & PAGE_FRAME_MASK;
+    let pt_virt = phys_to_virt(pt_phys) as *const u32;
+
+    let pte = pt_virt.add(pte_idx).read();
+    if (pte & PAGE_PRESENT) == 0 {
+        return None;
+    }
+
+    Some(pte & PAGE_FRAME_MASK)
 }
 
 fn active_pd_ptr() -> *mut u32 {
@@ -42,7 +65,9 @@ fn active_pd_ptr() -> *mut u32 {
 }
 
 pub fn mark_paging_initialized() {
-    unsafe { PAGING_INITIALIZED = true; }
+    unsafe {
+        PAGING_INITIALIZED = true;
+    }
 }
 
 fn kernel_pd_index() -> usize {
@@ -298,18 +323,49 @@ pub fn unmap_page(virt_addr: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn create_user_address_space() -> Option<u32> {
-    unsafe {
-        let pd_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
-        zero_page_table(pd_phys);
+pub unsafe fn clone_address_space(parent_cr3: u32) -> Option<u32> {
+    let child_pd_phys = crate::paging::physical::alloc_physical_page()?;
+    let child_pd = phys_to_virt(child_pd_phys) as *mut u32;
+    let parent_pd = phys_to_virt(parent_cr3) as *const u32;
 
-        let new_pd_ptr = phys_to_virt(pd_phys);
-        let boot_pd_ptr = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32;
+    // We just copy the pointers so kernel memory is shared natively.
+    core::ptr::copy_nonoverlapping(parent_pd.add(768), child_pd.add(768), 256);
 
-        for i in 0..ENTRIES_PER_TABLE {
-            new_pd_ptr.add(i).write(boot_pd_ptr.add(i).read());
+    // Deep Copy User Space
+    for pde_idx in 0..768 {
+        let pde = parent_pd.add(pde_idx).read();
+
+        if (pde & PAGE_PRESENT) != 0 && (pde & PAGE_USER) != 0 {
+            let child_pt_phys = crate::paging::physical::alloc_physical_page()?;
+            let child_pt = phys_to_virt(child_pt_phys) as *mut u32;
+            let parent_pt = phys_to_virt(pde & PAGE_FRAME_MASK) as *const u32;
+
+            core::ptr::write_bytes(child_pt, 0, 1024);
+            child_pd.add(pde_idx).write(child_pt_phys | (pde & 0xFFF)); // Preserve original flags
+
+            for pte_idx in 0..1024 {
+                let pte = parent_pt.add(pte_idx).read();
+
+                if (pte & PAGE_PRESENT) != 0 && (pte & PAGE_USER) != 0 {
+                    // Allocate a new physical frame for the actual data
+                    let data_phys = crate::paging::physical::alloc_physical_page()?;
+                    let data_virt_child = phys_to_virt(data_phys) as *mut u8;
+                    let data_virt_parent = phys_to_virt(pte & PAGE_FRAME_MASK) as *const u8;
+
+                    core::ptr::copy_nonoverlapping(data_virt_parent, data_virt_child, 4096);
+
+                    child_pt.add(pte_idx).write(data_phys | (pte & 0xFFF));
+                } else if (pte & PAGE_PRESENT) != 0 {
+                    // Present but Kernel-owned
+                    child_pt.add(pte_idx).write(pte);
+                }
+            }
+        } else if (pde & PAGE_PRESENT) != 0 {
+            child_pd.add(pde_idx).write(pde);
+        } else {
+            child_pd.add(pde_idx).write(0);
         }
-
-        Some(pd_phys)
     }
+
+    Some(child_pd_phys)
 }

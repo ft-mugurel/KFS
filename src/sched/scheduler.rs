@@ -31,7 +31,7 @@ pub fn init_scheduler() {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
     let current_ticks = crate::interrupts::timer::get_ticks();
-    // wake up
+
     for i in 0..MAX_PROCESSES {
         if let Some(ref mut task) = PROCESS_TABLE[i] {
             if task.state == ProcessState::Sleeping && current_ticks >= task.wakeup_time {
@@ -49,67 +49,69 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
         }
     }
 
-    // Round-Robin
-    let mut next_pid = CURRENT_PID;
     loop {
-        next_pid = (next_pid + 1) % MAX_PROCESSES;
+        let mut next_pid = CURRENT_PID;
+        loop {
+            next_pid = (next_pid + 1) % MAX_PROCESSES;
 
-        if let Some(ref task) = PROCESS_TABLE[next_pid] {
-            if task.state == ProcessState::Ready {
+            if let Some(ref task) = PROCESS_TABLE[next_pid] {
+                if task.state == ProcessState::Ready {
+                    break;
+                }
+            }
+
+            if next_pid == CURRENT_PID {
+                next_pid = 0;
                 break;
             }
         }
 
-        if next_pid == CURRENT_PID {
-            next_pid = 0;
-            break;
-        }
-    }
+        CURRENT_PID = next_pid;
+        let next_task = PROCESS_TABLE[CURRENT_PID].as_mut().unwrap();
 
-    CURRENT_PID = next_pid;
-    let next_task = PROCESS_TABLE[CURRENT_PID].as_mut().unwrap();
-    next_task.state = ProcessState::Running;
+        let queue = &mut next_task.signals;
+        let mut killed = false;
 
-    gdt::TSS.esp0 = next_task.kernel_stack_top;
+        if queue.head != queue.tail {
+            let sig_num = queue.pending[queue.tail];
+            let handler_addr = queue.handlers[sig_num as usize];
 
-    let current_cr3: u32;
-    core::arch::asm!("mov {}, cr3", out(reg) current_cr3);
-
-    if next_task.context.cr3 != current_cr3 {
-        core::arch::asm!("mov cr3, {}", in(reg) next_task.context.cr3);
-    }
-    crate::x86::write_cr3(next_task.context.cr3);
-
-    let queue = &mut next_task.signals;
-    if queue.head != queue.tail {
-        let sig_num = queue.pending[queue.tail];
-        queue.tail = (queue.tail + 1) % crate::sched::task::SIGNAL_QUEUE_SIZE;
-
-        let handler_addr = queue.handlers[sig_num as usize];
-        if handler_addr != 0 {
-            // Hijack the stack for custom handlers
-            let frame =
-                unsafe { &mut *(next_task.context.esp as *mut crate::sched::task::ContextFrame) };
-            frame.user_esp -= 4;
-            unsafe {
-                *(frame.user_esp as *mut u32) = frame.eip;
+            if handler_addr != 0 {
+                let frame = &mut *(next_task.context.esp as *mut crate::sched::task::ContextFrame);
+                if (frame.cs & 0x03) == 3 {
+                    queue.tail = (queue.tail + 1) % crate::sched::task::SIGNAL_QUEUE_SIZE;
+                    frame.user_esp -= 4;
+                    *(frame.user_esp as *mut u32) = frame.eip;
+                    frame.eip = handler_addr;
+                } else {
+                    // Process was in Ring 0
+                }
+            } else {
+                queue.tail = (queue.tail + 1) % crate::sched::task::SIGNAL_QUEUE_SIZE;
+                crate::pr_info!(
+                    "PID {} terminated by unhandled signal {}\n",
+                    CURRENT_PID as usize,
+                    sig_num
+                );
+                next_task.state = crate::sched::task::ProcessState::Zombie;
+                killed = true;
             }
-            frame.eip = handler_addr;
-        } else {
-            // THE DEFAULT ACTION: Terminate the process cleanly!
-            crate::pr_info!(
-                "PID {} terminated by unhandled signal {}\n",
-                CURRENT_PID,
-                sig_num
-            );
-            next_task.state = crate::sched::task::ProcessState::Zombie;
-
-            // Pivot back to kernel space before abandoning the process
-            crate::x86::write_cr3(crate::paging::page_table::bootstrap_directory_phys_addr());
-
-            // Force the scheduler to immediately pick another alive process (like the Shell)
-            return schedule(old_esp);
         }
+
+        if killed {
+            continue;
+        }
+
+        // Context Switch
+        next_task.state = ProcessState::Running;
+        gdt::set_kernel_stack(next_task.kernel_stack_top);
+
+        // Streamlined CR3 write
+        let current_cr3 = crate::x86::read_cr3();
+        if next_task.context.cr3 != current_cr3 {
+            crate::x86::write_cr3(next_task.context.cr3);
+        }
+
+        return next_task.context.esp;
     }
-    next_task.context.esp
 }

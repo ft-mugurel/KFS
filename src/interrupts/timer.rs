@@ -7,6 +7,8 @@ use crate::startup_config::pic;
 use crate::x86::outb;
 
 static mut TICKS: u64 = 0;
+static mut INITIAL_TSC: u64 = 0;
+static mut LAST_TSC: u64 = 0;
 
 unsafe extern "C" {
     fn isr_timer();
@@ -33,8 +35,25 @@ pub fn init_timer() {
     );
     init_pit(crate::startup_config::power::CONFIG_HZ);
     register_interrupt_handler(pic::TIMER_IRQ_VECTOR, isr_timer);
+    unsafe { INITIAL_TSC = get_tsc_delta() };
 }
 
 pub fn get_ticks() -> u64 {
-    unsafe { TICKS }
+    let ticks = unsafe { TICKS };
+    ticks
+}
+
+pub fn get_tsc_delta() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+        LAST_TSC = ((high as u64) << 32) | (low as u64);
+        LAST_TSC - INITIAL_TSC
+    }
 }

@@ -1,11 +1,12 @@
 use core::panic::PanicInfo;
 
+use crate::debug::stack::DumpStackOptions;
 use crate::startup_config::logging::DEFAULT_LOG_SCREEN;
 use crate::vga::text_mod::out::switch_screen;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-	crate::disable_interrupts();
+    crate::disable_interrupts();
     crate::pr_emerg!("KERNEL PANIC\n");
     crate::pr_emerg!("{}\n", info);
     // save_stack_trace();
@@ -15,11 +16,18 @@ fn panic(info: &PanicInfo) -> ! {
 
 pub(crate) fn save_stack_trace() {
     crate::pr_emerg!("Stack Trace:\n");
-	crate::debug::stack::dump_stack(|args| {
-		crate::vga::text_mod::out::write_fmt_on(DEFAULT_LOG_SCREEN, &args);
-	});
+    crate::debug::stack::dump_stack_with_options(DumpStackOptions {
+        words: 10,
+        frames: 10,
+        print_stack_values: false,
+        scan_stack: false,
+        walk_frames: true,
+        
+    }, |args| {
+        crate::vga::text_mod::out::write_fmt_on(DEFAULT_LOG_SCREEN, &args);
+    });
 }
 
 pub(crate) fn clean_registers_and_halt() -> ! {
-	unsafe { crate::x86::clean_registers_and_halt() };
+    unsafe { crate::x86::clean_registers_and_halt() };
 }

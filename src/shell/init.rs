@@ -10,6 +10,7 @@ use crate::interrupts::keyboard::character_map::keycode_to_char;
 use crate::interrupts::keyboard::keycode::{KeyCode, KeyEvent, Modifiers};
 use crate::interrupts::utils::{request_reboot, request_shutdown};
 use crate::printk::{set_log_level, KernelLogLevel};
+use crate::sched::create_user_process;
 use crate::signals::Signal;
 use crate::startup_config;
 use crate::vga::text_mod::out::{
@@ -518,13 +519,7 @@ fn run_command(line: &str) {
         "sc_write" => command_sc_write(),
         "read_test" => command_read_test(),
         "signal" => command_signal(parts),
-        "spawn" => {
-            if crate::sched::create_user_process(crate::user_process) {
-                print("Successfully spawned Ring 3 process on PID 2.\n");
-            } else {
-                print("Error: PID 2 is already running!\n");
-            }
-        }
+        "spawn" => command_spawn(parts),
         "wait" => command_wait(),
         "kill" => command_kill(parts),
         _ => {
@@ -742,7 +737,13 @@ fn command_stack(mut parts: str::SplitWhitespace<'_>) {
         return;
     }
 
-    let options = DumpStackOptions { words, trace_frames: stack::DEFAULT_TRACE_FRAMES };
+    let options = DumpStackOptions {
+        words,
+        frames: stack::DEFAULT_TRACE_FRAMES,
+        print_stack_values: true,
+        walk_frames: true,
+        scan_stack: true,
+    };
 
     stack::dump_stack_with_options(options, |args| {
         print_fmt(&args);
@@ -896,5 +897,32 @@ fn command_kill(mut parts: str::SplitWhitespace<'_>) {
         } else {
             print("Failed to send signal. Invalid PID?\n");
         }
+    }
+}
+
+#[inline(always)]
+fn command_spawn(mut parts: str::SplitWhitespace<'_>) {
+    let name = parts.next().unwrap_or("");
+    let size = parts.next().and_then(|s| parse_usize(s)).unwrap_or(0);
+    let entry_point = match name {
+        "sleep" => crate::test::process_sleep,
+        "fork" => crate::test::process_fork,
+        "socket" => crate::test::process_socket,
+        _ => {
+            print("Unknown process name. Available: user_process, sleep, fork, socket\n");
+            return;
+        }
+    };
+    if size == 0 {
+        print("Invalid size. Must be greater than 0.\n");
+        return;
+    }
+    if create_user_process(entry_point, size) {
+        print_fmt(&format_args!(
+            "Spawned user process '{}' with size {} bytes.\n",
+            name, size
+        ));
+    } else {
+        print("Failed to spawn user process. PID 2 might already be in use.\n");
     }
 }
