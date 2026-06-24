@@ -1,20 +1,19 @@
 use crate::interrupts::idt::register_interrupt_handler;
-use crate::interrupts::keyboard::api;
-use crate::interrupts::keyboard::character_map::{keycode_to_char, toggle_layout};
-use crate::interrupts::keyboard::keycode::{decode_set1_scancode, KeyCode, KeyEvent, Modifiers};
-use crate::interrupts::task_queue::schedule_task;
-use crate::interrupts::utils::request_shutdown;
+use crate::interrupts::keyboard::{
+    decode_set1_scancode, get_input_mode, keycode_to_char, push_char, toggle_layout, InputMode,
+    KeyCode, KeyEvent, Modifiers,
+};
+use crate::interrupts::request_shutdown;
+use crate::sched::schedule_task;
 use crate::shell::handle_shell_key_event;
-use crate::signals::Signal;
+use crate::signals::{send_signal, Signal};
 use crate::spin::Spinlock;
 use crate::startup_config::pic;
-use crate::vga::text_mod::cursor::{
-    disable_cursor, enable_cursor, set_big_cursor, set_cursor_shape, set_small_cursor,
-};
-use crate::vga::text_mod::out::{
-    move_cursor_down, move_cursor_left, move_cursor_right, move_cursor_up, scroll_view_down,
-    scroll_view_to_bottom, scroll_view_to_top, scroll_view_up, switch_screen,
-    switch_to_next_screen, switch_to_previous_screen,
+use crate::vga::text_mod::{
+    disable_cursor, enable_cursor, move_cursor_down, move_cursor_left, move_cursor_right,
+    move_cursor_up, scroll_view_down, scroll_view_to_bottom, scroll_view_to_top, scroll_view_up,
+    set_big_cursor, set_cursor_shape, set_small_cursor, switch_screen, switch_to_next_screen,
+    switch_to_previous_screen,
 };
 use crate::x86::{inb, outb};
 
@@ -42,7 +41,7 @@ fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
             return;
         }
         KeyCode::C if modifiers.ctrl() => {
-            crate::signals::send_signal(Signal::SIGINT);
+            send_signal(Signal::SIGINT);
             return;
         }
         KeyCode::F1 => {
@@ -100,11 +99,10 @@ fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
         _ => {} // Not a global hotkey, continue down to the router
     }
 
-    if api::get_input_mode() == api::InputMode::Blocking {
+    if get_input_mode() == InputMode::Blocking {
         if !modifiers.has_text_blocking_modifier() {
-            
             if let Some(c) = keycode_to_char(event.key, modifiers) {
-                api::push_char(c);
+                push_char(c);
             }
         }
     } else {

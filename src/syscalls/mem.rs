@@ -1,5 +1,6 @@
-use crate::sched::scheduler::{CURRENT_PID, PROCESS_TABLE};
-use crate::sched::task::ContextFrame;
+use crate::paging::{self, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
+use crate::sched::{ContextFrame, Vma, CURRENT_PID, MAX_VMAS, PROCESS_TABLE};
+use crate::{pr_warn, x86};
 
 pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
     unsafe {
@@ -15,7 +16,7 @@ pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
         }
 
         if increment < 0 {
-            crate::pr_warn!("Shrinking the heap is not yet supported.\n");
+            pr_warn!("Shrinking the heap is not yet supported.\n");
             (*regs).set_return_value(!0u32); // Return -1
             return;
         }
@@ -30,14 +31,12 @@ pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
             for i in 0..pages_to_allocate {
                 let vaddr = old_page_end + (i * 4096);
 
-                if let Some(phys_frame) = crate::paging::physical::alloc_physical_page() {
-                    let flags = crate::paging::page_table::PAGE_PRESENT
-                        | crate::paging::page_table::PAGE_WRITABLE
-                        | crate::paging::page_table::PAGE_USER;
+                if let Some(phys_frame) = paging::alloc_physical_page() {
+                    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
-                    crate::paging::page_table::map_page(vaddr, phys_frame, flags).unwrap();
+                    paging::map_page(vaddr, phys_frame, flags).unwrap();
                 } else {
-                    crate::pr_warn!("Out of physical memory for sbrk!\n");
+                    pr_warn!("Out of physical memory for sbrk!\n");
                     (*regs).set_return_value(!0u32);
                     return;
                 }
@@ -59,15 +58,12 @@ pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
 
     // Align length to the 4KB boundary
     let aligned_length = (length + 4095) & !4095;
-    let num_pages = aligned_length / 4096;
 
-    let current_pid = crate::sched::scheduler::CURRENT_PID;
-    let task = crate::sched::scheduler::PROCESS_TABLE[current_pid]
-        .as_mut()
-        .unwrap();
+    let current_pid = CURRENT_PID;
+    let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
 
     let mut vma_idx = None;
-    for i in 0..crate::sched::task::MAX_VMAS {
+    for i in 0..MAX_VMAS {
         if !task.memory.vmas[i].used {
             vma_idx = Some(i);
             break;
@@ -83,31 +79,13 @@ pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
     };
 
     let mmap_base = 0x5000_0000 + (vma_idx as u32 * 0x100_000);
-    let user_flags = crate::paging::page_table::PAGE_PRESENT
-        | crate::paging::page_table::PAGE_USER
-        | crate::paging::page_table::PAGE_WRITABLE;
+    /*
+     *  Demand Paging:
+     *      If a process requests a page but does not use it immediately or not even at all,
+     *      we can delay the allocation until an access occurs.
+     */
 
-    let old_cr3 = crate::x86::read_cr3();
-    crate::x86::write_cr3(task.context.cr3);
-
-    for i in 0..num_pages {
-        if let Some(phys_frame) = crate::paging::physical::alloc_physical_page() {
-            let vaddr = mmap_base + (i as u32 * 4096);
-            crate::paging::page_table::map_page(vaddr, phys_frame, user_flags).unwrap();
-
-            // Anonymous mappings must be zero-initialized
-            core::ptr::write_bytes(vaddr as *mut u8, 0, 4096);
-        } else {
-            crate::x86::write_cr3(old_cr3);
-            (*regs).set_return_value(!0u32); // ENOMEM
-            return;
-        }
-    }
-
-    crate::x86::write_cr3(old_cr3);
-
-    // Record the VMA metadata
-    task.memory.vmas[vma_idx] = crate::sched::task::Vma {
+    task.memory.vmas[vma_idx] = Vma {
         base: mmap_base,
         size: aligned_length as u32,
         flags: 3, // PROT_READ | PROT_WRITE
@@ -127,13 +105,11 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     }
 
     let aligned_length = (length + 4095) & !4095;
-    let current_pid = crate::sched::scheduler::CURRENT_PID;
-    let task = crate::sched::scheduler::PROCESS_TABLE[current_pid]
-        .as_mut()
-        .unwrap();
+    let current_pid = CURRENT_PID;
+    let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
 
     let mut target_vma_idx = None;
-    for i in 0..crate::sched::task::MAX_VMAS {
+    for i in 0..MAX_VMAS {
         let vma = &task.memory.vmas[i];
         if vma.used && addr >= vma.base && (addr + aligned_length) <= (vma.base + vma.size) {
             target_vma_idx = Some(i);
@@ -149,21 +125,21 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
         }
     };
 
-    let old_cr3 = crate::x86::read_cr3();
-    crate::x86::write_cr3(task.context.cr3);
+    let old_cr3 = x86::read_cr3();
+    x86::write_cr3(task.context.cr3);
 
     let num_pages = aligned_length / 4096;
     for i in 0..num_pages {
         let vaddr = addr + (i * 4096);
-        if let Some(phys_frame) = crate::paging::page_table::get_physical_address(vaddr) {
-            crate::paging::physical::free_physical_page(phys_frame);
-            crate::paging::page_table::unmap_page(vaddr).unwrap_or_else(|_| {
-                crate::pr_warn!("Failed to unmap page at {:#x}\n", vaddr);
+        if let Some(phys_frame) = paging::get_physical_address(vaddr) {
+            paging::free_physical_page(phys_frame);
+            paging::unmap_page(vaddr).unwrap_or_else(|_| {
+                pr_warn!("Failed to unmap page at {:#x}\n", vaddr);
             });
         }
     }
 
-    crate::x86::write_cr3(old_cr3);
+    x86::write_cr3(old_cr3);
 
     let vma = &mut task.memory.vmas[vma_idx];
     if addr == vma.base && aligned_length == vma.size {

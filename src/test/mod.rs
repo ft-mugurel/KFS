@@ -1,3 +1,5 @@
+use crate::pr_err;
+
 #[unsafe(no_mangle)]
 pub(crate) unsafe fn process_sleep() {
     loop {
@@ -137,7 +139,7 @@ pub(crate) unsafe fn process_fork() {
             options(nostack),
         );
     } else {
-        crate::pr_err!("Fork failed with error code: {}\n", pid);
+        pr_err!("Fork failed with error code: {}\n", pid);
         core::arch::asm!("int 0x80", in("eax") 1, in("ebx") 1, options(noreturn));
     }
 }

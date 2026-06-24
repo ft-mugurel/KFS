@@ -1,5 +1,4 @@
-use crate::sched::scheduler::{CURRENT_PID, PROCESS_TABLE};
-use crate::sched::task::ContextFrame;
+use crate::sched::{ContextFrame, CURRENT_PID, PROCESS_TABLE};
 
 pub(super) unsafe fn syscall_getuid(regs: *mut ContextFrame) {
     unsafe {

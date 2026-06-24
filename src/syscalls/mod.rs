@@ -1,12 +1,13 @@
-pub mod syscalls;
-pub use syscalls::init_syscalls;
+mod syscalls;
 
-mod mem;
-mod read_write;
 mod close;
 mod exit;
 mod fork;
-mod sys;
+mod mem;
+mod read_write;
 mod signal;
-mod time;
 mod socket;
+mod sys;
+mod time;
+
+pub use syscalls::init_syscalls;

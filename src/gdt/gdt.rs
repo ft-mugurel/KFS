@@ -1,9 +1,11 @@
 use core::arch::asm;
 use core::mem::size_of;
 
+use super::{KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS_SEL};
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
-pub struct GdtEntry {
+struct GdtEntry {
     pub limit0: u16,
     pub base0: u16,
     pub base1_flags: u16,
@@ -11,7 +13,7 @@ pub struct GdtEntry {
 }
 
 #[repr(C, packed)]
-pub struct GdtPointer {
+struct GdtPointer {
     pub limit: u16,
     pub base: u32,
 }
@@ -81,17 +83,9 @@ impl TaskStateSegment {
     }
 }
 
-pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
-
 const GDT_ENTRIES_COUNT: usize = 8;
 const GDT_LIMIT_BYTES: u32 = 0xfffff; // 4GiB
 const GDT_LIMIT: u32 = (GDT_LIMIT_BYTES >> 12) - 1;
-
-pub const KERNEL_CODE_SEL: u16 = (1 << 3) | 0;
-pub const KERNEL_DATA_SEL: u16 = (2 << 3) | 0;
-pub const USER_CODE_SEL: u16 = (4 << 3) | 3;
-pub const USER_DATA_SEL: u16 = (5 << 3) | 3;
-pub const TSS_SEL: u16 = (7 << 3) | 0;
 
 // Mirror Linux arch/x86/include/asm/desc_defs.h flags.
 const _DESC_ACCESSED: u16 = 0x0001;
@@ -154,6 +148,8 @@ static mut GDT: [GdtEntry; GDT_ENTRIES_COUNT] = [
     make_entry(DESC_USER_STACK32, 0, GDT_LIMIT), // User stack (expand-down data)
     make_entry(DESC_TSS32, 0, 0),                // TSS
 ];
+
+pub(crate) static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 pub fn load_gdt() {
     unsafe {

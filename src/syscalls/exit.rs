@@ -1,45 +1,87 @@
-use crate::sched::scheduler::{CURRENT_PID, PROCESS_TABLE};
-use crate::sched::task::ContextFrame;
+use crate::error::KernelError;
+use crate::paging;
+use crate::pr_info;
+use crate::sched::{self, ContextFrame, ProcessState, CURRENT_PID, MAX_CHILDREN, PROCESS_TABLE};
+use crate::x86;
 
 pub(super) unsafe fn syscall_exit(regs: *mut ContextFrame) {
     unsafe {
         let exit_code = (*regs).arg1();
         let current_pid = CURRENT_PID;
-        crate::pr_info!("PID {} exited with code {}\n", current_pid, exit_code);
+        pr_info!("PID {} exited with code {}\n", current_pid, exit_code);
 
         let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
-        task.state = crate::sched::task::ProcessState::Zombie;
-        let old_cr3 = task.context.cr3;
-        let boot_cr3 = crate::paging::page_table::bootstrap_directory_phys_addr();
 
-        crate::paging::physical::free_physical_page(old_cr3);
-        crate::x86::write_cr3(boot_cr3);
-        loop {
-            core::arch::asm!("sti; hlt");
+        task.state = ProcessState::Zombie;
+        task.exit_code = Some(exit_code);
+
+        let init_task = PROCESS_TABLE[1].as_mut().unwrap();
+        for i in 0..task.family.child_count {
+            let orphan_pid = task.family.children[i];
+
+            if let Some(ref mut orphan) = PROCESS_TABLE[orphan_pid as usize] {
+                orphan.family.parent_pid = 1;
+            }
+
+            if init_task.family.child_count < MAX_CHILDREN {
+                init_task.family.children[init_task.family.child_count] = orphan_pid;
+                init_task.family.child_count += 1;
+            }
         }
+        task.family.child_count = 0;
+
+        let parent_pid = task.family.parent_pid as usize;
+        if let Some(ref mut parent) = PROCESS_TABLE[parent_pid] {
+            if parent.state == ProcessState::Sleeping {
+                parent.state = ProcessState::Ready;
+            }
+        }
+
+        let old_cr3 = task.context.cr3;
+        let boot_cr3 = paging::bootstrap_directory_phys_addr();
+        x86::write_cr3(boot_cr3);
+        paging::free_user_address_space(old_cr3);
+
+        sched::yield_cpu();
     }
 }
 
-pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
+pub(super) fn syscall_wait(regs: *mut ContextFrame) {
     unsafe {
-        let current_pid = CURRENT_PID;
-        for i in 1..crate::sched::scheduler::MAX_PROCESSES {
-            if let Some(ref mut child) = PROCESS_TABLE[i] {
-                if child.family.parent_pid == current_pid as u32
-                    && child.state == crate::sched::task::ProcessState::Zombie
-                {
-                    crate::pr_info!(
+        let parent_pid = CURRENT_PID;
+        let parent_task = PROCESS_TABLE[parent_pid].as_mut().unwrap();
+
+        if parent_task.family.child_count == 0 {
+            (*regs).set_return_error(KernelError::ECHILD);
+            return;
+        }
+
+        for i in 0..parent_task.family.child_count {
+            let child_pid = parent_task.family.children[i] as usize;
+
+            if let Some(ref mut child) = PROCESS_TABLE[child_pid] {
+                if child.state == ProcessState::Zombie {
+                    let reaped_pid = child.pid;
+
+                    PROCESS_TABLE[child_pid] = None;
+
+                    let last_idx = parent_task.family.child_count - 1;
+                    parent_task.family.children[i] = parent_task.family.children[last_idx];
+                    parent_task.family.child_count -= 1;
+
+                    pr_info!(
                         "Parent PID {} reaped Zombie PID {}\n",
-                        current_pid,
-                        child.pid
+                        parent_pid,
+                        reaped_pid
                     );
-                    let child_pid = child.pid;
-                    PROCESS_TABLE[i] = None;
-                    (*regs).set_return_value(child_pid);
+
+                    (*regs).set_return_value(reaped_pid);
                     return;
                 }
             }
         }
-        (*regs).set_return_value(0);
+
+        parent_task.state = ProcessState::Sleeping;
+        (*regs).eip -= 2;
     }
 }

@@ -1,5 +1,3 @@
-use crate::{pr_debug, pr_err, pr_warn};
-
 use super::frame_allocator;
 use super::kernel_heap;
 use super::multiboot::{
@@ -9,7 +7,9 @@ use super::multiboot::{
 use super::page_table;
 use super::physical;
 use super::vmem;
+use super::{PAGE_USER, PAGE_WRITABLE};
 use crate::x86;
+use crate::{pr_debug, pr_err, pr_warn};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const USER_SPACE_START: usize = 0x0000_1000;
@@ -64,7 +64,7 @@ fn test_bootstrap_map_get_roundtrip() -> bool {
     let probe_addr = 0x003F_F000;
     test_start(NAME);
 
-    match page_table::map_page_bootstrap(probe_addr, probe_addr, page_table::PAGE_WRITABLE) {
+    match page_table::map_page_bootstrap(probe_addr, probe_addr, PAGE_WRITABLE) {
         Ok(()) => match page_table::get_page_bootstrap(probe_addr) {
             Some(entry) => {
                 let phys = entry & 0xFFFF_F000;
@@ -95,7 +95,7 @@ fn test_bootstrap_map_get_roundtrip() -> bool {
         },
         Err(e) => {
             pr_err!(
-                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] map failed: {}\n",
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] map failed: {:?}\n",
                 NAME,
                 e
             );
@@ -108,7 +108,7 @@ fn test_bootstrap_guard_rejects_unsupported_pde() -> bool {
     const NAME: &str = "bootstrap-guard";
     test_start(NAME);
 
-    match page_table::map_page_bootstrap(0x0080_0000, 0x0080_0000, page_table::PAGE_WRITABLE) {
+    match page_table::map_page_bootstrap(0x0080_0000, 0x0080_0000, PAGE_WRITABLE) {
         Ok(()) => {
             test_fail(NAME, "expected unsupported-PDE mapping to fail");
             false
@@ -169,15 +169,15 @@ fn test_vmalloc_vfree_vsize() -> bool {
     const NAME: &str = "vmalloc-vfree-vsize";
     test_start(NAME);
 
-    let Some(ptr) = vmem::vmalloc(6000) else {
+    let Ok(ptr) = vmem::vmalloc(6000) else {
         test_fail(NAME, "vmalloc returned none");
         return false;
     };
 
     let mut ok = true;
     match vmem::vsize(ptr as *const u8) {
-        Some(6000) => {}
-        Some(other) => {
+        Ok(6000) => {}
+        Ok(other) => {
             pr_err!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] size mismatch ptr={:#x} got={} expected=6000\n",
                 NAME,
@@ -186,7 +186,7 @@ fn test_vmalloc_vfree_vsize() -> bool {
             );
             ok = false;
         }
-        None => {
+        Err(_) => {
             pr_err!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] vsize returned none ptr={:#x}\n",
                 NAME,
@@ -196,13 +196,17 @@ fn test_vmalloc_vfree_vsize() -> bool {
         }
     }
 
-    if !vmem::vfree(ptr) {
-        pr_err!(
-            "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] vfree failed ptr={:#x}\n",
-            NAME,
-            ptr as usize
-        );
-        ok = false;
+    match vmem::vfree(ptr) {
+        Ok(()) => {}
+        Err(e) => {
+            pr_err!(
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] vfree failed ptr={:#x} e={:?}\n",
+                NAME,
+                ptr as usize,
+                e
+            );
+            ok = false;
+        }
     }
 
     if ok {
@@ -215,15 +219,15 @@ fn test_kmalloc_kfree_ksize() -> bool {
     const NAME: &str = "kmalloc-kfree-ksize";
     test_start(NAME);
 
-    let Some(ptr) = kernel_heap::kmalloc(128) else {
+    let Ok(ptr) = kernel_heap::kmalloc(128) else {
         test_fail(NAME, "kmalloc returned none");
         return false;
     };
 
     let mut ok = true;
     match kernel_heap::ksize(ptr as *const u8) {
-        Some(128) => {}
-        Some(other) => {
+        Ok(128) => {}
+        Ok(other) => {
             pr_err!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] size mismatch ptr={:#x} got={} expected=128\n",
                 NAME,
@@ -232,23 +236,28 @@ fn test_kmalloc_kfree_ksize() -> bool {
             );
             ok = false;
         }
-        None => {
+        Err(e) => {
             pr_err!(
-                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] ksize returned none ptr={:#x}\n",
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] ksize returned error ptr={:#x} error={:?}\n",
                 NAME,
-                ptr as usize
+                ptr as usize,
+                e
             );
             ok = false;
         }
     }
 
-    if !kernel_heap::kfree(ptr) {
-        pr_err!(
-            "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x}\n",
-            NAME,
-            ptr as usize
-        );
-        ok = false;
+    match kernel_heap::kfree(ptr) {
+        Ok(()) => {}
+        Err(e) => {
+            pr_err!(
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x} e={:?}\n",
+                NAME,
+                ptr as usize,
+                e
+            );
+            ok = false;
+        }
     }
 
     if ok {
@@ -261,12 +270,12 @@ fn test_kmalloc_reuse_after_free() -> bool {
     const NAME: &str = "kmalloc-reuse-after-free";
     test_start(NAME);
 
-    let Some(first) = kernel_heap::kmalloc(128) else {
+    let Ok(first) = kernel_heap::kmalloc(128) else {
         test_fail(NAME, "first kmalloc returned none");
         return false;
     };
 
-    let Some(second) = kernel_heap::kmalloc(96) else {
+    let Ok(second) = kernel_heap::kmalloc(96) else {
         let _ = kernel_heap::kfree(first);
         test_fail(NAME, "second kmalloc returned none");
         return false;
@@ -283,8 +292,8 @@ fn test_kmalloc_reuse_after_free() -> bool {
     }
 
     match kernel_heap::ksize(first as *const u8) {
-        Some(128) => {}
-        Some(other) => {
+        Ok(128) => {}
+        Ok(other) => {
             pr_err!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] size mismatch ptr={:#x} got={} expected=128\n",
                 NAME,
@@ -293,19 +302,20 @@ fn test_kmalloc_reuse_after_free() -> bool {
             );
             ok = false;
         }
-        None => {
+        Err(e) => {
             pr_err!(
-                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] ksize returned none ptr={:#x}\n",
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] ksize returned error ptr={:#x} error={:?}\n",
                 NAME,
-                first as usize
+                first as usize,
+                e
             );
             ok = false;
         }
     }
 
     match kernel_heap::ksize(second as *const u8) {
-        Some(96) => {}
-        Some(other) => {
+        Ok(96) => {}
+        Ok(other) => {
             pr_err!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] size mismatch ptr={:#x} got={} expected=96\n",
                 NAME,
@@ -314,26 +324,31 @@ fn test_kmalloc_reuse_after_free() -> bool {
             );
             ok = false;
         }
-        None => {
+        Err(e) => {
             pr_err!(
-                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] ksize returned none ptr={:#x}\n",
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] ksize returned error ptr={:#x} error={:?}\n",
                 NAME,
-                second as usize
+                second as usize,
+                e
             );
             ok = false;
         }
     }
 
-    if !kernel_heap::kfree(first) {
-        pr_err!(
-            "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x}\n",
-            NAME,
-            first as usize
-        );
-        ok = false;
+    match kernel_heap::kfree(first) {
+        Ok(()) => {}
+        Err(e) => {
+            pr_err!(
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x} e={:?}\n",
+                NAME,
+                first as usize,
+                e
+            );
+            ok = false;
+        }
     }
 
-    let Some(reused) = kernel_heap::kmalloc(80) else {
+    let Ok(reused) = kernel_heap::kmalloc(80) else {
         test_fail(NAME, "reuse kmalloc returned none");
         let _ = kernel_heap::kfree(second);
         return false;
@@ -349,7 +364,7 @@ fn test_kmalloc_reuse_after_free() -> bool {
         ok = false;
     }
 
-    if kernel_heap::ksize(reused as *const u8) != Some(80) {
+    if kernel_heap::ksize(reused as *const u8) != Ok(80) {
         pr_err!(
             "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] reused block size mismatch ptr={:#x}\n",
             NAME,
@@ -358,22 +373,30 @@ fn test_kmalloc_reuse_after_free() -> bool {
         ok = false;
     }
 
-    if !kernel_heap::kfree(second) {
-        pr_err!(
-            "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x}\n",
-            NAME,
-            second as usize
-        );
-        ok = false;
+    match kernel_heap::kfree(second) {
+        Ok(()) => {}
+        Err(e) => {
+            pr_err!(
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x} e={:?}\n",
+                NAME,
+                second as usize,
+                e
+            );
+            ok = false;
+        }
     }
 
-    if !kernel_heap::kfree(reused) {
-        pr_err!(
-            "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x}\n",
-            NAME,
-            reused as usize
-        );
-        ok = false;
+    match kernel_heap::kfree(reused) {
+        Ok(()) => {}
+        Err(e) => {
+            pr_err!(
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] kfree failed ptr={:#x} e={:?}\n",
+                NAME,
+                reused as usize,
+                e
+            );
+            ok = false;
+        }
     }
 
     if ok {
@@ -386,11 +409,7 @@ fn test_kernel_user_rights_guard() -> bool {
     const NAME: &str = "kernel-user-rights";
     test_start(NAME);
 
-    match page_table::map_page(
-        KERNEL_SPACE_START as u32,
-        0x0010_0000,
-        page_table::PAGE_USER,
-    ) {
+    match page_table::map_page(KERNEL_SPACE_START as u32, 0x0010_0000, PAGE_USER) {
         Ok(()) => {
             test_fail(NAME, "kernel mapping accepted PAGE_USER unexpectedly");
             false
@@ -414,11 +433,7 @@ fn test_user_map_get_unmap_roundtrip() -> bool {
     let user_va = (USER_SPACE_START + PAGE_SIZE) as u32;
     let mut ok = true;
 
-    match page_table::map_page(
-        user_va,
-        frame,
-        page_table::PAGE_WRITABLE | page_table::PAGE_USER,
-    ) {
+    match page_table::map_page(user_va, frame, PAGE_WRITABLE | PAGE_USER) {
         Ok(()) => match page_table::get_page(user_va) {
             Some(entry) => {
                 let got = entry & 0xFFFF_F000;
@@ -440,7 +455,7 @@ fn test_user_map_get_unmap_roundtrip() -> bool {
         },
         Err(e) => {
             pr_err!(
-                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] user map failed: {}\n",
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] user map failed: {:?}\n",
                 NAME,
                 e
             );
@@ -448,13 +463,17 @@ fn test_user_map_get_unmap_roundtrip() -> bool {
         }
     }
 
-    if page_table::unmap_page(user_va).is_err() {
-        pr_err!(
-            "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] user page unmap failed va={:#x}\n",
-            NAME,
-            user_va
-        );
-        ok = false;
+    match page_table::unmap_page(user_va) {
+        Ok(()) => {}
+        Err(e) => {
+            pr_err!(
+                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] user page unmap failed va={:#x} e={:?}\n",
+                NAME,
+                user_va,
+                e
+            );
+            ok = false;
+        }
     }
 
     let _ = physical::free_physical_page(frame);
@@ -471,15 +490,12 @@ fn test_virtual_reuse_after_free() -> bool {
 
     let first = vmem::vmalloc(4096);
     let second = first.and_then(|ptr| {
-        if vmem::vfree(ptr) {
-            vmem::vmalloc(4096)
-        } else {
-            None
-        }
+        vmem::vfree(ptr)?;
+        vmem::vmalloc(4096)
     });
 
     let result = match (first, second) {
-        (Some(first_ptr), Some(second_ptr)) if first_ptr == second_ptr => {
+        (Ok(first_ptr), Ok(second_ptr)) if first_ptr == second_ptr => {
             pr_debug!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] reused ptr={:#x}\n",
                 NAME,
@@ -488,7 +504,7 @@ fn test_virtual_reuse_after_free() -> bool {
             test_pass(NAME);
             true
         }
-        (Some(first_ptr), Some(second_ptr)) => {
+        (Ok(first_ptr), Ok(second_ptr)) => {
             pr_warn!(
                 "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] returned different ptrs first={:#x} second={:#x}\n",
                 NAME,
@@ -497,25 +513,29 @@ fn test_virtual_reuse_after_free() -> bool {
             );
             true
         }
-        (Some(_), None) => {
+        (Ok(_), Err(_)) => {
             test_fail(NAME, "second allocation failed after successful free");
             false
         }
-        (None, _) => {
+        (Err(_), _) => {
             test_fail(NAME, "initial allocation failed");
             false
         }
     };
 
-    second.map(|ptr| {
-        if !vmem::vfree(ptr) {
-            pr_err!(
-                "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] cleanup vfree failed ptr={:#x}\n",
-                NAME,
-                ptr as usize
-            );
-        }
-    });
+    if second.is_ok() {
+        let _ = second.and_then(|ptr| {
+            vmem::vfree(ptr).or_else(|e| {
+                pr_warn!(
+                    "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] vfree failed ptr={:#x} e={:?}\n",
+                    NAME,
+                    ptr as usize,
+                    e
+                );
+                Ok(())
+            })
+        });
+    }
 
     result
 }

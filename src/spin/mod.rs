@@ -1,3 +1,3 @@
-pub mod spinlock;
+mod spinlock;
 
-pub use spinlock::Spinlock;
+pub(crate) use spinlock::Spinlock;

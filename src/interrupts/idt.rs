@@ -1,5 +1,6 @@
 use core::arch::asm;
 
+use crate::gdt::KERNEL_CODE_SEL;
 use crate::startup_config;
 
 // This creates and IDT Struct and make it like __attribute__((packed)) in C
@@ -29,8 +30,6 @@ static mut IDT: [IdtEntry; startup_config::idt::ENTRIES] = [IdtEntry {
     offset_high: 0,
 }; startup_config::idt::ENTRIES];
 
-const KERNEL_CODE_SELECTOR: u16 = 0x08;
-
 pub fn init_idt() {
     // Initialize the IDTPointer first entry the size second the address of the first IDT entry
     let idt_ptr = IdtPointer {
@@ -49,7 +48,7 @@ pub(crate) fn register_interrupt_handler(index: u8, handler: unsafe extern "C" f
     unsafe {
         IDT[index as usize] = IdtEntry {
             offset_low: handler_addr as u16,
-            selector: KERNEL_CODE_SELECTOR, // Kernel code segment
+            selector: KERNEL_CODE_SEL, // Kernel code segment
             zero: 0,
             flags: 0x8E, // Present=1, DPL=0, Type=32-bit Interrupt Gate
             offset_high: (handler_addr >> 16) as u16,
@@ -62,7 +61,7 @@ pub(crate) fn register_user_interrupt_handler(index: u8, handler: unsafe extern 
     unsafe {
         IDT[index as usize] = IdtEntry {
             offset_low: handler_addr as u16,
-            selector: KERNEL_CODE_SELECTOR,
+            selector: KERNEL_CODE_SEL,
             zero: 0,
             flags: 0xEE, // Present=1, DPL=3, Type=32-bit Interrupt Gate
             offset_high: (handler_addr >> 16) as u16,

@@ -1,11 +1,13 @@
-use crate::sched::scheduler::{CURRENT_PID, PROCESS_TABLE};
-use crate::sched::task::ContextFrame;
+use crate::fs::FileDescriptor;
+use crate::ipc::SOCKETS;
+use crate::sched::{self, ContextFrame, CURRENT_PID, MAX_PROCESSES, PROCESS_TABLE};
+use crate::{paging, pr_info};
 
 pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let parent_pid = CURRENT_PID;
 
     let mut child_pid_opt = None;
-    for i in 1..crate::sched::scheduler::MAX_PROCESSES {
+    for i in 1..MAX_PROCESSES {
         if PROCESS_TABLE[i].is_none() {
             child_pid_opt = Some(i);
             break;
@@ -22,7 +24,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     let parent_task = PROCESS_TABLE[parent_pid].as_ref().unwrap();
 
-    let child_cr3 = match crate::paging::page_table::clone_address_space(parent_task.context.cr3) {
+    let child_cr3 = match paging::clone_address_space(parent_task.context.cr3) {
         Some(cr3) => cr3,
         None => {
             (*regs).set_return_value(!0u32); // ENOMEM
@@ -30,8 +32,8 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
         }
     };
 
-    let child_kstack_phys = crate::paging::physical::alloc_physical_page().unwrap();
-    let child_kstack_top = crate::paging::page_table::phys_to_virt(child_kstack_phys) as u32 + 4096;
+    let child_kstack_phys = paging::alloc_physical_page().unwrap();
+    let child_kstack_top = paging::phys_to_virt(child_kstack_phys) as u32 + 4096;
     let child_kstack_bottom = child_kstack_top - 4096;
 
     let child_frame_ptr =
@@ -42,7 +44,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let cf_eflags = (*child_frame_ptr).eflags;
     let cf_user_esp = (*child_frame_ptr).user_esp;
     let cf_user_ss = (*child_frame_ptr).user_ss;
-    crate::pr_info!(
+    pr_info!(
         "Child Frame: EIP={:#x}, CS={:#x}, EFLAGS={:#x}, USER_ESP={:#x}, USER_SS={:#x}\n",
         cf_eip,
         cf_cs,
@@ -55,11 +57,11 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     (*child_frame_ptr).eax = 0;
 
-    let mut child_task: crate::sched::task::TaskStruct =
-        core::mem::MaybeUninit::zeroed().assume_init();
+    let mut child_task: sched::TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
     child_task.pid = child_pid as u32;
     child_task.uid = parent_task.uid;
-    child_task.state = crate::sched::task::ProcessState::Ready;
+    child_task.state = sched::ProcessState::Ready;
+    child_task.exit_code = None;
 
     // Set the execution pointer to the forged stack
     child_task.context.esp = child_frame_ptr as u32;
@@ -69,11 +71,11 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     child_task.kernel_stack_top = child_kstack_top;
     child_task.kernel_stack_bottom = child_kstack_bottom;
 
-    for i in 0..crate::sched::task::MAX_FDS_PER_PROCESS {
+    for i in 0..sched::MAX_FDS_PER_PROCESS {
         if let Some(fd) = parent_task.fd_tbl[i] {
             child_task.fd_tbl[i] = Some(fd);
-            if let crate::fs::vfs::FileDescriptor::Socket(sock_idx) = fd {
-                crate::ipc::SOCKETS[sock_idx].lock().ref_count += 1;
+            if let FileDescriptor::Socket(sock_idx) = fd {
+                SOCKETS[sock_idx].lock().ref_count += 1;
             }
         }
     }
@@ -82,7 +84,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     let parent_task_mut = PROCESS_TABLE[parent_pid].as_mut().unwrap();
     let cc = parent_task_mut.family.child_count;
-    if cc < crate::sched::task::MAX_CHILDREN {
+    if cc < sched::MAX_CHILDREN {
         parent_task_mut.family.children[cc] = child_pid as u32;
         parent_task_mut.family.child_count += 1;
     }

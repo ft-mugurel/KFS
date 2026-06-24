@@ -1,9 +1,11 @@
-use crate::interrupts::task_queue::schedule_task;
+use crate::sched::schedule_task;
 use crate::pr_warn;
 use crate::spin::Spinlock;
 
 pub const MAX_SIGNALS: usize = 32;
 pub const MAX_SCHEDULED_SIGNALS: usize = 64;
+
+// TODO: Implement bitmasks and blocking.
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]

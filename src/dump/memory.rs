@@ -1,20 +1,20 @@
 use core::{fmt, ptr};
 
-use crate::paging::{kernel_heap, page_table, physical, vmem};
-
-pub const MEMDUMP_DEFAULT_LEN: usize = 128;
-pub const MEMDUMP_MAX_LEN: usize = 512;
+use crate::{
+    error::{KResult, KernelError},
+    paging,
+};
 
 pub fn print_memstat(mut emit: impl FnMut(&fmt::Arguments<'_>)) {
-    let total_pages = physical::total_physical_pages();
-    let free_pages = physical::free_physical_pages();
+    let total_pages = paging::total_physical_pages();
+    let free_pages = paging::free_physical_pages();
     let used_pages = total_pages.saturating_sub(free_pages);
-    let page_size = physical::physical_page_size();
+    let page_size = paging::physical_page_size();
     let total_phys_kib = total_pages.saturating_mul(page_size) / 1024;
     let free_phys_kib = free_pages.saturating_mul(page_size) / 1024;
 
-    let vstats = vmem::debug_stats();
-    let hstats = kernel_heap::debug_stats();
+    let vstats = paging::vmem_debug_stats();
+    let hstats = paging::kernel_heap_debug_stats();
 
     emit(&format_args!(
         "physical: total_pages={} free_pages={} used_pages={} total_kib={} free_kib={}\n",
@@ -48,7 +48,7 @@ pub fn print_memdebug(mut emit: impl FnMut(&fmt::Arguments<'_>)) {
 
     emit(&format_args!("vmem active allocations:\n"));
     let mut alloc_count = 0usize;
-    vmem::debug_for_each_alloc(|base, size, pages| {
+    paging::vmem_debug_for_each_alloc(|base, size, pages| {
         alloc_count += 1;
         emit(&format_args!(
             "  alloc#{:02} base={:#010x} size={} pages={}\n",
@@ -61,7 +61,7 @@ pub fn print_memdebug(mut emit: impl FnMut(&fmt::Arguments<'_>)) {
 
     emit(&format_args!("vmem free ranges:\n"));
     let mut free_count = 0usize;
-    vmem::debug_for_each_free_range(|base, size| {
+    paging::vmem_debug_for_each_free_range(|base, size| {
         free_count += 1;
         let end = base.saturating_add(size);
         emit(&format_args!(
@@ -76,7 +76,7 @@ pub fn print_memdebug(mut emit: impl FnMut(&fmt::Arguments<'_>)) {
 
 pub fn debug_page_entry(addr: u32, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     let page_base = addr & 0xFFFF_F000;
-    match page_table::get_page(page_base) {
+    match paging::get_page(page_base) {
         Some(entry) => {
             let phys = entry & 0xFFFF_F000;
             let flags = entry & 0x0000_0FFF;
@@ -86,10 +86,10 @@ pub fn debug_page_entry(addr: u32, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
             ));
             emit(&format_args!(
                 "  present={} writable={} user={} huge={}\n",
-                (entry & page_table::PAGE_PRESENT) != 0,
-                (entry & page_table::PAGE_WRITABLE) != 0,
-                (entry & page_table::PAGE_USER) != 0,
-                (entry & page_table::PAGE_PAGE_SIZE_4MB) != 0
+                (entry & paging::PAGE_PRESENT) != 0,
+                (entry & paging::PAGE_WRITABLE) != 0,
+                (entry & paging::PAGE_USER) != 0,
+                (entry & paging::PAGE_PAGE_SIZE_4MB) != 0
             ));
         }
         None => {
@@ -130,7 +130,7 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fm
 
             let byte_addr = start_addr.wrapping_add(pos as u32);
             let page_base = byte_addr & 0xFFFF_F000;
-            if page_table::get_page(page_base).is_none() {
+            if paging::get_page(page_base).is_none() {
                 emit(&format_args!("?? "));
                 ascii[i] = b'?';
                 continue;
@@ -188,7 +188,9 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
                     run_page = true;
                 }
                 _ => {
-                    emit(&format_args!("usage: memtest [physical,vmem,heap,page,all]\n"));
+                    emit(&format_args!(
+                        "usage: memtest [physical,vmem,heap,page,all]\n"
+                    ));
                     emit(&format_args!("unknown feature: {}\n", token));
                     return;
                 }
@@ -223,11 +225,14 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
 
     if run_heap {
         total += 1;
-        if memtest_heap_roundtrip() {
-            passed += 1;
-            emit(&format_args!("  [PASS] heap\n"));
-        } else {
-            emit(&format_args!("  [FAIL] heap\n"));
+        match memtest_heap_roundtrip() {
+            Ok(()) => {
+                passed += 1;
+                emit(&format_args!("  [PASS] heap\n"));
+            }
+            Err(e) => {
+                emit(&format_args!("  [FAIL] heap ({:?})\n", e));
+            }
         }
     }
 
@@ -250,73 +255,70 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
 }
 
 fn memtest_physical_roundtrip() -> bool {
-    let free_before = physical::free_physical_pages();
-    let Some(frame) = physical::alloc_physical_page() else {
+    let free_before = paging::free_physical_pages();
+    let Some(frame) = paging::alloc_physical_page() else {
         return false;
     };
 
-    let free_after_alloc = physical::free_physical_pages();
+    let free_after_alloc = paging::free_physical_pages();
     if free_after_alloc.saturating_add(1) != free_before {
-        let _ = physical::free_physical_page(frame);
+        let _ = paging::free_physical_page(frame);
         return false;
     }
 
-    if !physical::free_physical_page(frame) {
+    if !paging::free_physical_page(frame) {
         return false;
     }
 
-    physical::free_physical_pages() == free_before
+    paging::free_physical_pages() == free_before
 }
 
 fn memtest_vmem_roundtrip() -> bool {
-    let Some(ptr) = vmem::vmalloc(4096) else {
+    let Some(ptr) = paging::vmalloc(4096).ok() else {
         return false;
     };
 
-    if vmem::vsize(ptr as *const u8) != Some(4096) {
-        let _ = vmem::vfree(ptr);
+    if paging::vsize(ptr as *const u8).is_ok_and(|size| size != 4096) {
+        let _ = paging::vfree(ptr);
         return false;
     }
 
-    vmem::vfree(ptr)
+    paging::vfree(ptr).is_ok()
 }
 
-fn memtest_heap_roundtrip() -> bool {
-    let Some(ptr) = kernel_heap::kmalloc(128) else {
-        return false;
-    };
+fn memtest_heap_roundtrip() -> KResult<()> {
+    let ptr = paging::kmalloc(128)?;
 
-    if kernel_heap::ksize(ptr as *const u8) != Some(128) {
-        let _ = kernel_heap::kfree(ptr);
-        return false;
-    }
-
-    kernel_heap::kfree(ptr)
+    paging::ksize(ptr as *const u8)
+        .is_ok_and(|size| size == 128)
+        .then_some(())
+        .ok_or(KernelError::EINVAL)?;
+    paging::kfree(ptr)
 }
 
 fn memtest_page_roundtrip() -> bool {
     const TEST_USER_VA: u32 = 0x0800_0000;
 
-    let Some(frame) = physical::alloc_physical_page() else {
+    let Some(frame) = paging::alloc_physical_page() else {
         return false;
     };
 
-    let map_ok = page_table::map_page(
+    let map_ok = paging::map_page(
         TEST_USER_VA,
         frame,
-        page_table::PAGE_WRITABLE | page_table::PAGE_USER,
+        paging::PAGE_WRITABLE | paging::PAGE_USER,
     )
     .is_ok();
     if !map_ok {
-        let _ = physical::free_physical_page(frame);
+        let _ = paging::free_physical_page(frame);
         return false;
     }
 
     let mapped =
-        matches!(page_table::get_page(TEST_USER_VA), Some(entry) if (entry & 0xFFFF_F000) == frame);
+        matches!(paging::get_page(TEST_USER_VA), Some(entry) if (entry & 0xFFFF_F000) == frame);
 
-    let _ = page_table::unmap_page(TEST_USER_VA);
-    let _ = physical::free_physical_page(frame);
+    let _ = paging::unmap_page(TEST_USER_VA);
+    let _ = paging::free_physical_page(frame);
 
     mapped
 }

@@ -1,27 +1,11 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::interrupts::keyboard::keycode::{KeyCode, Modifiers};
-
-#[derive(Clone, Copy)]
-pub struct Glyph {
-    base: char,
-    lvl2: char,
-    is_letter: bool,
-}
+use super::{Glyph, KeyCode, KeyboardLayout, Modifiers};
 
 impl Glyph {
     const fn new_l2(base: char, lvl2: char, is_letter: bool) -> Self {
         Self { base, lvl2, is_letter }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum KeyboardLayout {
-    UsQwerty = 0,
-    TrQwerty = 1,
-    GbQwerty = 2,
-
-    LayoutEnd = 3,
 }
 
 static ACTIVE_LAYOUT: AtomicU8 = AtomicU8::new(KeyboardLayout::UsQwerty as u8);
@@ -65,8 +49,8 @@ pub fn keycode_to_char(key: KeyCode, modifiers: Modifiers) -> Option<char> {
 }
 
 mod us_qwerty {
-    use crate::interrupts::keyboard::character_map::Glyph;
-    use crate::interrupts::keyboard::keycode::KeyCode;
+    use super::Glyph;
+    use super::KeyCode;
 
     pub(super) fn glyph_for_key(key: KeyCode) -> Option<Glyph> {
         let glyph = match key {
@@ -129,8 +113,8 @@ mod us_qwerty {
 }
 
 mod tr_qwerty {
-    use crate::interrupts::keyboard::character_map::Glyph;
-    use crate::interrupts::keyboard::keycode::KeyCode;
+    use super::Glyph;
+    use super::KeyCode;
 
     pub(super) fn glyph_for_key(key: KeyCode) -> Option<Glyph> {
         let glyph = match key {
@@ -193,8 +177,8 @@ mod tr_qwerty {
 }
 
 mod gb_qwerty {
-    use crate::interrupts::keyboard::character_map::Glyph;
-    use crate::interrupts::keyboard::keycode::KeyCode;
+    use super::Glyph;
+    use super::KeyCode;
 
     pub(super) fn glyph_for_key(key: KeyCode) -> Option<Glyph> {
         let glyph = match key {

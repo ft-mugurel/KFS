@@ -1,5 +1,7 @@
-use crate::sched::scheduler::{CURRENT_PID, PROCESS_TABLE};
-use crate::sched::task::ContextFrame;
+use crate::error::KernelError;
+use crate::fs::FileDescriptor;
+use crate::ipc;
+use crate::sched::{ContextFrame, CURRENT_PID, MAX_FDS_PER_PROCESS, PROCESS_TABLE};
 
 pub(super) unsafe fn syscall_close(regs: *mut ContextFrame) {
     unsafe {
@@ -7,19 +9,19 @@ pub(super) unsafe fn syscall_close(regs: *mut ContextFrame) {
         let current_pid = CURRENT_PID;
         let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
 
-        if fd >= crate::sched::task::MAX_FDS_PER_PROCESS {
-            (*regs).set_return_value(!0u32); // EBADF
+        if fd >= MAX_FDS_PER_PROCESS {
+            (*regs).set_return_error(KernelError::EBADF);
             return;
         }
         match task.fd_tbl[fd] {
-            Some(crate::fs::vfs::FileDescriptor::Socket(sock_idx)) => {
-                crate::ipc::close_socket(sock_idx);
+            Some(FileDescriptor::Socket(sock_idx)) => {
+                ipc::close_socket(sock_idx);
             }
-            Some(crate::fs::vfs::FileDescriptor::TTY(_)) => {
+            Some(FileDescriptor::TTY(_)) => {
                 // Nothing to do here until we bind ttys to fds
             }
             _ => {
-                (*regs).set_return_value(!0u32); // EBADF
+                (*regs).set_return_error(KernelError::EBADF);
                 return;
             }
         }

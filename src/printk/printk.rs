@@ -2,7 +2,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::startup_config;
-use crate::vga::text_mod::out;
+use crate::vga::text_mod;
 
 pub static LOG_LEVEL: AtomicU8 = AtomicU8::new(KernelLogLevel::Info as u8);
 
@@ -48,8 +48,8 @@ pub fn printk_level_to_screen(
     if !is_enabled(level) {
         return;
     }
-    out::print_on(screen_index, level_tag(level));
-    out::write_fmt_on(screen_index, args);
+    text_mod::print_str_on(screen_index, level_tag(level));
+    text_mod::print_fmt_on(screen_index, args);
 }
 
 pub fn printk_level_to_default(level: KernelLogLevel, args: &fmt::Arguments<'_>) {
@@ -70,6 +70,6 @@ pub fn printk_to_debug(args: &fmt::Arguments<'_>) {
     } else {
         startup_config::logging::DEFAULT_DEBUG_LOG_SCREEN
     };
-    out::print_on(screen_index, level_tag(KernelLogLevel::Debug));
-    out::write_fmt_on(screen_index, args);
+    text_mod::print_str_on(screen_index, level_tag(KernelLogLevel::Debug));
+    text_mod::print_fmt_on(screen_index, args);
 }

@@ -2,24 +2,23 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::str;
 
-use crate::debug::{
-    memory,
-    stack::{self, DumpStackOptions},
+use crate::dump::{
+    self, DumpStackOptions, DEFAULT_DUMP_WORDS, DEFAULT_TRACE_FRAMES, MAX_DUMP_WORDS,
+    MEMDUMP_DEFAULT_LEN, MEMDUMP_MAX_LEN,
 };
-use crate::interrupts::keyboard::character_map::keycode_to_char;
-use crate::interrupts::keyboard::keycode::{KeyCode, KeyEvent, Modifiers};
-use crate::interrupts::utils::{request_reboot, request_shutdown};
+use crate::interrupts::keyboard::{self, KeyCode, KeyEvent, KeyboardLayout, Modifiers};
+use crate::interrupts::{request_reboot, request_shutdown};
 use crate::printk::{set_log_level, KernelLogLevel};
-use crate::sched::create_user_process;
-use crate::signals::Signal;
+use crate::sched;
+use crate::signals::{self, Signal};
 use crate::startup_config;
-use crate::vga::text_mod::out::{
+use crate::test;
+use crate::vga::text_mod::{
     active_cursor_position, active_screen_accepts_input, change_color, clear, is_screen_active,
-    print_char_on, print_on, scroll_view_to_bottom, set_cursor_movement_on, set_cursor_position_on,
-    set_screen_accepts_input, switch_screen, switch_to_next_screen, switch_to_previous_screen,
-    write_fmt_on, Color, ColorCode,
+    print_char_on, print_fmt_on, print_str_on, scroll_view_to_bottom, set_cursor_movement_on,
+    set_cursor_position_on, set_screen_accepts_input, switch_screen, switch_to_next_screen,
+    switch_to_previous_screen, Color, ColorCode, CursorMovement, VGA_WIDTH,
 };
-use crate::vga::text_mod::screen;
 
 const PROMPT: &str = "mysh > ";
 const MAX_INPUT_LEN: usize = startup_config::shell::MAX_INPUT_LEN;
@@ -223,7 +222,7 @@ fn with_shell_state_mut<R>(f: impl FnOnce(&mut ShellState) -> R) -> R {
 
 #[inline]
 fn print(s: &str) {
-    print_on(SCREEN_INDEX, s);
+    print_str_on(SCREEN_INDEX, s);
 }
 
 #[inline]
@@ -233,7 +232,7 @@ fn print_char(c: char) {
 
 #[inline]
 fn print_fmt(args: &fmt::Arguments<'_>) {
-    write_fmt_on(SCREEN_INDEX, args);
+    print_fmt_on(SCREEN_INDEX, args);
 }
 
 fn shell_sigint_handler() {
@@ -258,10 +257,10 @@ pub fn init_shell() {
         );
         print(PROMPT);
         state.rendered_len = PROMPT.len();
-        set_cursor_movement_on(SCREEN_INDEX, screen::CursorMovement::Horizontal);
+        set_cursor_movement_on(SCREEN_INDEX, CursorMovement::Horizontal);
     });
 
-    crate::signals::register_signal_handler(Signal::SIGINT, shell_sigint_handler);
+    signals::register_signal_handler(Signal::SIGINT, shell_sigint_handler);
     set_screen_accepts_input(SCREEN_INDEX, true);
 }
 
@@ -375,7 +374,7 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
         }
         _ => {
             if !modifiers.has_text_blocking_modifier() {
-                if let Some(ch) = keycode_to_char(event.key, modifiers) {
+                if let Some(ch) = keyboard::keycode_to_char(event.key, modifiers) {
                     let _ = try_insert_char(ch);
                     return true;
                 }
@@ -443,8 +442,8 @@ fn redraw_input_line() {
         }
 
         let cursor_offset = PROMPT.len() + state.idx;
-        let new_cursor_x = (cursor_offset % screen::VGA_WIDTH) as u16;
-        let new_cursor_y = cursor_y + (cursor_offset / screen::VGA_WIDTH) as u16;
+        let new_cursor_x = (cursor_offset % VGA_WIDTH) as u16;
+        let new_cursor_y = cursor_y + (cursor_offset / VGA_WIDTH) as u16;
         set_cursor_position_on(SCREEN_INDEX, new_cursor_x, new_cursor_y);
         state.rendered_len = new_rendered_len;
         let _ = cursor_x;
@@ -506,11 +505,11 @@ fn run_command(line: &str) {
         "screen" => command_screen(parts),
         "loglevel" => command_loglevel(parts),
         "color" => command_color(parts),
-        "memstat" => memory::print_memstat(|args| print_fmt(args)),
-        "memdebug" => memory::print_memdebug(|args| print_fmt(args)),
+        "memstat" => dump::print_memstat(|args| print_fmt(args)),
+        "memdebug" => dump::print_memdebug(|args| print_fmt(args)),
         "memdump" => command_memdump(parts),
         "pte" => command_pte(parts),
-        "memtest" => memory::run_memtest(line[command.len()..].trim(), |args| print_fmt(args)),
+        "memtest" => dump::run_memtest(line[command.len()..].trim(), |args| print_fmt(args)),
         "stack" => command_stack(parts),
         "layout" => command_layout(parts),
         "crash" => unsafe {
@@ -694,15 +693,15 @@ fn command_memdump(mut parts: str::SplitWhitespace<'_>) {
         };
         parsed
     } else {
-        memory::MEMDUMP_DEFAULT_LEN
+        MEMDUMP_DEFAULT_LEN
     };
 
-    if len == 0 || len > memory::MEMDUMP_MAX_LEN {
+    if len == 0 || len > MEMDUMP_MAX_LEN {
         print("length must be in range 1..=512\n");
         return;
     }
 
-    memory::dump_virtual_memory(addr, len, |args| print_fmt(args));
+    dump::dump_virtual_memory(addr, len, |args| print_fmt(args));
 }
 
 #[inline(always)]
@@ -717,7 +716,7 @@ fn command_pte(mut parts: str::SplitWhitespace<'_>) {
         return;
     };
 
-    memory::debug_page_entry(addr, |args| print_fmt(args));
+    dump::debug_page_entry(addr, |args| print_fmt(args));
 }
 
 #[inline(always)]
@@ -729,23 +728,23 @@ fn command_stack(mut parts: str::SplitWhitespace<'_>) {
         };
         parsed
     } else {
-        stack::DEFAULT_DUMP_WORDS
+        DEFAULT_DUMP_WORDS
     };
 
-    if words == 0 || words > stack::MAX_DUMP_WORDS {
+    if words == 0 || words > MAX_DUMP_WORDS {
         print("word count must be in range 1..=64\n");
         return;
     }
 
     let options = DumpStackOptions {
         words,
-        frames: stack::DEFAULT_TRACE_FRAMES,
+        frames: DEFAULT_TRACE_FRAMES,
         print_stack_values: true,
         walk_frames: true,
         scan_stack: true,
     };
 
-    stack::dump_stack_with_options(options, |args| {
+    dump::dump_stack_with_options(options, |args| {
         print_fmt(&args);
     });
 }
@@ -758,15 +757,15 @@ fn command_layout(mut parts: str::SplitWhitespace<'_>) {
     };
 
     let layout = match layout_str {
-        "us" => crate::interrupts::keyboard::character_map::KeyboardLayout::UsQwerty,
-        "tr" => crate::interrupts::keyboard::character_map::KeyboardLayout::TrQwerty,
+        "us" => KeyboardLayout::UsQwerty,
+        "tr" => KeyboardLayout::TrQwerty,
         _ => {
             print("invalid layout\n");
             return;
         }
     };
 
-    crate::interrupts::keyboard::character_map::set_layout(layout);
+    keyboard::set_layout(layout);
     print("keyboard layout updated\n");
 }
 
@@ -797,7 +796,7 @@ fn command_read_test() {
     let mut buffer = [0u8; 64];
 
     // This will block the shell execution until the user presses Enter
-    let len = crate::interrupts::keyboard::api::get_line(SCREEN_INDEX, &mut buffer);
+    let len = keyboard::get_line(SCREEN_INDEX, &mut buffer);
 
     if let Ok(input_str) = core::str::from_utf8(&buffer[..len]) {
         print("Hello, ");
@@ -861,9 +860,9 @@ fn command_signal(mut parts: str::SplitWhitespace<'_>) {
     };
 
     if delay_ms == 0 {
-        crate::signals::send_signal(signal);
+        signals::send_signal(signal);
     } else {
-        crate::signals::schedule_signal(signal, delay_ms);
+        signals::schedule_signal(signal, delay_ms);
     }
 }
 
@@ -905,9 +904,9 @@ fn command_spawn(mut parts: str::SplitWhitespace<'_>) {
     let name = parts.next().unwrap_or("");
     let size = parts.next().and_then(|s| parse_usize(s)).unwrap_or(0);
     let entry_point = match name {
-        "sleep" => crate::test::process_sleep,
-        "fork" => crate::test::process_fork,
-        "socket" => crate::test::process_socket,
+        "sleep" => test::process_sleep,
+        "fork" => test::process_fork,
+        "socket" => test::process_socket,
         _ => {
             print("Unknown process name. Available: user_process, sleep, fork, socket\n");
             return;
@@ -917,7 +916,7 @@ fn command_spawn(mut parts: str::SplitWhitespace<'_>) {
         print("Invalid size. Must be greater than 0.\n");
         return;
     }
-    if create_user_process(entry_point, size) {
+    if sched::create_user_process(entry_point, size) {
         print_fmt(&format_args!(
             "Spawned user process '{}' with size {} bytes.\n",
             name, size

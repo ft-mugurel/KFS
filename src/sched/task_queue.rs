@@ -1,4 +1,4 @@
-use crate::spin::Spinlock;
+use crate::{pr_warn, spin::Spinlock};
 
 const QUEUE_SIZE: usize = 128;
 
@@ -40,7 +40,7 @@ static TASK_QUEUE: Spinlock<TaskQueue> = Spinlock::new(TaskQueue::new());
 pub fn schedule_task(task: Task) {
     let mut queue = TASK_QUEUE.lock();
     if !queue.push(task) {
-        crate::pr_warn!("Task queue overflow! Dropped task.\n");
+        pr_warn!("Task queue overflow! Dropped task.\n");
     }
 }
 

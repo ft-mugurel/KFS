@@ -1,6 +1,9 @@
-use crate::interrupts::idt::register_interrupt_handler;
+use crate::interrupts::register_interrupt_handler;
+use crate::panic;
+use crate::sched::{self, ProcessState, CURRENT_PID, PROCESS_TABLE};
 use crate::startup_config::logging::DEFAULT_LOG_SCREEN;
 use crate::vga::text_mod;
+use crate::{paging, pr_info};
 use crate::{pr_emerg, pr_err, pr_warn, x86};
 
 const EXCEPTION_NAMES: [&str; 32] = [
@@ -106,35 +109,80 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
     let frame = &*regs;
 
     if (frame.cs & 0x03) == 3 {
-        let sig_num = match idx {
+        let current_pid = CURRENT_PID;
+        let idx_usize = vector as usize;
+
+        if idx_usize == 14 {
+            let fault_addr = x86::read_cr2();
+            let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+            let mem = &task.memory;
+
+            let mut is_valid = false;
+            let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+
+            if fault_addr >= mem.code_base && fault_addr < mem.code_base + mem.code_size {
+                is_valid = true;
+                flags |= paging::PAGE_WRITABLE;
+            } else if fault_addr >= mem.data_base && fault_addr < mem.data_base + mem.data_size {
+                is_valid = true;
+                flags |= paging::PAGE_WRITABLE;
+            } else if fault_addr >= mem.bss_base && fault_addr < mem.bss_base + mem.bss_size {
+                is_valid = true;
+                flags |= paging::PAGE_WRITABLE;
+            } else if fault_addr >= mem.stack_limit && fault_addr <= mem.stack_base {
+                is_valid = true;
+                flags |= paging::PAGE_WRITABLE;
+            } else if fault_addr >= mem.heap_base && fault_addr < mem.heap_brk {
+                is_valid = true;
+                flags |= paging::PAGE_WRITABLE;
+            } else {
+                for vma in &mem.vmas {
+                    if vma.used && fault_addr >= vma.base && fault_addr < vma.base + vma.size {
+                        is_valid = true;
+                        flags |= paging::PAGE_WRITABLE;
+                        break;
+                    }
+                }
+            }
+
+            if is_valid {
+                let aligned_vaddr = fault_addr & !0xFFF;
+                match paging::map_zero_page(aligned_vaddr, flags) {
+                    Ok(()) => {
+                        core::ptr::write_bytes(aligned_vaddr as *mut u8, 0, 4096);
+                        return;
+                    }
+                    Err(e) => {
+                        pr_info!("OOM: Cannot demand page PID {}: {:?}\n", current_pid, e);
+                    }
+                }
+            } else {
+                pr_info!("Segmentation Fault at {:#x}\n", fault_addr);
+            }
+        }
+        // --- END DEMAND PAGING ---
+
+        // If it was not a handled page fault, terminate the process
+        let sig_num = match idx_usize {
             0 => 8,        // Divide by Zero -> SIGFPE
             6 => 4,        // Invalid Opcode -> SIGILL
-            13 | 14 => 11, // GPF or Page Fault -> SIGSEGV
+            13 | 14 => 11, // GPF or Unhandled Page Fault -> SIGSEGV
             _ => 9,        // Unknown fatal fault -> SIGKILL
         };
 
-        let current_pid = crate::sched::scheduler::CURRENT_PID;
-        crate::pr_info!(
+        pr_info!(
             "PID {} killed by hardware exception {} (Signal {})\n",
             current_pid,
-            idx,
+            idx_usize,
             sig_num
         );
 
-        if idx == 14 {
-            let fault_addr = x86::read_cr2();
-            crate::pr_info!("Segmentation Fault at {:#x}\n", fault_addr);
-        }
-        let task = crate::sched::scheduler::PROCESS_TABLE[current_pid]
-            .as_mut()
-            .unwrap();
-        task.state = crate::sched::task::ProcessState::Zombie;
+        let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+        task.state = ProcessState::Zombie;
 
-        crate::x86::write_cr3(crate::paging::page_table::bootstrap_directory_phys_addr());
+        x86::write_cr3(paging::bootstrap_directory_phys_addr());
+        let next_esp = sched::schedule(frame.esp);
 
-        let next_esp = crate::sched::scheduler::schedule(frame.esp);
-
-        // Force a context switch directly from the exception handler
         core::arch::asm!(
             "mov esp, {}",
             "popad",
@@ -169,7 +217,7 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
 
     pr_emerg!("fatal CPU exception, halting kernel\n");
     x86::disable_interrupts();
-    text_mod::out::switch_screen(DEFAULT_LOG_SCREEN);
+    text_mod::switch_screen(DEFAULT_LOG_SCREEN);
 
     pr_emerg!(
         "Registers:\n\
@@ -185,8 +233,8 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         frame.esp
     );
 
-    crate::panic::save_stack_trace();
-    crate::panic::clean_registers_and_halt();
+    panic::save_stack_trace();
+    panic::clean_registers_and_halt();
 }
 
 pub fn init_exceptions() {

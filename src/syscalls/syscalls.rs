@@ -1,4 +1,6 @@
-use crate::sched::task::ContextFrame;
+use crate::interrupts::register_user_interrupt_handler;
+use crate::pr_warn;
+use crate::sched::ContextFrame;
 
 use super::close::syscall_close;
 use super::exit::{syscall_exit, syscall_wait};
@@ -49,10 +51,10 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) {
         }
     }
 
-    crate::pr_warn!("Unknown or unimplemented syscall number: {}\n", syscall_no);
+    pr_warn!("Unknown or unimplemented syscall number: {}\n", syscall_no);
     unsafe { (*regs).eax = (!0u32) - 38 + 1 };
 }
 
 pub fn init_syscalls() {
-    crate::interrupts::idt::register_user_interrupt_handler(SYSCALL_VECTOR, isr_syscall);
+    register_user_interrupt_handler(SYSCALL_VECTOR, isr_syscall);
 }

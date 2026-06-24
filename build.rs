@@ -13,7 +13,7 @@ fn main() {
     let map_path = PathBuf::from("build/kallsyms.map");
     let generated = match fs::read_to_string(&map_path) {
         Ok(content) => generate_outputs(&content),
-        Err(_) => "pub static KALLSYMS: &[crate::debug::kallsyms::Symbol] = &[];\n".to_string(),
+        Err(_) => "pub static KALLSYMS: &[crate::dump::kallsyms::Symbol] = &[];\n".to_string(),
     };
 
     fs::write(out_file, generated).expect("failed to write kallsyms_generated.rs");
@@ -34,7 +34,7 @@ fn generate_outputs(map: &str) -> String {
     let _ = fs::write("build/kallsyms.slim.map", to_map_text(&slim));
 
     let mut out = String::new();
-    out.push_str("pub static KALLSYMS: &[crate::debug::kallsyms::Symbol] = &[\n");
+    out.push_str("pub static KALLSYMS: &[crate::dump::kallsyms::Symbol] = &[\n");
 
     for (addr, name) in slim {
         out.push_str("    (");

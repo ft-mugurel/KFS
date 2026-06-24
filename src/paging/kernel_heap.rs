@@ -1,10 +1,11 @@
-use core::mem::size_of;
-use core::ptr;
-
 use super::init::{KERNEL_SPACE_START, PAGE_SIZE};
 use super::page_table;
 use super::physical;
+use super::PAGE_WRITABLE;
+use crate::error::{KResult, KernelError};
 use crate::{pr_debug, pr_warn};
+use core::mem::size_of;
+use core::ptr;
 
 const HEAP_ALIGNMENT: usize = 16;
 const HEAP_MAGIC: u32 = 0x4B_48_45_50;
@@ -238,7 +239,7 @@ fn map_heap_pages(size: usize) -> Option<*mut u8> {
         };
 
         let va = base + (i * PAGE_SIZE) as u32;
-        if page_table::map_page(va, frame, page_table::PAGE_WRITABLE).is_err() {
+        if page_table::map_page(va, frame, PAGE_WRITABLE).is_err() {
             let _ = physical::free_physical_page(frame);
             rollback_heap_mapping(base, mapped_pages);
             let _ = insert_heap_virtual_span(base, span);
@@ -575,16 +576,27 @@ fn ensure_heap_ready() {
 }
 
 #[inline(never)]
-pub fn kmalloc(size: usize) -> Option<*mut u8> {
+pub fn kmalloc(size: usize) -> KResult<*mut u8> {
     if size == 0 {
         pr_warn!("kmalloc rejected zero-sized request\n");
-        return None;
+        return Err(KernelError::EINVAL);
     }
 
     ensure_heap_ready();
 
-    let payload_size = align_up(size, HEAP_ALIGNMENT)?;
-    let total_size = align_up(block_alignment_overhead() + payload_size, HEAP_ALIGNMENT)?;
+    let payload_size = align_up(size, HEAP_ALIGNMENT).ok_or_else(|| {
+        pr_warn!("kmalloc size overflow size={}\n", size);
+        KernelError::ENOMEM
+    })?;
+    let total_size = align_up(block_alignment_overhead() + payload_size, HEAP_ALIGNMENT)
+        .ok_or_else(|| {
+            pr_warn!(
+                "kmalloc total size overflow size={} payload={}\n",
+                size,
+                payload_size
+            );
+            KernelError::ENOMEM
+        })?;
 
     unsafe {
         let mut block = find_free_block(total_size);
@@ -595,7 +607,7 @@ pub fn kmalloc(size: usize) -> Option<*mut u8> {
                     size,
                     total_size
                 );
-                return None;
+                return Err(KernelError::ENOMEM);
             }
             block = find_free_block(total_size);
         }
@@ -608,7 +620,7 @@ pub fn kmalloc(size: usize) -> Option<*mut u8> {
                     size,
                     total_size
                 );
-                return None;
+                return Err(KernelError::EFAULT);
             }
         };
         free_list_remove(block);
@@ -630,15 +642,15 @@ pub fn kmalloc(size: usize) -> Option<*mut u8> {
             (*block).total_size,
             user_ptr as usize
         );
-        Some(user_ptr)
+        Ok(user_ptr)
     }
 }
 
 #[inline(never)]
-pub fn kfree(ptr: *mut u8) -> bool {
+pub fn kfree(ptr: *mut u8) -> KResult<()> {
     if ptr.is_null() {
         pr_warn!("kfree rejected null pointer\n");
-        return false;
+        return Err(KernelError::EINVAL);
     }
 
     ensure_heap_ready();
@@ -647,19 +659,19 @@ pub fn kfree(ptr: *mut u8) -> bool {
         let block = ptr.sub(block_header_size()) as *mut BlockHeader;
         if (*block).magic != BLOCK_MAGIC {
             pr_warn!("kfree rejected unknown pointer={:#x}\n", ptr as usize);
-            return false;
+            return Err(KernelError::EINVAL);
         }
 
         if (*block).free != 0 {
             pr_warn!("kfree rejected double free ptr={:#x}\n", ptr as usize);
-            return false;
+            return Err(KernelError::EINVAL);
         }
 
         let chunk = match heap_chunk_from_block(block) {
             Some(chunk) => chunk,
             None => {
                 pr_warn!("kfree rejected corrupted chunk ptr={:#x}\n", ptr as usize);
-                return false;
+                return Err(KernelError::EINVAL);
             }
         };
 
@@ -691,7 +703,7 @@ pub fn kfree(ptr: *mut u8) -> bool {
         }
 
         if release_chunk_if_empty(merged) {
-            return true;
+            return Ok(());
         }
 
         (*merged).chunk = chunk;
@@ -703,14 +715,14 @@ pub fn kfree(ptr: *mut u8) -> bool {
             (*merged).total_size,
             merged as usize
         );
-        true
+        Ok(())
     }
 }
 
 #[inline(never)]
-pub fn ksize(ptr: *const u8) -> Option<usize> {
+pub fn ksize(ptr: *const u8) -> KResult<usize> {
     if ptr.is_null() {
-        return None;
+        return Err(KernelError::EINVAL);
     }
 
     ensure_heap_ready();
@@ -718,15 +730,15 @@ pub fn ksize(ptr: *const u8) -> Option<usize> {
     unsafe {
         let block = ptr.sub(block_header_size()) as *const BlockHeader;
         if (*block).magic != BLOCK_MAGIC || (*block).free != 0 {
-            return None;
+            return Err(KernelError::EFAULT);
         }
 
         let chunk = (*block).chunk;
         if chunk.is_null() || (*chunk).magic != HEAP_MAGIC {
-            return None;
+            return Err(KernelError::EFAULT);
         }
 
-        Some((*block).requested_size)
+        Ok((*block).requested_size)
     }
 }
 

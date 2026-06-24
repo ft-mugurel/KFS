@@ -1,25 +1,17 @@
 use core::{fmt, ptr};
 
-use crate::debug::kallsyms;
-use crate::paging::page_table;
+use super::kallsyms;
+use super::DumpStackOptions;
+use super::DEFAULT_DUMP_WORDS;
+use super::DEFAULT_TRACE_FRAMES;
+use super::MAX_DUMP_WORDS;
+use super::MAX_TRACE_FRAMES;
+use crate::paging;
 use crate::x86;
 
-pub const DEFAULT_DUMP_WORDS: usize = 10;
-pub const MAX_DUMP_WORDS: usize = 64;
-pub const DEFAULT_TRACE_FRAMES: usize = 10;
-pub const MAX_TRACE_FRAMES: usize = 32;
 const MAX_SYMBOL_OFFSET: u32 = 0x2000;
 const DEFAULT_SCAN_WORDS: usize = 128;
 const MAX_SCAN_WORDS: usize = 256;
-
-#[derive(Clone, Copy)]
-pub struct DumpStackOptions {
-    pub words: usize,
-    pub frames: usize,
-    pub print_stack_values: bool,
-    pub walk_frames: bool,
-    pub scan_stack: bool,
-}
 
 impl Default for DumpStackOptions {
     fn default() -> Self {
@@ -219,11 +211,11 @@ fn is_mapped_u32(addr: u32) -> bool {
     let start_page = addr & 0xFFFF_F000;
     let end_page = end & 0xFFFF_F000;
 
-    if page_table::get_page(start_page).is_none() {
+    if paging::get_page(start_page).is_none() {
         return false;
     }
 
-    if start_page != end_page && page_table::get_page(end_page).is_none() {
+    if start_page != end_page && paging::get_page(end_page).is_none() {
         return false;
     }
 

@@ -1,17 +1,16 @@
+use super::InputMode;
+use crate::sched;
 use crate::spin::Spinlock;
 use crate::startup_config::shell::SCREEN_INDEX;
-use crate::vga::text_mod::out::{active_cursor_position, active_screen_index, print_char_on, set_cursor_position_on};
+use crate::vga::text_mod::{
+    active_cursor_position, active_screen_index, print_char_on, set_cursor_position_on,
+};
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
 const BUF_SIZE: usize = 256;
 const NUM_TTYS: usize = 6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputMode {
-    EventDriven = 0,
-    Blocking = 1,
-}
 static INPUT_MODE: AtomicU8 = AtomicU8::new(InputMode::EventDriven as u8);
 
 pub fn set_input_mode(mode: InputMode) {
@@ -35,7 +34,7 @@ struct KeyboardBuffer {
 const EMPTY_BUFFER: KeyboardBuffer = KeyboardBuffer { data: ['\0'; BUF_SIZE], head: 0, tail: 0 };
 static TTY_BUFFERS: Spinlock<[KeyboardBuffer; NUM_TTYS]> = Spinlock::new([EMPTY_BUFFER; NUM_TTYS]);
 
-pub(crate) fn push_char(c: char) {
+pub fn push_char(c: char) {
     let active_tty = active_screen_index();
 
     let mut buffers = TTY_BUFFERS.lock();
@@ -50,12 +49,12 @@ pub(crate) fn push_char(c: char) {
 
 pub fn get_char_for_tty(tty_id: usize) -> char {
     loop {
-        crate::interrupts::task_queue::execute_tasks();
+        sched::execute_tasks();
 
         let c = {
             let mut buffers = TTY_BUFFERS.lock();
             let buf = &mut buffers[tty_id];
-            
+
             if buf.head != buf.tail {
                 let val = buf.data[buf.tail];
                 buf.tail = (buf.tail + 1) % BUF_SIZE;
@@ -69,7 +68,9 @@ pub fn get_char_for_tty(tty_id: usize) -> char {
             return ch;
         }
 
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }
 

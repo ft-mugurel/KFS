@@ -1,6 +1,8 @@
 use super::init::{KERNEL_SPACE_START, PAGE_SIZE};
 use super::page_table;
 use super::physical;
+use super::PAGE_WRITABLE;
+use crate::error::{KResult, KernelError};
 use crate::{pr_debug, pr_warn};
 
 const VMALLOC_START: u32 = KERNEL_SPACE_START as u32 + 0x0040_0000;
@@ -209,10 +211,9 @@ fn insert_free_range(mut base: u32, mut size: u32) -> bool {
 }
 
 #[inline(never)]
-pub fn vmalloc(size: usize) -> Option<*mut u8> {
+pub fn vmalloc(size: usize) -> KResult<*mut u8> {
     if size == 0 {
-        pr_warn!("vmalloc rejected zero-sized request\n");
-        return None;
+        return Err(KernelError::EINVAL);
     }
 
     let page_count = page_count_for(size);
@@ -223,7 +224,7 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
             page_count,
             MAX_PAGES_PER_ALLOC
         );
-        return None;
+        return Err(KernelError::EINVAL);
     }
 
     unsafe {
@@ -231,7 +232,7 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
             Some(v) => v,
             None => {
                 pr_warn!("vmalloc size overflow size={} pages={}\n", size, page_count);
-                return None;
+                return Err(KernelError::EOVERFLOW);
             }
         };
 
@@ -243,7 +244,7 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
                     size,
                     span
                 );
-                return None;
+                return Err(KernelError::ENOMEM);
             }
         };
 
@@ -256,7 +257,7 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
                     span
                 );
                 let _ = insert_free_range(base, span);
-                return None;
+                return Err(KernelError::EOVERFLOW);
             }
         };
 
@@ -268,14 +269,14 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
                 VMALLOC_END
             );
             let _ = insert_free_range(base, span);
-            return None;
+            return Err(KernelError::ENOMEM);
         }
 
         let slot = match find_free_slot() {
             Some(v) => v,
             None => {
                 pr_warn!("vmalloc allocation table full\n");
-                return None;
+                return Err(KernelError::ENOMEM);
             }
         };
 
@@ -289,15 +290,15 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
                         mapped_pages
                     );
                     rollback_alloc(base, mapped_pages, &frames);
-                    return None;
+                    return Err(KernelError::ENOMEM);
                 }
             };
 
             let va = base + (mapped_pages * PAGE_SIZE) as u32;
-            if page_table::map_page(va, frame, page_table::PAGE_WRITABLE).is_err() {
+            if page_table::map_page(va, frame, PAGE_WRITABLE).is_err() {
                 let _ = physical::free_physical_page(frame);
                 rollback_alloc(base, mapped_pages, &frames);
-                return None;
+                return Err(KernelError::ENOMEM);
             }
 
             frames[mapped_pages] = frame;
@@ -311,16 +312,16 @@ pub fn vmalloc(size: usize) -> Option<*mut u8> {
             base,
             end
         );
-        Some(base as *mut u8)
+        Ok(base as *mut u8)
     }
 }
 
 #[inline(never)]
-pub fn vfree(ptr: *mut u8) -> bool {
+pub fn vfree(ptr: *mut u8) -> KResult<()> {
     let base = ptr as u32;
     if base == 0 {
         pr_warn!("vfree rejected null pointer\n");
-        return false;
+        return Err(KernelError::EINVAL);
     }
 
     unsafe {
@@ -328,7 +329,7 @@ pub fn vfree(ptr: *mut u8) -> bool {
             Some(v) => v,
             None => {
                 pr_warn!("vfree unknown pointer={:#x}\n", base);
-                return false;
+                return Err(KernelError::EFAULT);
             }
         };
 
@@ -353,27 +354,27 @@ pub fn vfree(ptr: *mut u8) -> bool {
             rec.size,
             rec.page_count
         );
-        true
+        Ok(())
     }
 }
 
 #[inline(never)]
-pub fn vsize(ptr: *const u8) -> Option<usize> {
+pub fn vsize(ptr: *const u8) -> KResult<usize> {
     let base = ptr as u32;
     if base == 0 {
-        return None;
+        return Err(KernelError::EINVAL);
     }
 
     unsafe {
         for i in 0usize..MAX_VIRTUAL_ALLOCS {
             let rec = VIRTUAL_ALLOCS[i];
             if rec.in_use && rec.base == base {
-                return Some(rec.size);
+                return Ok(rec.size);
             }
         }
     }
 
-    None
+    Err(KernelError::EFAULT)
 }
 
 pub fn debug_stats() -> VmemStats {
