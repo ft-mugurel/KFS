@@ -1,7 +1,7 @@
 use super::init::{KERNEL_SPACE_START, USER_SPACE_START};
 use super::physical;
 use super::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-use crate::error::{KResult, KernelError};
+use crate::error::{KResult, KResultExt, KernelError};
 use crate::{pr_debug, pr_warn, x86};
 
 const ENTRIES_PER_TABLE: usize = 1024;
@@ -137,8 +137,7 @@ fn ensure_page_table(pde_index: usize) -> KResult<u32> {
         return Ok(pde & PAGE_FRAME_MASK);
     }
 
-    let table_phys =
-        physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT).ok_or(KernelError::ENOMEM)?;
+    let table_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
 
     zero_page_table(table_phys);
     unsafe {
@@ -239,18 +238,18 @@ pub fn map_page(virt_addr: u32, phys_addr: u32, flags: u32) -> KResult<()> {
         x86::invalidate_page(virt_addr);
     }
 
-    pr_debug!(
-        "map_page: va={:#x} -> pa={:#x} flags={:#x}\n",
-        virt_addr,
-        phys_addr,
-        flags | PAGE_PRESENT
-    );
+    // pr_debug!(
+    //     "map_page: va={:#x} -> pa={:#x} flags={:#x}\n",
+    //     virt_addr,
+    //     phys_addr,
+    //     flags | PAGE_PRESENT
+    // );
 
     Ok(())
 }
 
 pub fn map_zero_page(virt_addr: u32, flags: u32) -> KResult<()> {
-    let phys_frame = physical::alloc_physical_page().ok_or(KernelError::ENOMEM)?;
+    let phys_frame = physical::alloc_physical_page()?;
     unsafe {
         core::ptr::write_bytes(phys_to_virt(phys_frame) as *mut u8, 0, 4096);
     }
@@ -328,7 +327,7 @@ pub fn unmap_page(virt_addr: u32) -> KResult<()> {
     Ok(())
 }
 
-pub unsafe fn clone_address_space(parent_cr3: u32) -> Option<u32> {
+pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
     let child_pd_phys = physical::alloc_physical_page()?;
     let child_pd = phys_to_virt(child_pd_phys) as *mut u32;
     let parent_pd = phys_to_virt(parent_cr3) as *const u32;
@@ -372,7 +371,7 @@ pub unsafe fn clone_address_space(parent_cr3: u32) -> Option<u32> {
         }
     }
 
-    Some(child_pd_phys)
+    Ok(child_pd_phys)
 }
 
 pub unsafe fn free_user_address_space(cr3: u32) {
@@ -390,13 +389,16 @@ pub unsafe fn free_user_address_space(cr3: u32) {
 
                 if (pte & PAGE_PRESENT) != 0 && (pte & PAGE_USER) != 0 {
                     let data_phys = pte & PAGE_FRAME_MASK;
-                    physical::free_physical_page(data_phys);
+                    physical::free_physical_page(data_phys)
+                        .consume_err("Failed to free physical page in user address space");
                 }
             }
 
-            physical::free_physical_page(pt_phys);
+            physical::free_physical_page(pt_phys)
+                .consume_err("Failed to free page table in user address space");
         }
     }
 
-    physical::free_physical_page(cr3);
+    physical::free_physical_page(cr3)
+        .consume_err("Failed to free page directory in user address space");
 }

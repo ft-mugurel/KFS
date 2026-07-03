@@ -230,8 +230,8 @@ fn map_heap_pages(size: usize) -> Option<*mut u8> {
 
     for i in 0usize..page_count {
         let frame = match physical::alloc_physical_page() {
-            Some(frame) => frame,
-            None => {
+            Ok(frame) => frame,
+            Err(_) => {
                 rollback_heap_mapping(base, mapped_pages);
                 let _ = insert_heap_virtual_span(base, span);
                 return None;
@@ -274,7 +274,7 @@ fn unmap_heap_pages(base: *mut u8, size: usize) -> bool {
         if page_table::unmap_page(va).is_err() {
             return false;
         }
-        if !physical::free_physical_page(frame) {
+        if physical::free_physical_page(frame).is_err() {
             return false;
         }
     }

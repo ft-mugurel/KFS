@@ -6,8 +6,10 @@ use crate::dump::{
     self, DumpStackOptions, DEFAULT_DUMP_WORDS, DEFAULT_TRACE_FRAMES, MAX_DUMP_WORDS,
     MEMDUMP_DEFAULT_LEN, MEMDUMP_MAX_LEN,
 };
+use crate::fs;
 use crate::interrupts::keyboard::{self, KeyCode, KeyEvent, KeyboardLayout, Modifiers};
 use crate::interrupts::{request_reboot, request_shutdown};
+use crate::pr_info;
 use crate::printk::{set_log_level, KernelLogLevel};
 use crate::sched;
 use crate::signals::{self, Signal};
@@ -46,6 +48,9 @@ const COMMANDS: &[&str] = &[
     "spawn",
     "wait",
     "kill",
+    "dump_sb",
+    "write_ata",
+    "read_ata",
 ];
 
 struct ShellState {
@@ -521,6 +526,16 @@ fn run_command(line: &str) {
         "spawn" => command_spawn(parts),
         "wait" => command_wait(),
         "kill" => command_kill(parts),
+        "dump_sb" => unsafe {
+            fs::dump_ext2_sb().unwrap_or_else(|e| {
+                print_fmt(&format_args!("Failed to read EXT2 superblock: {:?}\n", e));
+            })
+        },
+        "dump_vfs" => unsafe {
+            fs::print_vfs_tree(fs::ROOT_NODE, 0);
+        },
+        "write_ata" => command_write_ata(parts, line),
+        "read_ata" => command_read_ata(parts),
         _ => {
             print("unknown command: ");
             print(command);
@@ -618,6 +633,10 @@ fn command_help(mut parts: str::SplitWhitespace<'_>) {
         "spawn" => print("spawn\n  Spawn a user process (Ring 3) on PID 2. If PID 2 is already running, it will not spawn a new process.\n"),
         "wait" => print("wait\n  Wait for a child process to exit and reap it if it's a zombie.\n"),
         "sleep" => print("sleep <milliseconds>\n  Put the shell process to sleep for the specified duration.\n"),
+        "kill" => print("kill <pid>\n  Send SIGKILL to the specified process ID.\n"),
+        "dump_sb" => print("dump_sb\n  Display EXT2 superblock information.\n"),
+        "write_ata" => print("write_ata <block_number> <data>\n  Write data to the specified ATA block number.\n"),
+        "read_ata" => print("read_ata <block_number>\n  Read data from the specified ATA block number.\n"),
         _ => print("Unknown command. Type 'help' for a list of commands.\n"),
     }
 }
@@ -902,26 +921,60 @@ fn command_kill(mut parts: str::SplitWhitespace<'_>) {
 #[inline(always)]
 fn command_spawn(mut parts: str::SplitWhitespace<'_>) {
     let name = parts.next().unwrap_or("");
-    let size = parts.next().and_then(|s| parse_usize(s)).unwrap_or(0);
-    let entry_point = match name {
-        "sleep" => test::process_sleep,
-        "fork" => test::process_fork,
-        "socket" => test::process_socket,
-        _ => {
-            print("Unknown process name. Available: user_process, sleep, fork, socket\n");
-            return;
-        }
-    };
-    if size == 0 {
-        print("Invalid size. Must be greater than 0.\n");
-        return;
-    }
-    if sched::create_user_process(entry_point, size) {
-        print_fmt(&format_args!(
-            "Spawned user process '{}' with size {} bytes.\n",
-            name, size
-        ));
+    // let entry_point = match name {
+    //     "sleep" => test::process_sleep,
+    //     "fork" => test::process_fork,
+    //     "socket" => test::process_socket,
+    //     _ => {
+    //         print("Unknown process name. Available: user_process, sleep, fork, socket\n");
+    //         return;
+    //     }
+    // };
+    if unsafe { sched::create_user_process(test::process_fork, 1024) } {
+        pr_info!("Spawned user process '{}' with 1024 bytes.\n", name);
     } else {
-        print("Failed to spawn user process. PID 2 might already be in use.\n");
+        pr_info!("Failed to spawn user process. PID might already be in use.\n");
     }
+}
+
+#[inline(always)]
+fn command_write_ata(mut parts: str::SplitWhitespace<'_>, line: &str) {
+    let Some(num_str) = parts.next() else {
+        print("usage: write_ata <block_number> <data...>\n");
+        return;
+    };
+
+    let Some(block_number) = parse_u32(num_str) else {
+        print("invalid block number\n");
+        return;
+    };
+
+    let data = line
+        .trim_start_matches("write_ata ")
+        .trim_start_matches(num_str)
+        .trim();
+    let data_bytes = data.as_bytes();
+
+    fs::write_ext2_block(block_number, data_bytes).unwrap_or_else(|_| {
+        print("Failed to write block to ATA device.\n");
+    });
+}
+
+#[inline(always)]
+fn command_read_ata(mut parts: str::SplitWhitespace<'_>) {
+    let Some(num_str) = parts.next() else {
+        print("usage: read_ata <block_number>\n");
+        return;
+    };
+
+    let Some(block_number) = parse_u32(num_str) else {
+        print("invalid block number\n");
+        return;
+    };
+
+    let mut buffer = [0u8; 1024];
+
+    fs::read_ext2_block(block_number, &mut buffer).unwrap_or_else(|_| {
+        print("Failed to read block from ATA device.\n");
+    });
 }

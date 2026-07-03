@@ -149,18 +149,22 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
                 let aligned_vaddr = fault_addr & !0xFFF;
                 match paging::map_zero_page(aligned_vaddr, flags) {
                     Ok(()) => {
+                        pr_info!(
+                            "Demand paging: Mapped page for PID {} at {:#x}\n",
+                            current_pid,
+                            aligned_vaddr
+                        );
                         core::ptr::write_bytes(aligned_vaddr as *mut u8, 0, 4096);
                         return;
                     }
                     Err(e) => {
-                        pr_info!("OOM: Cannot demand page PID {}: {:?}\n", current_pid, e);
+                        pr_err!("OOM: Cannot demand page PID {}: {:?}\n", current_pid, e);
                     }
                 }
             } else {
-                pr_info!("Segmentation Fault at {:#x}\n", fault_addr);
+                pr_err!("Segmentation Fault at {:#x}\n", fault_addr);
             }
         }
-        // --- END DEMAND PAGING ---
 
         // If it was not a handled page fault, terminate the process
         let sig_num = match idx_usize {
@@ -196,7 +200,7 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         );
     }
 
-    if idx == 14 {
+    if idx == 14 || idx == 13 {
         let present = (frame.error_code & 0b001) != 0;
         let write = (frame.error_code & 0b010) != 0;
         let user = (frame.error_code & 0b100) != 0;
@@ -222,7 +226,8 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
     pr_emerg!(
         "Registers:\n\
         EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}\n\
-        ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}\n",
+        ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}\n\
+        EIP: {:#010x} CS:  {:#010x} EFLAGS: {:#010x}\n",
         frame.eax,
         frame.ebx,
         frame.ecx,
@@ -230,7 +235,10 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         frame.esi,
         frame.edi,
         frame.ebp,
-        frame.esp
+        frame.esp,
+        frame.eip,
+        frame.cs,
+        frame.eflags
     );
 
     panic::save_stack_trace();

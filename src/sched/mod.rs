@@ -1,9 +1,9 @@
-use crate::fs::FileDescriptor;
+use crate::fs::VfsNode;
 
+mod process;
 mod scheduler;
 mod task;
 mod task_queue;
-mod user_process;
 
 pub(crate) const MAX_PROCESSES: usize = 64;
 pub(crate) const MAX_CHILDREN: usize = 16;
@@ -12,13 +12,14 @@ pub(crate) const MAX_SIGNALS: usize = 32;
 pub(crate) const SIGNAL_QUEUE_SIZE: usize = 16;
 pub(crate) const MAX_VMAS: usize = 16;
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessState {
     Ready,
     Running,
     Sleeping,
+    Waiting,
     Zombie,
-    Thread,
+    Terminated,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +67,7 @@ pub(crate) struct SignalQueue {
     pub handlers: [u32; MAX_SIGNALS],
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct TaskStruct {
     pub pid: u32,
     pub uid: u32,
@@ -75,7 +77,9 @@ pub(crate) struct TaskStruct {
     pub memory: ProcessMemory,
     pub family: ProcessFamily,
     pub signals: SignalQueue,
-    pub fd_tbl: [Option<FileDescriptor>; MAX_FDS_PER_PROCESS],
+    pub fd_tbl: [Option<usize>; MAX_FDS_PER_PROCESS],
+
+    pub cwd: *mut VfsNode,
 
     pub kernel_stack_top: u32,
     pub kernel_stack_bottom: u32,
@@ -116,6 +120,6 @@ pub(crate) static mut PROCESS_TABLE: [Option<TaskStruct>; MAX_PROCESSES] = {
 };
 pub(crate) static mut CURRENT_PID: usize = 0;
 
-pub(crate) use scheduler::{init_scheduler, schedule, yield_cpu};
+pub(crate) use process::create_user_process;
+pub(crate) use scheduler::{init_scheduler, schedule};
 pub(crate) use task_queue::{execute_tasks, schedule_task};
-pub(crate) use user_process::create_user_process;

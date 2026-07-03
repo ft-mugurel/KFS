@@ -7,19 +7,37 @@ use crate::interrupts::timer;
 use crate::paging;
 use crate::pr_info;
 use crate::x86;
-use core::mem::MaybeUninit;
+
+static mut INIT_KERNEL_STACK: [u8; 4096] = [0; 4096];
 
 pub fn init_scheduler() {
     unsafe {
         let boot_cr3 = paging::bootstrap_directory_phys_addr();
-        let mut init_task: TaskStruct = MaybeUninit::zeroed().assume_init();
+
+        // NEW: Allocate a real kernel stack for PID 0
+        #[allow(static_mut_refs)]
+        let k_stack_bottom = INIT_KERNEL_STACK.as_ptr() as u32;
+        let k_stack_top = k_stack_bottom + 4096;
+
+        let mut init_task: TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
         init_task.pid = 0;
         init_task.uid = 0;
         init_task.state = ProcessState::Running;
         init_task.context.cr3 = boot_cr3;
 
+        // NEW: Set kernel stack bounds for PID 0
+        init_task.kernel_stack_top = k_stack_top;
+        init_task.kernel_stack_bottom = k_stack_bottom;
+
+        // context.esp stays 0 until the first timer preemption fills it in
+        // But now kernel_stack_top is valid, so TSS.esp0 can point somewhere real
+        // This prevents GPF when yield_cpu() tries to set TSS.esp0 = next_task.kernel_stack_top
+
         PROCESS_TABLE[0] = Some(init_task);
         CURRENT_PID = 0;
+
+        // Initialize TSS with the kernel stack
+        gdt::set_kernel_stack(k_stack_top);
 
         pr_info!("Scheduler initialized with PID 0.\n");
     }
@@ -111,36 +129,4 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
 
         return next_task.context.esp;
     }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe fn yield_cpu() -> ! {
-    loop {
-        CURRENT_PID = (CURRENT_PID + 1) % MAX_PROCESSES;
-        if let Some(ref task) = PROCESS_TABLE[CURRENT_PID] {
-            if task.state == ProcessState::Ready {
-                break;
-            }
-        }
-    }
-
-    let next_task = PROCESS_TABLE[CURRENT_PID].as_mut().unwrap();
-    next_task.state = ProcessState::Running;
-
-    gdt::TSS.esp0 = next_task.kernel_stack_top;
-    x86::write_cr3(next_task.context.cr3);
-
-    let next_esp = next_task.context.esp;
-
-    core::arch::asm!(
-        "mov esp, {}",
-        "popad",
-        "pop gs",
-        "pop fs",
-        "pop es",
-        "pop ds",
-        "iretd",
-        in(reg) next_esp,
-        options(noreturn)
-    );
 }

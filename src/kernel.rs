@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod drivers;
 mod dump;
 mod error;
 mod fs;
@@ -17,6 +18,7 @@ mod spin;
 mod startup_config;
 mod syscalls;
 mod test;
+mod utils;
 mod vga;
 mod x86;
 

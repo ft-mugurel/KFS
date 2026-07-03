@@ -283,14 +283,14 @@ pub fn vmalloc(size: usize) -> KResult<*mut u8> {
         let mut frames = [0u32; MAX_PAGES_PER_ALLOC];
         for mapped_pages in 0usize..page_count {
             let frame = match physical::alloc_physical_page() {
-                Some(v) => v,
-                None => {
+                Ok(v) => v,
+                Err(e) => {
                     pr_warn!(
                         "vmalloc ran out of physical pages at mapped_pages={}\n",
                         mapped_pages
                     );
                     rollback_alloc(base, mapped_pages, &frames);
-                    return Err(KernelError::ENOMEM);
+                    return Err(e);
                 }
             };
 

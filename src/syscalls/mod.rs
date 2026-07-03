@@ -1,6 +1,6 @@
 mod syscalls;
 
-mod close;
+mod open;
 mod exit;
 mod fork;
 mod mem;

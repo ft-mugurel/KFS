@@ -125,7 +125,7 @@ fn test_physical_alloc_free_roundtrip() -> bool {
     test_start(NAME);
 
     let free_before = physical::free_physical_pages();
-    let Some(frame) = physical::alloc_physical_page() else {
+    let Ok(frame) = physical::alloc_physical_page() else {
         test_fail(NAME, "alloc_physical_page returned none");
         return false;
     };
@@ -141,7 +141,7 @@ fn test_physical_alloc_free_roundtrip() -> bool {
         return false;
     }
 
-    if !physical::free_physical_page(frame) {
+    if physical::free_physical_page(frame).is_err() {
         pr_err!(
             "[paging-selftest:\x1b\x1f;\x00m{}\x1bm] free_physical_page failed frame={:#x}\n",
             NAME,
@@ -425,7 +425,7 @@ fn test_user_map_get_unmap_roundtrip() -> bool {
     const NAME: &str = "user-map-get-unmap";
     test_start(NAME);
 
-    let Some(frame) = physical::alloc_physical_page() else {
+    let Ok(frame) = physical::alloc_physical_page() else {
         test_fail(NAME, "no physical frame available for user mapping test");
         return false;
     };

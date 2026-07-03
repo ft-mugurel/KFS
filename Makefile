@@ -23,6 +23,8 @@ KERNEL_DBG_LIB  = $(TARGET_DIR)/debug/libkernel.a
 ISO_OUT         = $(BUILD_DIR)/kernel.iso
 ISO_FULL_OUT    = $(BUILD_DIR)/kernel-full.iso
 
+ATA_DRIVE_IMG   = $(BUILD_DIR)/ata_drive.img
+
 LINKER          = linker/linker.ld
 
 # Automatically find ALL assembly files in the asm directory
@@ -93,6 +95,14 @@ $(BUILD_DIR)/%.o: $(ASM_DIR)/%.asm
 	@$(NASM) -f elf32 $< -o $@
 	@echo -e "$(CYAN)[+] NASM compiled: $<$(RESET)"
 
+$(ATA_DRIVE_IMG):
+	@mkdir -p $(BUILD_DIR)
+	@echo -e "$(YELLOW)[~] Creating ATA drive image...$(RESET)"
+	@dd if=/dev/zero of=$(ATA_DRIVE_IMG) bs=1M count=64 status=none
+	@echo -e "$(YELLOW)[~] Formatting ATA drive image with ext2 filesystem...$(RESET)"
+	@mkfs.ext2 -q $(ATA_DRIVE_IMG)
+	@echo -e "$(GREEN)[✓] ATA drive image created: $(ATA_DRIVE_IMG)$(RESET)"
+
 build: CARGO_ARGS = --no-default-features
 build: $(ASM_OBJS)
 	@echo -e "$(BOLD)$(CYAN)[~] Building Release Kernel...$(RESET)"
@@ -131,16 +141,23 @@ iso-full: build $(ISO_DIR)/boot/grub/grub.cfg
 	@$(GRUB_MKRESCUE) -o $(ISO_FULL_OUT) $(ISO_DIR) --directory=$(GRUB_MODULE_DIR) --modules="multiboot" 2>/dev/null
 	@echo -e "$(BOLD)$(GREEN)[✓] FULL ISO BUILD DONE: $(ISO_FULL_OUT)$(RESET)"
 
-run-iso: iso
-	@$(QEMU_SYSTEM) -m 4G -drive format=raw,file=$(ISO_OUT),media=cdrom -boot order=d
-	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
-
-run-iso-full: iso-full
-	@$(QEMU_SYSTEM) -m 4G -drive format=raw,file=$(ISO_FULL_OUT),media=cdrom -boot order=d
-	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
-
-run-iso-term: iso
+run-iso: iso $(ATA_DRIVE_IMG)
 	@$(QEMU_SYSTEM) -m 4G \
+		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
+		-drive format=raw,file=$(ISO_OUT),media=cdrom \
+		-boot order=d
+	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
+
+run-iso-full: iso-full $(ATA_DRIVE_IMG)
+	@$(QEMU_SYSTEM) -m 4G \
+		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
+		-drive format=raw,file=$(ISO_FULL_OUT),media=cdrom \
+		-boot order=d
+	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
+
+run-iso-term: iso $(ATA_DRIVE_IMG)
+	@$(QEMU_SYSTEM) -m 4G \
+		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
 		-drive format=raw,file=$(ISO_OUT),media=cdrom \
 		-boot order=d -nographic
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"

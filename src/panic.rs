@@ -10,7 +10,7 @@ fn panic(info: &PanicInfo) -> ! {
     x86::disable_interrupts();
     pr_emerg!("KERNEL PANIC\n");
     pr_emerg!("{}\n", info);
-    // save_stack_trace();
+    save_stack_trace();
     switch_screen(DEFAULT_LOG_SCREEN);
     unsafe { x86::clean_registers_and_halt() };
 }
@@ -19,8 +19,8 @@ pub(crate) fn save_stack_trace() {
     pr_emerg!("Stack Trace:\n");
     dump::dump_stack_with_options(
         DumpStackOptions {
-            words: 10,
-            frames: 10,
+            words: 16,
+            frames: 16,
             print_stack_values: false,
             scan_stack: false,
             walk_frames: true,

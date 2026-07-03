@@ -1,7 +1,10 @@
-use crate::fs::FileDescriptor;
-use crate::ipc::SOCKETS;
-use crate::sched::{self, ContextFrame, CURRENT_PID, MAX_PROCESSES, PROCESS_TABLE};
-use crate::{paging, pr_info};
+use crate::error::{KResultExt, KernelError};
+use crate::fs::OPEN_FILE_TABLE;
+use crate::sched::{
+    self, ContextFrame, CURRENT_PID, MAX_CHILDREN, MAX_FDS_PER_PROCESS, MAX_PROCESSES,
+    PROCESS_TABLE,
+};
+use crate::{paging, pr_info, pr_warn};
 
 pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let parent_pid = CURRENT_PID;
@@ -17,7 +20,8 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let child_pid = match child_pid_opt {
         Some(pid) => pid,
         None => {
-            (*regs).set_return_value(!0u32); // EAGAIN
+            pr_warn!("[PID {}] No available PID for fork\n", parent_pid);
+            (*regs).set_return_error(KernelError::EAGAIN);
             return;
         }
     };
@@ -25,14 +29,21 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let parent_task = PROCESS_TABLE[parent_pid].as_ref().unwrap();
 
     let child_cr3 = match paging::clone_address_space(parent_task.context.cr3) {
-        Some(cr3) => cr3,
-        None => {
-            (*regs).set_return_value(!0u32); // ENOMEM
+        Ok(cr3) => cr3,
+        Err(_) => {
+            pr_warn!(
+                "[PID {}] Failed to clone address space for child PID {}\n",
+                parent_pid,
+                child_pid
+            );
+            (*regs).set_return_error(KernelError::ENOMEM);
             return;
         }
     };
 
-    let child_kstack_phys = paging::alloc_physical_page().unwrap();
+    let child_kstack_phys = paging::alloc_physical_page()
+        .consume_err("fork: could not allocate memory\n")
+        .unwrap();
     let child_kstack_top = paging::phys_to_virt(child_kstack_phys) as u32 + 4096;
     let child_kstack_bottom = child_kstack_top - 4096;
 
@@ -71,11 +82,13 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     child_task.kernel_stack_top = child_kstack_top;
     child_task.kernel_stack_bottom = child_kstack_bottom;
 
-    for i in 0..sched::MAX_FDS_PER_PROCESS {
-        if let Some(fd) = parent_task.fd_tbl[i] {
-            child_task.fd_tbl[i] = Some(fd);
-            if let FileDescriptor::Socket(sock_idx) = fd {
-                SOCKETS[sock_idx].lock().ref_count += 1;
+    child_task.fd_tbl = parent_task.fd_tbl;
+
+    // Increment global reference counts for inherited files
+    for i in 0..MAX_FDS_PER_PROCESS {
+        if let Some(global_fd) = child_task.fd_tbl[i] {
+            if let Some(open_file) = &mut OPEN_FILE_TABLE[global_fd] {
+                open_file.ref_count += 1;
             }
         }
     }
@@ -84,7 +97,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     let parent_task_mut = PROCESS_TABLE[parent_pid].as_mut().unwrap();
     let cc = parent_task_mut.family.child_count;
-    if cc < sched::MAX_CHILDREN {
+    if cc < MAX_CHILDREN {
         parent_task_mut.family.children[cc] = child_pid as u32;
         parent_task_mut.family.child_count += 1;
     }

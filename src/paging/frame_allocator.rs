@@ -2,6 +2,7 @@ use super::init::PAGE_SIZE;
 use super::multiboot::{
     MemoryMapIter, MultibootInfo, MULTIBOOT_INFO_HAS_BASIC_MEMORY, MULTIBOOT_MEMORY_AVAILABLE,
 };
+use crate::error::{KResult, KernelError};
 use crate::spin::Spinlock;
 use crate::{pr_debug, pr_warn};
 
@@ -178,7 +179,7 @@ pub(super) fn init_from_multiboot(info: &MultibootInfo) {
 }
 
 #[inline(never)]
-pub(super) fn alloc_frame() -> Option<u32> {
+pub(super) fn alloc_frame() -> KResult<u32> {
     let mut state = ALLOCATOR_STATE.lock();
     for word_idx in 0..BITMAP_WORDS {
         let word = state.bitmap[word_idx];
@@ -190,17 +191,17 @@ pub(super) fn alloc_frame() -> Option<u32> {
                 let addr = frame_addr(frame_idx);
                 let free_frames = state.free_frames;
                 pr_debug!("alloc_frame -> {:#x} (free_left={})\n", addr, free_frames);
-                return Some(addr);
+                return Ok(addr);
             }
         }
     }
 
     pr_warn!("alloc_frame failed: no free physical frame\n");
-    None
+    Err(KernelError::ENOMEM)
 }
 
 #[inline(never)]
-pub(super) fn alloc_frame_below(limit_addr: u64) -> Option<u32> {
+pub(super) fn alloc_frame_below(limit_addr: u64) -> KResult<u32> {
     let mut state = ALLOCATOR_STATE.lock();
     let limit_frame = (limit_addr as usize / PAGE_SIZE).min(MAX_FRAMES);
     let mut frame_idx = limit_frame;
@@ -218,7 +219,7 @@ pub(super) fn alloc_frame_below(limit_addr: u64) -> Option<u32> {
             "alloc_frame_below({:#x}) failed: no free frame below limit\n",
             limit_addr
         );
-        return None;
+        return Err(KernelError::ENOMEM);
     }
 
     state.mark_used(frame_idx);
@@ -230,15 +231,15 @@ pub(super) fn alloc_frame_below(limit_addr: u64) -> Option<u32> {
         addr,
         free_frames
     );
-    Some(addr)
+    Ok(addr)
 }
 
 #[inline(never)]
-pub(super) fn free_frame(phys_addr: u32) -> bool {
+pub(super) fn free_frame(phys_addr: u32) -> KResult<()> {
     let frame_idx = frame_index(phys_addr);
     if frame_idx >= MAX_FRAMES || (phys_addr as usize % PAGE_SIZE) != 0 {
         pr_warn!("free_frame rejected invalid addr={:#x}\n", phys_addr);
-        return false;
+        return Err(KernelError::EINVAL);
     }
 
     let mut state = ALLOCATOR_STATE.lock();
@@ -249,7 +250,7 @@ pub(super) fn free_frame(phys_addr: u32) -> bool {
         phys_addr,
         free_frames
     );
-    true
+    Ok(())
 }
 
 pub(super) fn total_frame_count() -> usize {

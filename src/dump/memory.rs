@@ -256,7 +256,7 @@ pub fn run_memtest(features: &str, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
 
 fn memtest_physical_roundtrip() -> bool {
     let free_before = paging::free_physical_pages();
-    let Some(frame) = paging::alloc_physical_page() else {
+    let Ok(frame) = paging::alloc_physical_page() else {
         return false;
     };
 
@@ -266,7 +266,7 @@ fn memtest_physical_roundtrip() -> bool {
         return false;
     }
 
-    if !paging::free_physical_page(frame) {
+    if paging::free_physical_page(frame).is_err() {
         return false;
     }
 
@@ -299,7 +299,7 @@ fn memtest_heap_roundtrip() -> KResult<()> {
 fn memtest_page_roundtrip() -> bool {
     const TEST_USER_VA: u32 = 0x0800_0000;
 
-    let Some(frame) = paging::alloc_physical_page() else {
+    let Ok(frame) = paging::alloc_physical_page() else {
         return false;
     };
 

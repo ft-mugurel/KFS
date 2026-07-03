@@ -24,6 +24,19 @@ impl ContextFrame {
         self.eax = value;
     }
     pub fn set_return_error(&mut self, error: KernelError) {
-        self.eax = !(error as u32);
+        self.eax = error as u32;
+    }
+    pub fn get_return_value(&self) -> u32 {
+        self.eax
+    }
+    pub fn is_error(&self) -> bool {
+        self.eax >= 0x80000000
+    }
+    pub fn get_error(&self) -> Option<KernelError> {
+        if self.is_error() {
+            Some(unsafe { core::mem::transmute(self.eax) })
+        } else {
+            None
+        }
     }
 }

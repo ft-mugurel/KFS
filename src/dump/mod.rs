@@ -9,6 +9,7 @@ pub const MAX_DUMP_WORDS: usize = 64;
 pub const DEFAULT_TRACE_FRAMES: usize = 10;
 pub const MAX_TRACE_FRAMES: usize = 32;
 
+pub(crate) use kallsyms::lookup;
 pub(crate) use memory::{
     debug_page_entry, dump_virtual_memory, print_memdebug, print_memstat, run_memtest,
 };

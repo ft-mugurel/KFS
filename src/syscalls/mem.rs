@@ -1,3 +1,4 @@
+use crate::error::KernelError;
 use crate::paging::{self, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 use crate::sched::{ContextFrame, Vma, CURRENT_PID, MAX_VMAS, PROCESS_TABLE};
 use crate::{pr_warn, x86};
@@ -17,7 +18,7 @@ pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
 
         if increment < 0 {
             pr_warn!("Shrinking the heap is not yet supported.\n");
-            (*regs).set_return_value(!0u32); // Return -1
+            (*regs).set_return_error(KernelError::EINVAL);
             return;
         }
 
@@ -31,13 +32,13 @@ pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
             for i in 0..pages_to_allocate {
                 let vaddr = old_page_end + (i * 4096);
 
-                if let Some(phys_frame) = paging::alloc_physical_page() {
+                if let Ok(phys_frame) = paging::alloc_physical_page() {
                     let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
                     paging::map_page(vaddr, phys_frame, flags).unwrap();
                 } else {
                     pr_warn!("Out of physical memory for sbrk!\n");
-                    (*regs).set_return_value(!0u32);
+                    (*regs).set_return_error(KernelError::ENOMEM);
                     return;
                 }
             }
@@ -52,7 +53,7 @@ pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
     let length = (*regs).arg2() as usize;
 
     if length == 0 {
-        (*regs).set_return_value(!0u32); // EINVAL
+        (*regs).set_return_error(KernelError::EINVAL);
         return;
     }
 
@@ -73,7 +74,7 @@ pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
     let vma_idx = match vma_idx {
         Some(idx) => idx,
         None => {
-            (*regs).set_return_value(!0u32); // ENOMEM
+            (*regs).set_return_error(KernelError::ENOMEM);
             return;
         }
     };
@@ -100,7 +101,7 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     let length = (*regs).arg2();
 
     if addr % 4096 != 0 || length == 0 {
-        (*regs).set_return_value(!0u32); // EINVAL
+        (*regs).set_return_error(KernelError::EINVAL);
         return;
     }
 
@@ -120,7 +121,7 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     let vma_idx = match target_vma_idx {
         Some(idx) => idx,
         None => {
-            (*regs).set_return_value(!0u32); // EINVAL (Not a mapped region)
+            (*regs).set_return_error(KernelError::EINVAL);
             return;
         }
     };
@@ -132,10 +133,14 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     for i in 0..num_pages {
         let vaddr = addr + (i * 4096);
         if let Some(phys_frame) = paging::get_physical_address(vaddr) {
-            paging::free_physical_page(phys_frame);
-            paging::unmap_page(vaddr).unwrap_or_else(|_| {
-                pr_warn!("Failed to unmap page at {:#x}\n", vaddr);
-            });
+            if let Err(e) = paging::free_physical_page(phys_frame) {
+                pr_warn!("Failed to free physical page: {:?}\n", e);
+                (*regs).set_return_error(e);
+            }
+            if let Err(e) = paging::unmap_page(vaddr) {
+                pr_warn!("Failed to unmap page at {:#x}: {:?}\n", vaddr, e);
+                (*regs).set_return_error(e);
+            }
         }
     }
 
