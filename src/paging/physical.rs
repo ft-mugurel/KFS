@@ -1,7 +1,6 @@
 use crate::error::KResult;
 
-use super::frame_allocator;
-use super::init::PAGE_SIZE;
+use super::{frame_allocator, PAGE_SIZE};
 
 pub fn alloc_physical_page() -> KResult<u32> {
     frame_allocator::alloc_frame()

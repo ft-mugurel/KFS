@@ -3,11 +3,10 @@ use crate::interrupts::keyboard::{
     decode_set1_scancode, get_input_mode, keycode_to_char, push_char, toggle_layout, InputMode,
     KeyCode, KeyEvent, Modifiers,
 };
-use crate::interrupts::request_shutdown;
-use crate::sched::schedule_task;
+use crate::locks::Spinlock;
 use crate::shell::handle_shell_key_event;
 use crate::signals::{send_signal, Signal};
-use crate::spin::Spinlock;
+use crate::smp::ipi::request_shutdown;
 use crate::startup_config::pic;
 use crate::vga::text_mod::{
     disable_cursor, enable_cursor, move_cursor_down, move_cursor_left, move_cursor_right,
@@ -37,11 +36,11 @@ fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
 
     match event.key {
         KeyCode::Delete if modifiers.ctrl() && modifiers.alt() => {
-            request_shutdown();
+            unsafe { request_shutdown() };
             return;
         }
         KeyCode::C if modifiers.ctrl() => {
-            send_signal(Signal::SIGINT);
+            unsafe { send_signal(Signal::SIGINT) };
             return;
         }
         KeyCode::F1 => {
@@ -194,7 +193,7 @@ fn pop_scancode() -> Option<u8> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn keyboard_interrupt_handler() {
     push_scancode(inb(PIC_KEYBOARD_DATA_PORT));
-    schedule_task(process_keyboard_event);
+    process_keyboard_event();
     outb(PIC_MASTER_COMMAND_PORT, PIC_EOI);
 }
 

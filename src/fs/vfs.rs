@@ -1,9 +1,8 @@
 use super::{VfsNode, VfsNodeType};
 use crate::{
-    drivers,
     error::{KResult, KernelError},
-    fs::ext2::EXT2_BLOCK_SIZE,
-    pr_err, pr_info, utils,
+    pr_warn, utils,
+    vga::text_mod::{print_fmt_on, print_str_on},
 };
 
 pub const MAX_VFS_NODES: usize = 1024;
@@ -12,6 +11,71 @@ pub static mut ROOT_NODE: *mut VfsNode = core::ptr::null_mut();
 // static pool
 static mut VFS_NODE_POOL: [VfsNode; MAX_VFS_NODES] = unsafe { core::mem::zeroed() };
 static mut VFS_NODE_COUNT: usize = 0;
+
+impl VfsNode {
+    pub unsafe fn read(&self, buffer: &mut [u8], offset: u32) -> KResult<usize> {
+        // TODO: Other types will be supported too
+        if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
+            pr_warn!("VFS: Attempted to read from a non-file node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        let mount = (*self.master).mount;
+        let fn_read = (*mount).backend.read;
+
+        fn_read(mount, self.inode, buffer, offset)
+    }
+
+    pub unsafe fn write(&mut self, buffer: &[u8], offset: u32) -> KResult<usize> {
+        if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
+            pr_warn!("VFS: Attempted to write to a non-file node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        let mount = (*self.master).mount;
+        let fn_write = (*mount).backend.write;
+
+        let bytes_written = fn_write(mount, self.inode, buffer, offset)?;
+
+        // Update the VFS node if the file was appended to
+        if self.node_type == VfsNodeType::File && offset + (bytes_written as u32) > self.size {
+            self.size = offset + (bytes_written as u32);
+        }
+
+        Ok(bytes_written)
+    }
+
+    pub unsafe fn truncate(&mut self) -> KResult<()> {
+        if !matches!(self.node_type, VfsNodeType::File) {
+            pr_warn!("VFS: Attempted to truncate a non-file node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        let mount = (*self.master).mount;
+        let fn_truncate = (*mount).backend.truncate;
+
+        fn_truncate(mount, self.inode)?;
+        self.size = 0;
+        Ok(())
+    }
+
+    pub unsafe fn lazy_load_directory(&self) -> KResult<()> {
+        if self.node_type != VfsNodeType::Directory {
+            pr_warn!("VFS: Attempted to lazy load a non-directory node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        if !self.children.is_null() {
+            return Ok(()); // Already loaded
+        }
+
+        let mount = (*self.master).mount;
+        let fn_load_dir = (*mount).backend.lazy_load_directory;
+        let inode = self.inode;
+
+        fn_load_dir(mount, inode)
+    }
+}
 
 pub unsafe fn alloc_vfs_node() -> KResult<*mut VfsNode> {
     if VFS_NODE_COUNT >= MAX_VFS_NODES {
@@ -22,30 +86,98 @@ pub unsafe fn alloc_vfs_node() -> KResult<*mut VfsNode> {
     Ok(node_ptr)
 }
 
-// Helper to convert Ext2 mode/type to VfsNodeType
-pub fn ext2_type_to_vfs(ext2_type: u8) -> VfsNodeType {
-    match ext2_type {
-        1 => VfsNodeType::File,
-        2 => VfsNodeType::Directory,
-        7 => VfsNodeType::Symlink,
-        _ => VfsNodeType::Unknown,
+pub unsafe fn append_child(parent: *mut VfsNode, child: *mut VfsNode) {
+    (*child).father = parent;
+
+    if (*parent).children.is_null() {
+        (*parent).children = child;
+        return;
     }
+
+    let mut sibling = (*parent).children;
+    while !(*sibling).next_of_kin.is_null() {
+        sibling = (*sibling).next_of_kin;
+    }
+
+    (*sibling).next_of_kin = child;
+}
+
+pub unsafe fn create_child_node(
+    parent: *mut VfsNode,
+    name: &str,
+    node_type: VfsNodeType,
+    rights: u16,
+) -> KResult<*mut VfsNode> {
+    let node = alloc_vfs_node()?;
+
+    core::ptr::write_bytes((*node).name.as_mut_ptr(), 0, (*node).name.len());
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() >= (*node).name.len() {
+        return Err(KernelError::ENAMETOOLONG);
+    }
+    core::ptr::copy_nonoverlapping(
+        name_bytes.as_ptr(),
+        (*node).name.as_mut_ptr(),
+        name_bytes.len(),
+    );
+
+    (*node).size = 0;
+    (*node).node_type = node_type;
+    (*node).inode = 0;
+    (*node).links = 1;
+    (*node).master = (*parent).master;
+    (*node).father = parent;
+    (*node).children = core::ptr::null_mut();
+    (*node).next_of_kin = core::ptr::null_mut();
+    (*node).rights = rights;
+
+    append_child(parent, node);
+    Ok(node)
+}
+
+pub unsafe fn mount_node(target: *mut VfsNode, mounted_root: *mut VfsNode) -> KResult<()> {
+    if target.is_null() || mounted_root.is_null() {
+        return Err(KernelError::EINVAL);
+    }
+
+    if (*target).node_type != VfsNodeType::Directory {
+        return Err(KernelError::ENOTDIR);
+    }
+
+    (*target).master = mounted_root;
+    Ok(())
+}
+
+pub unsafe fn umount_node(target: *mut VfsNode) -> KResult<()> {
+    if target.is_null() {
+        return Err(KernelError::EINVAL);
+    }
+
+    if (*target).node_type != VfsNodeType::Directory {
+        return Err(KernelError::ENOTDIR);
+    }
+
+    (*target).master = target;
+    Ok(())
 }
 
 pub unsafe fn print_vfs_tree(mut node: *mut VfsNode, depth: usize) {
     while !node.is_null() {
         for _ in 0..depth {
-            pr_info!("|   ");
+            print_str_on(1, " |  ");
         }
 
         let name_str = utils::c_str_to_rust((*node).name.as_ptr());
 
-        pr_info!(
-            "|-- {} (Inode: {}, Type: {:?}, Size: {})\n",
-            name_str,
-            (*node).inode,
-            (*node).node_type,
-            (*node).size
+        print_fmt_on(
+            1,
+            &format_args!(
+                " |-- {} (Inode: {}, Type: {:?}, Size: {})\n",
+                name_str,
+                (*node).inode,
+                (*node).node_type,
+                (*node).size
+            ),
         );
 
         if !(*node).children.is_null() {
@@ -54,34 +186,6 @@ pub unsafe fn print_vfs_tree(mut node: *mut VfsNode, depth: usize) {
 
         node = (*node).next_of_kin;
     }
-}
-
-pub unsafe fn lazy_load_directory(dir_node: *mut VfsNode) -> KResult<()> {
-    if !(*dir_node).children.is_null() {
-        return Ok(()); // Already loaded
-    }
-
-    let inode = super::get_ext2_inode((*dir_node).inode)?;
-    // For simplicity, we only read the first direct block of the directory.
-    // Large directories require reading i_block[1], i_block[2], etc.
-    let block_num = inode.i_block[0];
-    if block_num == 0 {
-        return Ok(());
-    }
-
-    let block_size = EXT2_BLOCK_SIZE;
-    let lba = block_num * (block_size / 512);
-
-    let mut dir_buf: [u8; 4096] = [0; 4096];
-    drivers::read_sectors(lba, (block_size / 512) as u8, &mut dir_buf)?;
-
-    crate::fs::ext2::parse_directory_block(
-        dir_buf.as_ptr(),
-        block_size as usize,
-        dir_node,
-        (*dir_node).master,
-    );
-    Ok(())
 }
 
 pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNode> {
@@ -112,7 +216,7 @@ pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNod
         }
 
         if (*current).node_type == VfsNodeType::Directory {
-            lazy_load_directory(current)?;
+            (*current).lazy_load_directory()?;
         }
 
         let mut child = (*current).children;
@@ -136,46 +240,4 @@ pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNod
     }
 
     Ok(current)
-}
-
-pub unsafe fn read_file(node: *mut VfsNode, buffer: &mut [u8], offset: u32) -> KResult<usize> {
-    if (*node).node_type != VfsNodeType::File {
-        return Err(KernelError::EINVAL);
-    }
-
-    let inode = super::get_ext2_inode((*node).inode)?;
-
-    let file_size = inode.i_size;
-    if offset >= file_size {
-        return Ok(0); // EOF
-    }
-
-    let bytes_to_read = core::cmp::min(buffer.len() as u32, file_size - offset);
-
-    let block_size = super::EXT2_BLOCK_SIZE;
-    let logical_block_idx = (offset / block_size) as usize;
-    let offset_in_block = (offset % block_size) as usize;
-
-    if logical_block_idx > 11 {
-        pr_err!("File too large, indirect blocks not implemented.\n");
-        return Err(KernelError::ENOSYS);
-    }
-
-    let physical_block = inode.i_block[logical_block_idx];
-    if physical_block == 0 {
-        return Ok(0); // Sparse file, treat as EOF
-    }
-
-    let mut block_buf: [u8; 1024] = [0; 1024];
-    if super::read_ext2_block(physical_block, &mut block_buf).is_err() {
-        return Err(KernelError::EIO);
-    }
-
-    core::ptr::copy_nonoverlapping(
-        block_buf.as_ptr().add(offset_in_block),
-        buffer.as_mut_ptr(),
-        bytes_to_read as usize,
-    );
-
-    Ok(bytes_to_read as usize)
 }

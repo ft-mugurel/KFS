@@ -1,10 +1,13 @@
-use crate::fs::VfsNode;
+use core::{fmt::Display, mem::MaybeUninit};
+
+use crate::{fs::VfsNode, locks::Spinlock, paging::PAGE_SIZE, x86};
 
 mod process;
 mod scheduler;
-mod task;
-mod task_queue;
+mod thread_info;
+// mod task_queue;
 
+pub(super) const THREAD_SIZE: usize = PAGE_SIZE;
 pub(crate) const MAX_PROCESSES: usize = 64;
 pub(crate) const MAX_CHILDREN: usize = 16;
 pub(crate) const MAX_FDS_PER_PROCESS: usize = 16;
@@ -13,6 +16,7 @@ pub(crate) const SIGNAL_QUEUE_SIZE: usize = 16;
 pub(crate) const MAX_VMAS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum ProcessState {
     Ready,
     Running,
@@ -20,6 +24,20 @@ pub(crate) enum ProcessState {
     Waiting,
     Zombie,
     Terminated,
+}
+
+impl Display for ProcessState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let state_str = match self {
+            ProcessState::Ready => "Ready",
+            ProcessState::Running => "Running",
+            ProcessState::Sleeping => "Sleeping",
+            ProcessState::Waiting => "Waiting",
+            ProcessState::Zombie => "Zombie",
+            ProcessState::Terminated => "Terminated",
+        };
+        write!(f, "{}", state_str)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +51,7 @@ pub(crate) struct Context {
 pub(crate) struct Vma {
     pub base: u32,
     pub size: u32,
+    #[allow(dead_code)]
     pub flags: u32,
     pub used: bool,
 }
@@ -88,38 +107,47 @@ pub(crate) struct TaskStruct {
     pub exit_code: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub(crate) struct ContextFrame {
-    pub edi: u32,
-    pub esi: u32,
-    pub ebp: u32,
-    pub esp_dummy: u32,
-    pub ebx: u32,
-    pub edx: u32,
-    pub ecx: u32,
-    pub eax: u32,
-
-    pub gs: u32,
-    pub fs: u32,
-    pub es: u32,
-    pub ds: u32,
-
-    pub eip: u32,
-    pub cs: u32,
-    pub eflags: u32,
-    pub user_esp: u32,
-    pub user_ss: u32,
-}
+unsafe impl Send for TaskStruct {}
 
 const EMPTY_VMA: Vma = Vma { base: 0, size: 0, flags: 0, used: false };
 
-pub(crate) static mut PROCESS_TABLE: [Option<TaskStruct>; MAX_PROCESSES] = {
+pub(crate) static PROCESS_TABLE: Spinlock<[Option<TaskStruct>; MAX_PROCESSES]> = {
     const EMPTY: Option<TaskStruct> = None;
-    [EMPTY; MAX_PROCESSES]
+    Spinlock::new([EMPTY; MAX_PROCESSES])
 };
-pub(crate) static mut CURRENT_PID: usize = 0;
+
+pub(crate) fn reserve_process_slot() -> Option<usize> {
+    let mut table = PROCESS_TABLE.lock();
+    for (index, task) in table.iter_mut().enumerate() {
+        if task.is_none() {
+            let new_task: TaskStruct = unsafe { MaybeUninit::zeroed().assume_init() };
+            *task = Some(new_task);
+            return Some(index);
+        }
+    }
+    None
+}
 
 pub(crate) use process::create_user_process;
-pub(crate) use scheduler::{init_scheduler, schedule};
-pub(crate) use task_queue::{execute_tasks, schedule_task};
+pub(crate) use scheduler::{idle_stack_top, init_scheduler_for_cpu, schedule};
+pub(crate) use thread_info::{current, current_pid, ContextFrame};
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idle_loop() -> ! {
+    x86::enable_interrupts();
+    loop {
+        x86::hlt();
+    }
+}
+
+/// Moves esp onto the given stack and jumps (not calls) into idle_loop.
+/// Never returns — there is no valid frame to return to on the old stack.
+pub unsafe fn switch_to_idle_stack(new_esp: u32) -> ! {
+    core::arch::asm!(
+        "mov esp, {esp}",
+        "jmp {func}",
+        esp = in(reg) new_esp,
+        func = sym idle_loop,
+        options(noreturn)
+    );
+}

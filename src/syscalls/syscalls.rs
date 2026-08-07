@@ -1,11 +1,12 @@
 use crate::dump::lookup;
 use crate::error::KernelError;
 use crate::interrupts::register_user_interrupt_handler;
-use crate::sched::{ContextFrame, CURRENT_PID, PROCESS_TABLE};
+use crate::sched::{self, ContextFrame};
 use crate::{pr_debug, pr_warn};
 
 use super::exit::{syscall_exit, syscall_wait};
 use super::fork::syscall_fork;
+use super::fs::{syscall_mknod, syscall_mount, syscall_umount};
 use super::mem::{syscall_mmap, syscall_munmap, syscall_sbrk};
 use super::open::{syscall_close, syscall_open};
 use super::read_write::{syscall_read, syscall_write};
@@ -54,6 +55,9 @@ static mut SYSCALL_ENTRIES: [Option<SyscallEntry>; MAX_SYSCALL_NUMBER] = {
     table[4] = Some(SyscallEntry::Normal(syscall_write)); // write(fd, buf, len)
     table[5] = Some(SyscallEntry::Normal(syscall_open)); // open(path, flags)
     table[6] = Some(SyscallEntry::Normal(syscall_close)); // close(fd)
+    table[8] = Some(SyscallEntry::Normal(syscall_mknod)); // mknod(path, mode)
+    table[9] = Some(SyscallEntry::Normal(syscall_mount)); // mount(source, target)
+    table[10] = Some(SyscallEntry::Normal(syscall_umount)); // umount(target)
 
     // System info
     table[24] = Some(SyscallEntry::Normal(syscall_getuid)); // getuid()
@@ -84,11 +88,8 @@ static mut SYSCALL_ENTRIES: [Option<SyscallEntry>; MAX_SYSCALL_NUMBER] = {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
-    let current_pid = CURRENT_PID;
-
-    if let Some(ref mut task) = PROCESS_TABLE[current_pid] {
-        task.context.esp = regs as u32;
-    }
+    let task = sched::current().as_mut().unwrap();
+    task.context.esp = regs as u32;
 
     let syscall_no = unsafe { (*regs).eax } as usize;
     if syscall_no < MAX_SYSCALL_NUMBER {
@@ -105,8 +106,7 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
                 .unwrap_or("unknown");
 
             pr_debug!(
-                "[PID {}] Syscall: {} from EIP: {:#x}\n",
-                current_pid,
+                "Syscall: {} from EIP: {:#x}\n",
                 syscall_name,
                 (*regs).eip as u32
             );
@@ -115,15 +115,13 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
 
             if (*regs).is_error() {
                 pr_debug!(
-                    "[PID {}] Syscall {} returned error: {:?}\n",
-                    current_pid,
+                    "Syscall {} returned error: {:?}\n",
                     syscall_name,
-                    (*regs).get_error().unwrap_or(KernelError::EINVAL)
+                    (*regs).get_error().unwrap_or(KernelError::E2BIG)
                 );
             } else {
                 pr_debug!(
-                    "[PID {}] Syscall {} returned value: {}\n",
-                    current_pid,
+                    "Syscall {} returned value: {}\n",
                     syscall_name,
                     (*regs).get_return_value()
                 );
@@ -132,11 +130,7 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
         }
     }
 
-    pr_warn!(
-        "[PID {}] Unknown syscall number: {}\n",
-        current_pid,
-        syscall_no
-    );
+    pr_warn!("Unknown syscall number: {}\n", syscall_no);
     (*regs).set_return_error(KernelError::ENOSYS);
     0
 }

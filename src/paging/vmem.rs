@@ -1,9 +1,8 @@
-use super::init::{KERNEL_SPACE_START, PAGE_SIZE};
 use super::page_table;
 use super::physical;
-use super::PAGE_WRITABLE;
+use super::{KERNEL_SPACE_START, PAGE_SIZE, PAGE_WRITABLE};
 use crate::error::{KResult, KernelError};
-use crate::{pr_debug, pr_warn};
+use crate::{pr_warn, pr_debug};
 
 const VMALLOC_START: u32 = KERNEL_SPACE_START as u32 + 0x0040_0000;
 const VMALLOC_END: u32 = KERNEL_SPACE_START as u32 + 0x0100_0000;

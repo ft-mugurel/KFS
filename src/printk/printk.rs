@@ -49,6 +49,10 @@ pub fn printk_level_to_screen(
         return;
     }
     text_mod::print_str_on(screen_index, level_tag(level));
+    text_mod::print_fmt_on(
+        screen_index,
+        &format_args!("({}) ", unsafe { crate::sched::current_pid() }),
+    );
     text_mod::print_fmt_on(screen_index, args);
 }
 

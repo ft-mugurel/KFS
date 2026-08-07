@@ -1,10 +1,10 @@
-use super::init::PAGE_SIZE;
 use super::multiboot::{
     MemoryMapIter, MultibootInfo, MULTIBOOT_INFO_HAS_BASIC_MEMORY, MULTIBOOT_MEMORY_AVAILABLE,
 };
+use super::PAGE_SIZE;
 use crate::error::{KResult, KernelError};
-use crate::spin::Spinlock;
-use crate::{pr_debug, pr_warn};
+use crate::locks::Spinlock;
+use crate::pr_warn;
 
 const MAX_PHYS_MEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // On 32-bit targets, casting 4 GiB to usize wraps to 0. Compute max 4 KiB frames
@@ -158,16 +158,6 @@ pub(super) fn init_from_multiboot(info: &MultibootInfo) {
     state.mark_range_used(0, 0x0010_0000);
     let kernel_end = align_up(&raw const __kernel_end as usize, PAGE_SIZE) as u64;
     state.mark_range_used(0x0010_0000, kernel_end);
-    let total_frames = state.total_frames;
-    let free_frames = state.free_frames;
-
-    pr_debug!(
-            "Frame allocator initialized: max_frames={} free_frames={} reserved_low=0x{:x} kernel_end=0x{:x}\n",
-            total_frames,
-            free_frames,
-            0x0010_0000usize,
-            kernel_end as usize
-        );
 
     if !has_usable_memory || state.free_frames == 0 {
         pr_warn!(
@@ -189,8 +179,8 @@ pub(super) fn alloc_frame() -> KResult<u32> {
             if frame_idx < MAX_FRAMES {
                 state.mark_used(frame_idx);
                 let addr = frame_addr(frame_idx);
-                let free_frames = state.free_frames;
-                pr_debug!("alloc_frame -> {:#x} (free_left={})\n", addr, free_frames);
+                // let free_frames = state.free_frames;
+                // pr_debug!("alloc_frame -> {:#x} (free_left={})\n", addr, free_frames);
                 return Ok(addr);
             }
         }
@@ -224,13 +214,13 @@ pub(super) fn alloc_frame_below(limit_addr: u64) -> KResult<u32> {
 
     state.mark_used(frame_idx);
     let addr = frame_addr(frame_idx);
-    let free_frames = state.free_frames;
-    pr_debug!(
-        "alloc_frame_below({:#x}) -> {:#x} (free_left={})\n",
-        limit_addr,
-        addr,
-        free_frames
-    );
+    // let free_frames = state.free_frames;
+    // pr_debug!(
+    //     "alloc_frame_below({:#x}) -> {:#x} (free_left={})\n",
+    //     limit_addr,
+    //     addr,
+    //     free_frames
+    // );
     Ok(addr)
 }
 
@@ -244,12 +234,12 @@ pub(super) fn free_frame(phys_addr: u32) -> KResult<()> {
 
     let mut state = ALLOCATOR_STATE.lock();
     state.mark_free(frame_idx);
-    let free_frames = state.free_frames;
-    pr_debug!(
-        "free_frame <- {:#x} (free_now={})\n",
-        phys_addr,
-        free_frames
-    );
+    // let free_frames = state.free_frames;
+    // pr_debug!(
+    //     "free_frame <- {:#x} (free_now={})\n",
+    //     phys_addr,
+    //     free_frames
+    // );
     Ok(())
 }
 

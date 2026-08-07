@@ -32,6 +32,9 @@ ASM_DIR         = asm
 ASM_SRCS        = $(wildcard $(ASM_DIR)/*.asm)
 ASM_OBJS        = $(patsubst $(ASM_DIR)/%.asm, $(BUILD_DIR)/%.o, $(ASM_SRCS))
 
+TRAMPOLINE_SRC = src/smp/trampoline.asm
+TRAMPOLINE_BIN = $(BUILD_DIR)/trampoline.bin
+
 # **************************************************************************** #
 # 
 # **************************************************************************** #
@@ -77,7 +80,9 @@ define link_kernel
 	@echo -e "$(YELLOW)[~] Linking Stage 1...$(RESET)"
 	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) $(1)
 	@echo -e "$(YELLOW)[~] Generating kallsyms map...$(RESET)"
-	@nm -n $(KERNEL_BIN) | awk '$$2 ~ /[tTwW]/ { if ($$3 != "") print $$1 " " $$3 }' > $(BUILD_DIR)/kallsyms.map
+	@nm -n $(KERNEL_BIN) | awk '$$2 ~ /[tTwW]/ { if ($$3 != "") print $$1 " " $$3 }' > $(BUILD_DIR)/kallsyms.tmp
+	@cmp -s $(BUILD_DIR)/kallsyms.tmp $(BUILD_DIR)/kallsyms.map || mv $(BUILD_DIR)/kallsyms.tmp $(BUILD_DIR)/kallsyms.map
+	@rm -f $(BUILD_DIR)/kallsyms.tmp
 	@echo -e "$(YELLOW)[~] Rebuilding Rust with embedded symbols...$(RESET)"
 	@$(CARGO) build $(CARGO_ARGS) $(2)
 	@echo -e "$(YELLOW)[~] Linking Stage 2 (Final)...$(RESET)"
@@ -103,14 +108,18 @@ $(ATA_DRIVE_IMG):
 	@mkfs.ext2 -q $(ATA_DRIVE_IMG)
 	@echo -e "$(GREEN)[✓] ATA drive image created: $(ATA_DRIVE_IMG)$(RESET)"
 
+$(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC) | $(BUILD_DIR)
+	@echo -e "$(YELLOW)[~] Compiling trampoline.asm...$(RESET)"
+	@nasm -f bin $(TRAMPOLINE_SRC) -o $(TRAMPOLINE_BIN)
+
 build: CARGO_ARGS = --no-default-features
-build: $(ASM_OBJS)
+build: $(ASM_OBJS) $(TRAMPOLINE_BIN)
 	@echo -e "$(BOLD)$(CYAN)[~] Building Release Kernel...$(RESET)"
 	@$(CARGO) build --release
 	$(call link_kernel, $(KERNEL_REL_LIB), --release)
 	@echo -e "$(BOLD)$(GREEN)[✓] RELEASE KERNEL BUILD DONE$(RESET)"
 
-build_debug: $(ASM_OBJS)
+build_debug: $(ASM_OBJS) $(TRAMPOLINE_BIN)
 	@echo -e "$(BOLD)$(YELLOW)[~] Building Debug Kernel...$(RESET)"
 	@$(CARGO) build
 	$(call link_kernel, $(KERNEL_DBG_LIB), )
@@ -145,6 +154,7 @@ run-iso: iso $(ATA_DRIVE_IMG)
 	@$(QEMU_SYSTEM) -m 4G \
 		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
 		-drive format=raw,file=$(ISO_OUT),media=cdrom \
+		-smp 3 \
 		-boot order=d
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 

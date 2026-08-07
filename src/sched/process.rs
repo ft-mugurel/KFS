@@ -1,6 +1,7 @@
+use super::thread_info;
 use super::{ContextFrame, ProcessState, TaskStruct, EMPTY_VMA, MAX_VMAS, PROCESS_TABLE};
 use crate::gdt::{USER_CODE_SEL, USER_DATA_SEL};
-use crate::{paging, pr_err, pr_info, x86};
+use crate::{paging, pr_err, pr_info, pr_warn, x86};
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
@@ -10,10 +11,12 @@ const USER_BSS_VADDR: u32 = 0x0804B000;
 const USER_STACK_VADDR: u32 = 0xBFFFF000;
 
 pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -> bool {
-    let tty_id = 1;
-    if PROCESS_TABLE[tty_id].is_some() {
+    let pid = super::reserve_process_slot();
+    if pid.is_none() {
+        pr_err!("No available PID for new user process\n");
         return false;
     }
+    let pid = pid.unwrap();
     let k_stack_frame = match paging::alloc_physical_page() {
         Ok(frame) => frame,
         Err(e) => {
@@ -21,6 +24,7 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
                 "Failed to allocate kernel stack frame for user process: {:?}\n",
                 e
             );
+            PROCESS_TABLE.lock()[pid] = None; // Free the reserved slot
             return false;
         }
     };
@@ -35,6 +39,7 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
         Ok(cr3) => cr3,
         Err(e) => {
             pr_err!("Failed to create address space for user process: {:?}\n", e);
+            PROCESS_TABLE.lock()[pid] = None;
             return false;
         }
     };
@@ -61,7 +66,7 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     copy_nonoverlapping(entry_point as *const u8, code_ptr, entry_size);
 
     // exit even if the user didn't call exit, to avoid returning to the kernel
-    let trampoline_vaddr = USER_CODE_VADDR + 0x800;
+    let trampoline_vaddr = USER_CODE_VADDR + entry_size as u32;
     let trampoline_ptr = trampoline_vaddr as *mut u8;
     let exit_payload: [u8; 12] = [
         0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
@@ -94,7 +99,7 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     frame.user_ss = user_data;
 
     let mut new_task: TaskStruct = MaybeUninit::zeroed().assume_init();
-    new_task.pid = 2;
+    new_task.pid = pid as u32;
     new_task.uid = 1000;
     new_task.state = ProcessState::Ready;
     new_task.context.esp = frame_ptr as u32;
@@ -116,7 +121,26 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     new_task.kernel_stack_top = k_stack_top;
     new_task.kernel_stack_bottom = k_stack_bottom;
 
-    PROCESS_TABLE[tty_id] = Some(new_task);
-    pr_info!("Spawned Isolated User Process PID {}\n", tty_id);
+    let mut locked_process_table = PROCESS_TABLE.lock();
+    locked_process_table[pid] = Some(new_task);
+
+    pr_warn!(
+        "writing thread info for PID {} at {:p}\n",
+        pid,
+        k_stack_bottom as *mut thread_info::ThreadInfo
+    );
+    // Getting rid of global CURRENT_PID and using the current thread info to get the PID
+    let ti = k_stack_bottom as *mut thread_info::ThreadInfo;
+    (*ti).task = locked_process_table[pid].as_mut().unwrap() as *mut _;
+    (*ti).task_pid = pid as u32;
+    (*ti).preempt_count = 0;
+    (*ti).flags = 0;
+    (*ti).canary = thread_info::STACK_CANARY;
+
+    // Add the new process to the parent's child list
+    let parent_task = locked_process_table[0].as_mut().unwrap();
+    parent_task.family.children[parent_task.family.child_count] = pid as u32;
+    parent_task.family.child_count += 1;
+    pr_info!("Spawned Isolated User Process PID {}\n", pid);
     true
 }

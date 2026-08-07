@@ -1,7 +1,7 @@
 use crate::interrupts::idt::register_interrupt_handler;
 use crate::interrupts::pit::init_pit;
-use crate::pr_debug;
-use crate::sched::schedule;
+use crate::{pr_debug};
+use crate::sched::{schedule};
 use crate::signals::process_scheduled_signals;
 use crate::startup_config::{pic, power::CONFIG_HZ};
 use crate::x86::outb;
@@ -22,7 +22,6 @@ pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
 
     process_scheduled_signals();
 
-    // Send End of Interrupt (EOI) to master PIC
     outb(pic::MASTER_COMMAND_PORT, pic::EOI);
 
     schedule(old_esp)

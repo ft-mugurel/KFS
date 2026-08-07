@@ -1,39 +1,45 @@
 use crate::error::{KResultExt, KernelError};
 use crate::fs::OPEN_FILE_TABLE;
 use crate::sched::{
-    self, ContextFrame, CURRENT_PID, MAX_CHILDREN, MAX_FDS_PER_PROCESS, MAX_PROCESSES,
-    PROCESS_TABLE,
+    self, current_pid, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE,
 };
 use crate::{paging, pr_info, pr_warn};
 
 pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
-    let parent_pid = CURRENT_PID;
-
     let mut child_pid_opt = None;
-    for i in 1..MAX_PROCESSES {
-        if PROCESS_TABLE[i].is_none() {
+    for (i, task_opt) in PROCESS_TABLE.lock().iter().enumerate() {
+        if task_opt.is_none() {
             child_pid_opt = Some(i);
             break;
         }
     }
 
+    let parent_task = sched::current().as_mut().unwrap();
+    let cc = parent_task.family.child_count;
+    if cc >= MAX_CHILDREN {
+        pr_warn!(
+            "[PID {}] Maximum number of child processes reached\n",
+            parent_task.pid
+        );
+        (*regs).set_return_error(KernelError::EAGAIN);
+        return;
+    }
+
     let child_pid = match child_pid_opt {
         Some(pid) => pid,
         None => {
-            pr_warn!("[PID {}] No available PID for fork\n", parent_pid);
+            pr_warn!("[PID {}] No available PID for fork\n", current_pid());
             (*regs).set_return_error(KernelError::EAGAIN);
             return;
         }
     };
-
-    let parent_task = PROCESS_TABLE[parent_pid].as_ref().unwrap();
 
     let child_cr3 = match paging::clone_address_space(parent_task.context.cr3) {
         Ok(cr3) => cr3,
         Err(_) => {
             pr_warn!(
                 "[PID {}] Failed to clone address space for child PID {}\n",
-                parent_pid,
+                parent_task.pid,
                 child_pid
             );
             (*regs).set_return_error(KernelError::ENOMEM);
@@ -93,16 +99,11 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
         }
     }
 
-    child_task.family.parent_pid = parent_pid as u32;
+    child_task.family.parent_pid = parent_task.pid;
+    parent_task.family.children[parent_task.family.child_count] = child_pid as u32;
+    parent_task.family.child_count += 1;
 
-    let parent_task_mut = PROCESS_TABLE[parent_pid].as_mut().unwrap();
-    let cc = parent_task_mut.family.child_count;
-    if cc < MAX_CHILDREN {
-        parent_task_mut.family.children[cc] = child_pid as u32;
-        parent_task_mut.family.child_count += 1;
-    }
-
-    PROCESS_TABLE[child_pid] = Some(child_task);
+    PROCESS_TABLE.lock()[child_pid] = Some(child_task);
 
     (*regs).set_return_value(child_pid as u32);
 }

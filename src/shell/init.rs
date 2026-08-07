@@ -2,55 +2,37 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::str;
 
-use crate::dump::{
-    self, DumpStackOptions, DEFAULT_DUMP_WORDS, DEFAULT_TRACE_FRAMES, MAX_DUMP_WORDS,
-    MEMDUMP_DEFAULT_LEN, MEMDUMP_MAX_LEN,
-};
-use crate::fs;
-use crate::interrupts::keyboard::{self, KeyCode, KeyEvent, KeyboardLayout, Modifiers};
-use crate::interrupts::{request_reboot, request_shutdown};
-use crate::pr_info;
-use crate::printk::{set_log_level, KernelLogLevel};
-use crate::sched;
-use crate::signals::{self, Signal};
-use crate::startup_config;
-use crate::test;
-use crate::vga::text_mod::{
-    active_cursor_position, active_screen_accepts_input, change_color, clear, is_screen_active,
-    print_char_on, print_fmt_on, print_str_on, scroll_view_to_bottom, set_cursor_movement_on,
-    set_cursor_position_on, set_screen_accepts_input, switch_screen, switch_to_next_screen,
-    switch_to_previous_screen, Color, ColorCode, CursorMovement, VGA_WIDTH,
+use crate::{
+    dump::{
+        self, DumpStackOptions, DEFAULT_DUMP_WORDS, DEFAULT_TRACE_FRAMES, MAX_DUMP_WORDS,
+        MEMDUMP_DEFAULT_LEN, MEMDUMP_MAX_LEN,
+    },
+    fs,
+    interrupts::{
+        keyboard::{self, KeyCode, KeyEvent, KeyboardLayout, Modifiers},
+        request_reboot,
+    },
+    pr_info,
+    printk::{set_log_level, KernelLogLevel},
+    sched,
+    signals::{self, Signal},
+    smp::ipi::request_shutdown,
+    startup_config, test,
+    vga::text_mod::{
+        active_cursor_position, active_screen_accepts_input, change_color, clear, is_screen_active,
+        print_char_on, print_fmt_on, print_str_on, scroll_view_to_bottom, set_cursor_movement_on,
+        set_cursor_position_on, set_screen_accepts_input, switch_screen, switch_to_next_screen,
+        switch_to_previous_screen, Color, ColorCode, CursorMovement, VGA_WIDTH,
+    },
 };
 
 const PROMPT: &str = "mysh > ";
 const MAX_INPUT_LEN: usize = startup_config::shell::MAX_INPUT_LEN;
 const SCREEN_INDEX: usize = startup_config::shell::SCREEN_INDEX;
 const COMMANDS: &[&str] = &[
-    "help",
-    "clear",
-    "echo",
-    "reboot",
-    "shutdown",
-    "screen",
-    "loglevel",
-    "color",
-    "memstat",
-    "memdebug",
-    "memdump",
-    "pte",
-    "memtest",
-    "stack",
-    "crash",
-    "sc_write",
-    "layout",
-    "read_test",
-    "signal",
-    "spawn",
-    "wait",
-    "kill",
-    "dump_sb",
-    "write_ata",
-    "read_ata",
+    "help", "clear", "echo", "reboot", "shutdown", "screen", "loglevel", "color", "memstat",
+    "memdebug", "memdump", "pte", "memtest", "stack", "crash", "layout", "signal", "spawn", "wait",
+    "kill", "ps", "fs_test", "fs_tree",
 ];
 
 struct ShellState {
@@ -256,16 +238,12 @@ pub fn init_shell() {
         }
 
         state.initialized = true;
-        print(
-            "This is the default screen for the shell \n\
-            Use F1-F6 / Shift+<Left/Right Arrow> to switch screens.\n",
-        );
         print(PROMPT);
         state.rendered_len = PROMPT.len();
         set_cursor_movement_on(SCREEN_INDEX, CursorMovement::Horizontal);
     });
 
-    signals::register_signal_handler(Signal::SIGINT, shell_sigint_handler);
+    unsafe { signals::register_signal_handler(Signal::SIGINT, shell_sigint_handler as u32) };
     set_screen_accepts_input(SCREEN_INDEX, true);
 }
 
@@ -477,7 +455,7 @@ fn run_command_line() {
         return;
     }
 
-    run_command(line);
+    unsafe { run_command(line) };
     with_shell_state_mut(|state| {
         state.add_to_history(line);
     });
@@ -491,7 +469,7 @@ fn run_command_line() {
     }
 }
 
-fn run_command(line: &str) {
+unsafe fn run_command(line: &str) {
     let mut parts: str::SplitWhitespace<'_> = line.split_whitespace();
     let Some(command) = parts.next() else {
         return;
@@ -517,25 +495,19 @@ fn run_command(line: &str) {
         "memtest" => dump::run_memtest(line[command.len()..].trim(), |args| print_fmt(args)),
         "stack" => command_stack(parts),
         "layout" => command_layout(parts),
-        "crash" => unsafe {
+        "crash" => {
             core::ptr::read_volatile(0xdeadbeef as *const u32);
-        },
-        "sc_write" => command_sc_write(),
-        "read_test" => command_read_test(),
+        }
         "signal" => command_signal(parts),
-        "spawn" => command_spawn(parts),
+        "spawn" => command_spawn(),
         "wait" => command_wait(),
         "kill" => command_kill(parts),
-        "dump_sb" => unsafe {
-            fs::dump_ext2_sb().unwrap_or_else(|e| {
-                print_fmt(&format_args!("Failed to read EXT2 superblock: {:?}\n", e));
-            })
-        },
         "dump_vfs" => unsafe {
             fs::print_vfs_tree(fs::ROOT_NODE, 0);
         },
-        "write_ata" => command_write_ata(parts, line),
-        "read_ata" => command_read_ata(parts),
+        "fs_test" => command_fs_test(),
+        "ps" => command_ps(),
+        "fs_tree" => command_fs_tree(),
         _ => {
             print("unknown command: ");
             print(command);
@@ -600,13 +572,18 @@ fn parse_usize(input: &str) -> Option<usize> {
 #[inline(always)]
 fn command_help(mut parts: str::SplitWhitespace<'_>) {
     let Some(topic) = parts.next() else {
+        print("Available commands:\n");
+        for cmd in COMMANDS {
+            print_fmt(&format_args!("{:<10}", cmd));
+        }
         print(
-            "Available commands:\n\
-            help clear echo shutdown reboot screen loglevel color memstat memdebug\n\
-            memdump pte memtest stack crash sc_write layout read_test signal\n\
-            spawn\n",
+            "\n\nType 'help <command>' for more details on a specific command.\n\n\
+            Tab for auto-completion.\n\
+            Up/Down arrows for command history.\n\
+            Home/End to move the cursor to the beginning or end of the line.\n\
+            Shift+Left/Right arrows to switch between screens.\n\
+            Ctrl+C to interrupt the current command.\n",
         );
-        print("Type 'help <command>' for more details on a specific command.\n");
         return;
     };
 
@@ -626,17 +603,16 @@ fn command_help(mut parts: str::SplitWhitespace<'_>) {
         "memtest" => print("memtest [physical,vmem,heap,page,all]\n  Run memory tests on different memory regions.\n"),
         "stack" => print("stack [words<=64]\n  Dump the current stack contents (default 32 words).\n"),
         "crash" => print("crash\n  Intentionally crash the kernel for testing purposes.\n"),
-        "sc_write" => print("sc_write\n  Test syscall write by printing a message directly from a syscall.\n"),
         "layout" => print("layout <us|tr>\n  Change keyboard layout to US QWERTY or Turkish QWERTY.\n"),
         "read_test" => print("read_test\n  Test blocking read by prompting for user input and echoing it back.\n"),
-        "signal" => print("signal <signum|signal_name> [delay_ms]\n  Send a signal to the shell process, optionally with a delay in milliseconds.\n"),
-        "spawn" => print("spawn\n  Spawn a user process (Ring 3) on PID 2. If PID 2 is already running, it will not spawn a new process.\n"),
+        "signal" => print("signal <signum|signal_name>\n  Send a signal to the shell process\n"),
         "wait" => print("wait\n  Wait for a child process to exit and reap it if it's a zombie.\n"),
         "sleep" => print("sleep <milliseconds>\n  Put the shell process to sleep for the specified duration.\n"),
         "kill" => print("kill <pid>\n  Send SIGKILL to the specified process ID.\n"),
-        "dump_sb" => print("dump_sb\n  Display EXT2 superblock information.\n"),
-        "write_ata" => print("write_ata <block_number> <data>\n  Write data to the specified ATA block number.\n"),
-        "read_ata" => print("read_ata <block_number>\n  Read data from the specified ATA block number.\n"),
+        "ps" => print("ps\n  Display information about running processes.\n"),
+        "fs_test" => print("fs_test\n  Exercise mknod, mount, umount, open(O_CREAT|O_TRUNC), write, and read.\n"),
+        "spawn" => print("spawn\n  Spawn a user process with 'test::most_syscalls_we_have_probably' entry point. Change the code for something else.\n"),
+        "fs_tree" => print("fs_tree\n  Print the virtual file system tree starting from the root node.\n"),
         _ => print("Unknown command. Type 'help' for a list of commands.\n"),
     }
 }
@@ -789,40 +765,113 @@ fn command_layout(mut parts: str::SplitWhitespace<'_>) {
 }
 
 #[inline(always)]
-fn command_sc_write() {
-    let msg = "This message was printed using the sc_write command.\n";
-    let fd: i32 = 1; // stdout
-    let buf_ptr = msg.as_ptr();
-    let len = msg.len();
+fn command_fs_test() {
     unsafe {
-        // 32-bit x86 syscall convention using int 0x80
+        let dev_path: [u8; 5] = [b'/', b'd', b'e', b'v', 0];
+        let mnt_path: [u8; 5] = [b'/', b'm', b'n', b't', 0];
+        let file_path: [u8; 13] = [
+            b'/', b'f', b's', b'_', b't', b'e', b's', b't', b'.', b't', b'x', b't', 0,
+        ];
+        let write_msg: [u8; 6] = [b'f', b's', b'-', b'o', b'k', b'\n'];
+        let mut result: u32;
+        let mut fd: u32;
+        let mut read_back: u32;
+        let mut read_buf = [0u8; 32];
+
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 8,
+            in("ebx") mnt_path.as_ptr(),
+            in("ecx") 0x4000u32 | 0o755,
+            lateout("eax") _,
+            options(nostack, nomem),
+        );
+
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 9,
+            in("ebx") dev_path.as_ptr(),
+            in("ecx") mnt_path.as_ptr(),
+            lateout("eax") result,
+            options(nostack, nomem),
+        );
+        if (result as i32) < 0 {
+            print("fs_test: mount failed\n");
+            return;
+        }
+
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 10,
+            in("ebx") mnt_path.as_ptr(),
+            lateout("eax") result,
+            options(nostack, nomem),
+        );
+        if (result as i32) < 0 {
+            print("fs_test: umount failed\n");
+            return;
+        }
+
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 5,
+            in("ebx") file_path.as_ptr(),
+            in("ecx") 0x241u32, // O_CREAT | O_TRUNC | O_RDWR
+            in("edx") 0o644u32,
+            lateout("eax") fd,
+            options(nostack, nomem),
+        );
+        if (fd as i32) < 0 {
+            print("fs_test: open create/trunc failed\n");
+            return;
+        }
+
         core::arch::asm!(
             "int 0x80",
             in("eax") 4,
             in("ebx") fd,
-            in("ecx") buf_ptr,
-            in("edx") len,
+            in("ecx") write_msg.as_ptr(),
+            in("edx") write_msg.len(),
+            lateout("eax") _,
             options(nostack, nomem),
         );
-    }
-}
+        core::arch::asm!("int 0x80", in("eax") 6, in("ebx") fd, options(nostack, nomem));
 
-#[inline(always)]
-fn command_read_test() {
-    print("Entering blocking read mode.\n");
-    print("Please type your name: ");
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 5,
+            in("ebx") file_path.as_ptr(),
+            in("ecx") 0u32,
+            in("edx") 0u32,
+            lateout("eax") fd,
+            options(nostack, nomem),
+        );
+        if (fd as i32) < 0 {
+            print("fs_test: reopen failed\n");
+            return;
+        }
 
-    let mut buffer = [0u8; 64];
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 3,
+            in("ebx") fd,
+            in("ecx") read_buf.as_mut_ptr(),
+            in("edx") read_buf.len(),
+            lateout("eax") read_back,
+            options(nostack, nomem),
+        );
+        core::arch::asm!("int 0x80", in("eax") 6, in("ebx") fd, options(nostack, nomem));
 
-    // This will block the shell execution until the user presses Enter
-    let len = keyboard::get_line(SCREEN_INDEX, &mut buffer);
+        if (read_back as i32) < 0 {
+            print("fs_test: readback failed\n");
+            return;
+        }
 
-    if let Ok(input_str) = core::str::from_utf8(&buffer[..len]) {
-        print("Hello, ");
-        print(input_str);
-        print("!\n");
-    } else {
-        print("Invalid input.\n");
+        print("fs_test: success\n");
+        if let Ok(text) = core::str::from_utf8(&read_buf[..read_back as usize]) {
+            print(text);
+            print("\n");
+        }
     }
 }
 
@@ -851,7 +900,7 @@ fn command_wait() {
 #[inline(always)]
 fn command_signal(mut parts: str::SplitWhitespace<'_>) {
     let Some(sig_str) = parts.next() else {
-        print("usage: signal <signum|signal_name> [delay_ms]\n");
+        print("usage: signal <signum|signal_name>\n");
         return;
     };
 
@@ -866,23 +915,7 @@ fn command_signal(mut parts: str::SplitWhitespace<'_>) {
         return;
     };
 
-    let delay_ms = if let Some(delay_str) = parts.next() {
-        match delay_str.parse::<u64>() {
-            Ok(delay) => delay,
-            Err(_) => {
-                print("invalid delay\n");
-                return;
-            }
-        }
-    } else {
-        0
-    };
-
-    if delay_ms == 0 {
-        signals::send_signal(signal);
-    } else {
-        signals::schedule_signal(signal, delay_ms);
-    }
+    unsafe { signals::send_signal(signal) };
 }
 
 #[inline(always)]
@@ -919,62 +952,32 @@ fn command_kill(mut parts: str::SplitWhitespace<'_>) {
 }
 
 #[inline(always)]
-fn command_spawn(mut parts: str::SplitWhitespace<'_>) {
-    let name = parts.next().unwrap_or("");
-    // let entry_point = match name {
-    //     "sleep" => test::process_sleep,
-    //     "fork" => test::process_fork,
-    //     "socket" => test::process_socket,
-    //     _ => {
-    //         print("Unknown process name. Available: user_process, sleep, fork, socket\n");
-    //         return;
-    //     }
-    // };
-    if unsafe { sched::create_user_process(test::process_fork, 1024) } {
-        pr_info!("Spawned user process '{}' with 1024 bytes.\n", name);
+fn command_spawn() {
+    // if unsafe { sched::create_user_process(test::most_syscalls_we_have_probably, 1024) } {
+    if unsafe { sched::create_user_process(test::most_syscalls_we_have_probably, 1024) } {
+        pr_info!("Spawned user process with 1024 bytes.\n");
     } else {
         pr_info!("Failed to spawn user process. PID might already be in use.\n");
     }
 }
 
 #[inline(always)]
-fn command_write_ata(mut parts: str::SplitWhitespace<'_>, line: &str) {
-    let Some(num_str) = parts.next() else {
-        print("usage: write_ata <block_number> <data...>\n");
-        return;
-    };
-
-    let Some(block_number) = parse_u32(num_str) else {
-        print("invalid block number\n");
-        return;
-    };
-
-    let data = line
-        .trim_start_matches("write_ata ")
-        .trim_start_matches(num_str)
-        .trim();
-    let data_bytes = data.as_bytes();
-
-    fs::write_ext2_block(block_number, data_bytes).unwrap_or_else(|_| {
-        print("Failed to write block to ATA device.\n");
-    });
+fn command_ps() {
+    print(" PID | UID  | Parent PID | Exit Code  | State\n");
+    for process in sched::PROCESS_TABLE.lock().iter() {
+        if let Some(task) = process {
+            print_fmt(&format_args!(" {:<3} |", task.pid));
+            print_fmt(&format_args!(" {:<4} |", task.uid));
+            print_fmt(&format_args!(" {:<10} |", task.family.parent_pid));
+            print_fmt(&format_args!(" {:<10} |", task.exit_code.unwrap_or(0)));
+            print_fmt(&format_args!(" {:<20}\n", task.state));
+        }
+    }
 }
 
 #[inline(always)]
-fn command_read_ata(mut parts: str::SplitWhitespace<'_>) {
-    let Some(num_str) = parts.next() else {
-        print("usage: read_ata <block_number>\n");
-        return;
-    };
-
-    let Some(block_number) = parse_u32(num_str) else {
-        print("invalid block number\n");
-        return;
-    };
-
-    let mut buffer = [0u8; 1024];
-
-    fs::read_ext2_block(block_number, &mut buffer).unwrap_or_else(|_| {
-        print("Failed to read block from ATA device.\n");
-    });
+fn command_fs_tree() {
+    unsafe {
+        fs::print_vfs_tree(fs::ROOT_NODE, 0);
+    }
 }

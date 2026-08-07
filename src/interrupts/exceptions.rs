@@ -1,44 +1,45 @@
 use crate::interrupts::register_interrupt_handler;
+use crate::paging;
 use crate::panic;
-use crate::sched::{self, ProcessState, CURRENT_PID, PROCESS_TABLE};
+use crate::sched::{self, ProcessState};
 use crate::startup_config::logging::DEFAULT_LOG_SCREEN;
 use crate::vga::text_mod;
-use crate::{paging, pr_info};
-use crate::{pr_emerg, pr_err, pr_warn, x86};
+use crate::x86;
+use crate::{pr_emerg, pr_err, pr_info, pr_warn};
 
 const EXCEPTION_NAMES: [&str; 32] = [
-    "Divide Error",
-    "Debug",
-    "NMI",
-    "Breakpoint",
-    "Overflow",
-    "BOUND Range Exceeded",
-    "Invalid Opcode",
-    "Device Not Available",
-    "Double Fault",
-    "Coprocessor Segment Overrun",
-    "Invalid TSS",
-    "Segment Not Present",
-    "Stack-Segment Fault",
-    "General Protection Fault",
-    "Page Fault",
-    "Reserved",
-    "x87 Floating-Point",
-    "Alignment Check",
-    "Machine Check",
-    "SIMD Floating-Point",
-    "Virtualization",
-    "Control Protection",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Hypervisor Injection",
-    "VMM Communication",
-    "Security",
-    "Reserved",
+/* 0x00 */"Divide Error",
+/* 0x01 */"Debug",
+/* 0x02 */"NMI",
+/* 0x03 */"Breakpoint",
+/* 0x04 */"Overflow",
+/* 0x05 */"BOUND Range Exceeded",
+/* 0x06 */"Invalid Opcode",
+/* 0x07 */"Device Not Available",
+/* 0x08 */"Double Fault",
+/* 0x09 */"Coprocessor Segment Overrun",
+/* 0x0A */"Invalid TSS",
+/* 0x0B */"Segment Not Present",
+/* 0x0C */"Stack-Segment Fault",
+/* 0x0D */"General Protection Fault",
+/* 0x0E */"Page Fault",
+/* 0x0F */"Reserved",
+/* 0x10 */"x87 Floating-Point",
+/* 0x11 */"Alignment Check",
+/* 0x12 */"Machine Check",
+/* 0x13 */"SIMD Floating-Point",
+/* 0x14 */"Virtualization",
+/* 0x15 */"Control Protection",
+/* 0x16 */"Reserved",
+/* 0x17 */"Reserved",
+/* 0x18 */"Reserved",
+/* 0x19 */"Reserved",
+/* 0x1A */"Reserved",
+/* 0x1B */"Reserved",
+/* 0x1C */"Hypervisor Injection",
+/* 0x1D */"VMM Communication",
+/* 0x1E */"Security",
+/* 0x1F */"Reserved",
 ];
 
 unsafe extern "C" {
@@ -107,14 +108,22 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         .copied()
         .unwrap_or("Unknown Exception");
     let frame = &*regs;
+    let task_opt = sched::current().as_mut();
 
-    if (frame.cs & 0x03) == 3 {
-        let current_pid = CURRENT_PID;
+    if (frame.cs & 0x03) == 3 && task_opt.is_none() {
+        pr_emerg!(
+            "User-mode exception {} (vector {}) occurred, but no current task found. Halting.\n",
+            name,
+            idx
+        );
+    } else if (frame.cs & 0x03) == 3 {
+        let current_pid = sched::current_pid();
         let idx_usize = vector as usize;
+
+        let task = task_opt.unwrap();
 
         if idx_usize == 14 {
             let fault_addr = x86::read_cr2();
-            let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
             let mem = &task.memory;
 
             let mut is_valid = false;
@@ -181,7 +190,6 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
             sig_num
         );
 
-        let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
         task.state = ProcessState::Zombie;
 
         x86::write_cr3(paging::bootstrap_directory_phys_addr());

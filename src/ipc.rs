@@ -1,13 +1,14 @@
 use crate::{
     error::{KResult, KernelError},
     pr_notice, pr_warn,
-    spin::Spinlock,
+    locks::Spinlock,
 };
 
 pub const SOCKET_BUFFER_SIZE: usize = 1024;
 pub const MAX_SOCKETS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SocketState {
     Unbound,
     Bound,

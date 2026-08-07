@@ -75,7 +75,7 @@ pub(crate) use cursor::{
 pub(crate) use print::{print_char_on, print_fmt_on, print_str_on};
 pub(crate) use screen::{
     active_cursor_position, active_screen_accepts_input, active_screen_index, change_color, clear,
-    init as init_virtual_screens, is_screen_active, scroll_view_down, scroll_view_to_bottom,
+    init_virtual_screens, is_screen_active, scroll_view_down, scroll_view_to_bottom,
     scroll_view_to_top, scroll_view_up, set_active as switch_screen, set_cursor_movement_on,
     set_screen_accepts_input, switch_to_next_screen, switch_to_previous_screen,
 };

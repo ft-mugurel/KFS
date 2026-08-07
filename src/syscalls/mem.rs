@@ -1,15 +1,18 @@
 use crate::error::KernelError;
 use crate::paging::{self, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-use crate::sched::{ContextFrame, Vma, CURRENT_PID, MAX_VMAS, PROCESS_TABLE};
+use crate::sched::{self, ContextFrame, ProcessMemory, Vma, MAX_VMAS};
 use crate::{pr_warn, x86};
+
+unsafe fn current_pmem() -> *mut ProcessMemory {
+    &mut (*sched::current().as_mut().unwrap()).memory
+}
 
 pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
     unsafe {
         let increment = (*regs).arg1() as i32;
-        let current_pid = CURRENT_PID;
-        let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+        let mem = current_pmem();
 
-        let old_brk = task.memory.heap_brk;
+        let old_brk = (*mem).heap_brk;
 
         if increment == 0 {
             (*regs).set_return_value(old_brk);
@@ -44,7 +47,7 @@ pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
             }
         }
 
-        task.memory.heap_brk = new_brk;
+        (*mem).heap_brk = new_brk;
         (*regs).set_return_value(old_brk);
     }
 }
@@ -60,12 +63,11 @@ pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
     // Align length to the 4KB boundary
     let aligned_length = (length + 4095) & !4095;
 
-    let current_pid = CURRENT_PID;
-    let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+    let mem = current_pmem();
 
     let mut vma_idx = None;
     for i in 0..MAX_VMAS {
-        if !task.memory.vmas[i].used {
+        if !(*mem).vmas[i].used {
             vma_idx = Some(i);
             break;
         }
@@ -86,7 +88,7 @@ pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
      *      we can delay the allocation until an access occurs.
      */
 
-    task.memory.vmas[vma_idx] = Vma {
+    (*mem).vmas[vma_idx] = Vma {
         base: mmap_base,
         size: aligned_length as u32,
         flags: 3, // PROT_READ | PROT_WRITE
@@ -106,8 +108,7 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     }
 
     let aligned_length = (length + 4095) & !4095;
-    let current_pid = CURRENT_PID;
-    let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+    let task = sched::current().as_mut().unwrap();
 
     let mut target_vma_idx = None;
     for i in 0..MAX_VMAS {
@@ -132,7 +133,7 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     let num_pages = aligned_length / 4096;
     for i in 0..num_pages {
         let vaddr = addr + (i * 4096);
-        if let Some(phys_frame) = paging::get_physical_address(vaddr) {
+        if let Some(phys_frame) = paging::virt_to_phys(vaddr) {
             if let Err(e) = paging::free_physical_page(phys_frame) {
                 pr_warn!("Failed to free physical page: {:?}\n", e);
                 (*regs).set_return_error(e);

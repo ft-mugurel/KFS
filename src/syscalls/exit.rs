@@ -1,15 +1,12 @@
 use crate::error::{KResultExt, KernelError};
 use crate::fs::{VfsNodeType, OPEN_FILE_TABLE};
-use crate::sched::{
-    ContextFrame, ProcessState, CURRENT_PID, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE,
-};
+use crate::sched::{ContextFrame, ProcessState, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE};
 use crate::{ipc, sched};
 use crate::{paging, pr_info};
 
 pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
     let exit_code = (*regs).arg1();
-    let current_pid = CURRENT_PID;
-    let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+    let task = sched::current().as_mut().unwrap();
 
     task.state = ProcessState::Zombie;
     task.exit_code = Some(exit_code);
@@ -38,11 +35,12 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
     }
 
     // Reparent orphans to PID 1
-    let init_task = PROCESS_TABLE[1].as_mut().unwrap();
+    let mut table = PROCESS_TABLE.lock();
+    let mut init_task = table.as_mut_slice()[1].unwrap();
     for i in 0..task.family.child_count {
         let orphan_pid = task.family.children[i];
 
-        if let Some(ref mut orphan) = PROCESS_TABLE[orphan_pid as usize] {
+        if let Some(ref mut orphan) = table[orphan_pid as usize] {
             orphan.family.parent_pid = 1;
         }
 
@@ -55,7 +53,7 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
 
     // Wake the parent if it is blocked in waitpid()
     let parent_pid = task.family.parent_pid as usize;
-    if let Some(ref mut parent) = PROCESS_TABLE[parent_pid] {
+    if let Some(ref mut parent) = table[parent_pid] {
         if parent.state == ProcessState::Waiting {
             parent.state = ProcessState::Ready;
         }
@@ -63,14 +61,14 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
 
     // DO NOT touch CR3 or free memory here.
     // Memory is preserved until the parent calls waitpid().
-    let curr_esp = PROCESS_TABLE[current_pid].as_ref().unwrap().context.esp;
+    let curr_esp = task.context.esp;
 
     sched::schedule(curr_esp)
 }
 
 pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
-    let parent_pid = CURRENT_PID;
-    let parent_task = PROCESS_TABLE[parent_pid].as_mut().unwrap();
+    let parent_task = sched::current().as_mut().unwrap();
+    let parent_pid = parent_task.pid as usize;
 
     if parent_task.family.child_count == 0 {
         (*regs).set_return_error(KernelError::ECHILD);
@@ -80,14 +78,15 @@ pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
     for i in 0..parent_task.family.child_count {
         let child_pid = parent_task.family.children[i] as usize;
 
-        if let Some(ref mut child) = PROCESS_TABLE[child_pid] {
+        let mut table = PROCESS_TABLE.lock();
+        if let Some(ref mut child) = table[child_pid] {
             if child.state == ProcessState::Zombie {
                 let reaped_pid = child.pid;
 
                 let old_cr3 = child.context.cr3;
                 let k_stack_bottom = child.kernel_stack_bottom;
 
-                PROCESS_TABLE[child_pid] = None;
+                table[child_pid] = None;
 
                 let last_idx = parent_task.family.child_count - 1;
                 parent_task.family.children[i] = parent_task.family.children[last_idx];
