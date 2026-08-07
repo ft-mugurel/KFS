@@ -2,6 +2,7 @@ mod syscalls;
 
 mod open;
 mod exit;
+mod fs;
 mod fork;
 mod mem;
 mod read_write;

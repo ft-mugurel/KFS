@@ -1,8 +1,11 @@
-use super::init::{KERNEL_SPACE_START, USER_SPACE_START};
-use super::physical;
-use super::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-use crate::error::{KResult, KResultExt, KernelError};
-use crate::{pr_debug, pr_warn, x86};
+use super::{
+    physical, KERNEL_SPACE_START, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, USER_SPACE_START,
+};
+
+use crate::{
+    error::{KResult, KResultExt, KernelError},
+    pr_debug, pr_warn, x86,
+};
 
 const ENTRIES_PER_TABLE: usize = 1024;
 const PAGE_SIZE_4K: u32 = 0x1000;
@@ -26,7 +29,7 @@ pub fn phys_to_virt(phys: u32) -> *mut u32 {
     (phys + KERNEL_SPACE_START as u32) as *mut u32
 }
 
-pub unsafe fn get_physical_address(vaddr: u32) -> Option<u32> {
+pub unsafe fn virt_to_phys(vaddr: u32) -> Option<u32> {
     let pd_phys = x86::read_cr3();
     let pd_virt = phys_to_virt(pd_phys) as *const u32;
 
@@ -67,8 +70,9 @@ pub fn mark_paging_initialized() {
     }
 }
 
-fn kernel_pd_index() -> usize {
-    (KERNEL_SPACE_START >> 22) as usize
+#[inline]
+const fn kernel_pd_index() -> usize {
+    KERNEL_SPACE_START >> 22
 }
 
 #[inline]
@@ -171,33 +175,29 @@ fn lookup_page_entry_ptr(virt_addr: u32) -> Option<*mut u32> {
     }
 }
 
-fn install_boot_mappings() {
-    let pd_ptr = (unsafe { &raw mut BOOT_PAGE_DIRECTORY.0 }) as *mut u32;
-    let low_table_phys = (unsafe { &raw const BOOT_LOW_TABLE.0 }) as *const u32 as u32;
-    let kernel_table_phys = (unsafe { &raw const BOOT_KERNEL_TABLE.0 }) as *const u32 as u32;
+#[unsafe(no_mangle)]
+unsafe fn install_boot_mappings() {
+    let pd_ptr = (&raw mut BOOT_PAGE_DIRECTORY.0) as *mut u32;
+    let low_table_phys = (&raw const BOOT_LOW_TABLE.0) as *const u32 as u32;
+    let kernel_table_phys = (&raw const BOOT_KERNEL_TABLE.0) as *const u32 as u32;
 
     // Identity map first 4 MiB so current execution continues after PG=1.
-    unsafe { pd_ptr.add(0).write(low_table_phys | TABLE_FLAGS) };
+    pd_ptr.add(0).write(low_table_phys | TABLE_FLAGS);
 
     // Map kernel higher-half base (3 GiB) to the same low 4 MiB for early transition.
-    unsafe {
-        pd_ptr
-            .add(kernel_pd_index())
-            .write(kernel_table_phys | TABLE_FLAGS)
-    };
+    pd_ptr
+        .add(kernel_pd_index())
+        .write(kernel_table_phys | TABLE_FLAGS)
 }
 
-pub fn enable_bootstrap_paging() {
-    unsafe {
-        clear_page_directory();
-        fill_identity_low_table();
-        fill_kernel_low_alias_table();
-        install_boot_mappings();
+pub unsafe fn enable_bootstrap_paging() {
+    clear_page_directory();
+    fill_identity_low_table();
+    fill_kernel_low_alias_table();
+    install_boot_mappings();
 
-        let pd_phys = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32 as u32;
-        x86::write_cr3(pd_phys);
-        pr_debug!("Bootstrap paging tables loaded: cr3={:#x}\n", pd_phys);
-    }
+    let pd_phys = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32 as u32;
+    x86::write_cr3(pd_phys);
 
     x86::enable_paging();
     pr_debug!("CR0.PG set: paging is enabled\n");
@@ -205,19 +205,6 @@ pub fn enable_bootstrap_paging() {
 
 pub fn bootstrap_directory_phys_addr() -> u32 {
     unsafe { (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32 as u32 }
-}
-
-pub fn map_page_bootstrap(virt_addr: u32, phys_addr: u32, flags: u32) -> KResult<()> {
-    let pde = pde_index(virt_addr);
-    if pde != 0 && pde != kernel_pd_index() {
-        pr_warn!(
-            "map_page_bootstrap rejected unsupported pde={} va={:#x}\n",
-            pde,
-            virt_addr
-        );
-        return Err(KernelError::EOPNOTSUPP);
-    }
-    map_page(virt_addr, phys_addr, flags)
 }
 
 pub fn map_page(virt_addr: u32, phys_addr: u32, flags: u32) -> KResult<()> {
@@ -254,15 +241,6 @@ pub fn map_zero_page(virt_addr: u32, flags: u32) -> KResult<()> {
         core::ptr::write_bytes(phys_to_virt(phys_frame) as *mut u8, 0, 4096);
     }
     map_page(virt_addr, phys_frame, flags)
-}
-
-pub fn get_page_bootstrap(virt_addr: u32) -> Option<u32> {
-    let pde = pde_index(virt_addr);
-    if pde != 0 && pde != kernel_pd_index() {
-        return None;
-    }
-
-    get_page(virt_addr)
 }
 
 pub fn get_page(virt_addr: u32) -> Option<u32> {

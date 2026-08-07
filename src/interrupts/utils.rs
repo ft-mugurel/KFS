@@ -1,27 +1,6 @@
-use crate::{
-    sched::schedule_task,
-    x86::{outb, outw},
-};
-use core::arch::asm;
+use crate::x86::{outb, outw};
 
 use crate::startup_config::power;
-
-fn execute_shutdown() {
-    outw(power::QEMU_SHUTDOWN_PORT, power::QEMU_SHUTDOWN_VALUE); // QEMU
-    outw(power::BOCHS_SHUTDOWN_PORT, power::BOCHS_SHUTDOWN_VALUE); // Bochs
-    outw(
-        power::VIRTUALBOX_SHUTDOWN_PORT,
-        power::VIRTUALBOX_SHUTDOWN_VALUE,
-    ); // VirtualBox
-
-    loop {
-        unsafe { asm!("hlt") };
-    }
-}
-
-pub(crate) fn request_shutdown() {
-    schedule_task(execute_shutdown);
-}
 
 pub(crate) fn request_reboot() {
     outb(
@@ -30,4 +9,6 @@ pub(crate) fn request_reboot() {
     );
     outb(power::PCI_RESET_PORT, power::PCI_RESET_VALUE);
     outw(power::QEMU_SHUTDOWN_PORT, power::QEMU_SHUTDOWN_VALUE);
+    outw(power::BOCHS_SHUTDOWN_PORT, power::BOCHS_SHUTDOWN_VALUE);
+    outw(power::VBOX_SHUTDOWN_PORT, power::VBOX_SHUTDOWN_VALUE);
 }

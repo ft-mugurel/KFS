@@ -159,6 +159,58 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fm
     }
 }
 
+#[allow(dead_code)]
+pub fn dump_physical_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
+    let end_addr = match (start_addr as usize).checked_add(len) {
+        Some(v) if v <= u32::MAX as usize => v as u32,
+        _ => {
+            emit(&format_args!("address range overflow\n"));
+            return;
+        }
+    };
+
+    emit(&format_args!(
+        "memdump: [{:#010x}, {:#010x}) len={}\n",
+        start_addr, end_addr, len
+    ));
+
+    let mut offset = 0usize;
+    while offset < len {
+        let line_addr = start_addr.wrapping_add(offset as u32);
+        emit(&format_args!("{:#010x}: ", line_addr));
+
+        let mut ascii = [b'.'; 16];
+        for i in 0usize..16 {
+            let pos = offset + i;
+            if pos >= len {
+                emit(&format_args!("   "));
+                continue;
+            }
+
+            let byte_addr = start_addr.wrapping_add(pos as u32);
+            let value = unsafe { ptr::read_volatile(byte_addr as *const u8) };
+            emit(&format_args!("{:02x} ", value));
+            ascii[i] = if value.is_ascii_graphic() || value == b' ' {
+                value
+            } else {
+                b'.'
+            };
+        }
+
+        emit(&format_args!(" |"));
+        for i in 0usize..16 {
+            let pos = offset + i;
+            if pos >= len {
+                break;
+            }
+            emit(&format_args!("{}", ascii[i] as char));
+        }
+        emit(&format_args!("|\n"));
+
+        offset = offset.saturating_add(16);
+    }
+}
+
 pub fn run_memtest(features: &str, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
     let mut run_physical = false;
     let mut run_vmem = false;

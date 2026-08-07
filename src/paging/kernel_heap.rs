@@ -1,9 +1,8 @@
-use super::init::{KERNEL_SPACE_START, PAGE_SIZE};
 use super::page_table;
 use super::physical;
-use super::PAGE_WRITABLE;
+use super::{KERNEL_SPACE_START, PAGE_SIZE, PAGE_WRITABLE};
 use crate::error::{KResult, KernelError};
-use crate::{pr_debug, pr_warn};
+use crate::{pr_warn, pr_debug};
 use core::mem::size_of;
 use core::ptr;
 

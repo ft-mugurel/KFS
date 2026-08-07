@@ -23,7 +23,7 @@ pub(crate) fn save_stack_trace() {
             frames: 16,
             print_stack_values: false,
             scan_stack: false,
-            walk_frames: true,
+            walk_frames: false,
         },
         |args| {
             print_fmt_on(DEFAULT_LOG_SCREEN, &args);

@@ -1,8 +1,6 @@
 use crate::{
     error::KernelError,
-    sched::{
-        ContextFrame, CURRENT_PID, MAX_PROCESSES, MAX_SIGNALS, PROCESS_TABLE, SIGNAL_QUEUE_SIZE,
-    },
+    sched::{self, ContextFrame, MAX_PROCESSES, MAX_SIGNALS, PROCESS_TABLE, SIGNAL_QUEUE_SIZE},
 };
 
 pub(super) unsafe fn syscall_kill(regs: *mut ContextFrame) {
@@ -10,7 +8,8 @@ pub(super) unsafe fn syscall_kill(regs: *mut ContextFrame) {
         let target_pid = (*regs).arg1() as usize;
         let sig_num = (*regs).arg2() as u8;
 
-        if target_pid >= MAX_PROCESSES || PROCESS_TABLE[target_pid].is_none() {
+        let mut table = PROCESS_TABLE.lock();
+        if target_pid >= MAX_PROCESSES || table[target_pid].is_none() {
             (*regs).set_return_error(KernelError::ESRCH);
             return;
         }
@@ -20,7 +19,7 @@ pub(super) unsafe fn syscall_kill(regs: *mut ContextFrame) {
             return;
         }
 
-        let target_task = PROCESS_TABLE[target_pid].as_mut().unwrap();
+        let target_task = table[target_pid].as_mut().unwrap();
         let queue = &mut target_task.signals;
 
         let next_head = (queue.head + 1) % SIGNAL_QUEUE_SIZE;
@@ -34,11 +33,14 @@ pub(super) unsafe fn syscall_kill(regs: *mut ContextFrame) {
     }
 }
 
+unsafe fn current_signals() -> *mut sched::SignalQueue {
+    &mut (*sched::current().as_mut().unwrap()).signals
+}
+
 pub(super) unsafe fn syscall_signal(regs: *mut ContextFrame) {
     unsafe {
         let sig_num = (*regs).arg1() as usize;
         let handler_addr = (*regs).arg2(); // The memory address of the user's function
-        let current_pid = CURRENT_PID;
 
         if sig_num >= MAX_SIGNALS {
             (*regs).set_return_error(KernelError::EINVAL);
@@ -46,8 +48,8 @@ pub(super) unsafe fn syscall_signal(regs: *mut ContextFrame) {
         }
 
         // Register the user's function pointer in the task struct
-        let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
-        task.signals.handlers[sig_num] = handler_addr;
+        let signals = current_signals();
+        (*signals).handlers[sig_num] = handler_addr;
 
         (*regs).set_return_value(0);
     }

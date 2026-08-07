@@ -1,6 +1,6 @@
 use crate::error::KernelError;
 use crate::fs::{self, OpenFile, VfsNodeType, MAX_OPEN_FILES, OPEN_FILE_TABLE};
-use crate::sched::{ContextFrame, CURRENT_PID, MAX_FDS_PER_PROCESS, PROCESS_TABLE};
+use crate::sched::{self, ContextFrame, MAX_FDS_PER_PROCESS};
 use crate::{ipc, pr_warn};
 
 const AF_UNIX: u32 = 1;
@@ -17,12 +17,11 @@ pub unsafe fn syscall_socket(regs: *mut ContextFrame) {
         return;
     }
 
-    let current_pid = CURRENT_PID;
-    let task = PROCESS_TABLE[current_pid].as_mut().unwrap();
+    let fd_tbl = &mut sched::current().as_mut().unwrap().fd_tbl;
 
     let mut local_fd = None;
     for i in 3..MAX_FDS_PER_PROCESS {
-        if task.fd_tbl[i].is_none() {
+        if fd_tbl[i].is_none() {
             local_fd = Some(i);
             break;
         }
@@ -30,10 +29,7 @@ pub unsafe fn syscall_socket(regs: *mut ContextFrame) {
     let fd = match local_fd {
         Some(f) => f,
         None => {
-            pr_warn!(
-                "sys_socket: no available file descriptors for process {}\n",
-                current_pid
-            );
+            pr_warn!("sys_socket: no available file descriptors\n");
             (*regs).set_return_error(KernelError::EMFILE);
             return;
         }
@@ -97,6 +93,6 @@ pub unsafe fn syscall_socket(regs: *mut ContextFrame) {
         ref_count: 1,
     });
 
-    task.fd_tbl[fd] = Some(g_fd); // Process local points to VFS global
+    fd_tbl[fd] = Some(g_fd); // Process local points to VFS global
     (*regs).set_return_value(fd as u32);
 }

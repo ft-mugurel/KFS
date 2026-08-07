@@ -5,7 +5,6 @@ use crate::x86::{inb, inw, outb, outw};
 
 const IDE_PORT_BASE: u16 = 0x1F0;
 const IDE_PORT_DATA: u16 = IDE_PORT_BASE + 0;
-const IDE_PORT_ERROR: u16 = IDE_PORT_BASE + 1;
 const IDE_PORT_SECT_COUNT: u16 = IDE_PORT_BASE + 2;
 const IDE_PORT_LBA_LO: u16 = IDE_PORT_BASE + 3;
 const IDE_PORT_LBA_MID: u16 = IDE_PORT_BASE + 4;
@@ -17,9 +16,7 @@ const IDE_PORT_STATUS: u16 = IDE_PORT_BASE + 7;
 // Status Register Flags
 const STATUS_ERR: u8 = 0x01; // Error
 const STATUS_DRQ: u8 = 0x08; // Data Request Ready
-const STATUS_SRV: u8 = 0x10; // Overlapped Mode Service Request
 const STATUS_DF: u8 = 0x20; // Drive Fault Error
-const STATUS_RDY: u8 = 0x40; // Drive Ready
 const STATUS_BSY: u8 = 0x80; // Busy
 
 // ATA Commands
@@ -122,8 +119,14 @@ pub fn write_sectors(lba: u32, sector_count: u8, buffer: &[u8]) -> KResult<()> {
     }
 
     // Force drive cache flush
+    flush_cache()?;
+
+    Ok(())
+}
+
+pub fn flush_cache() -> KResult<()> {
+    wait_busy()?;
     outb(IDE_PORT_COMMAND, CMD_CACHE_FLUSH);
     wait_busy()?;
-
     Ok(())
 }

@@ -59,8 +59,8 @@ pub mod power {
     pub const BOCHS_SHUTDOWN_PORT: u16 = 0xB004;
     pub const BOCHS_SHUTDOWN_VALUE: u16 = 0x2000;
 
-    pub const VIRTUALBOX_SHUTDOWN_PORT: u16 = 0x4004;
-    pub const VIRTUALBOX_SHUTDOWN_VALUE: u16 = 0x3400;
+    pub const VBOX_SHUTDOWN_PORT: u16 = 0x4004;
+    pub const VBOX_SHUTDOWN_VALUE: u16 = 0x3400;
 
     pub const KEYBOARD_CONTROLLER_COMMAND_PORT: u16 = 0x64;
     pub const KEYBOARD_CONTROLLER_REBOOT: u8 = 0xFE;

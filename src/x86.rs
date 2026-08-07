@@ -148,6 +148,7 @@ pub fn read_ebp() -> u32 {
 }
 
 #[inline(always)]
+#[unsafe(no_mangle)]
 pub fn enable_paging() {
     const CR0_PG: u32 = 1 << 31;
     let cr0 = read_cr0();
@@ -198,4 +199,47 @@ pub unsafe fn clean_registers_and_halt() -> ! {
         "jmp 2b",
         options(noreturn, nostack)
     );
+}
+
+#[inline(always)]
+pub fn io_wait() {
+    outb(0x80, 0);
+}
+
+/// Only to be used in early boot code, before the APIC is initialized.
+/// This is a busy wait that takes approximately 1 microsecond.
+pub fn busy_wait_us(microseconds: u32) {
+    for _ in 0..microseconds {
+        io_wait();
+    }
+}
+
+#[inline(always)]
+pub fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+#[inline(always)]
+pub fn wrmsr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }

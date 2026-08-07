@@ -1,13 +1,8 @@
-use crate::sched::schedule_task;
-use crate::pr_warn;
-use crate::spin::Spinlock;
-
-pub const MAX_SIGNALS: usize = 32;
-pub const MAX_SCHEDULED_SIGNALS: usize = 64;
+use crate::{pr_err, sched};
 
 // TODO: Implement bitmasks and blocking.
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Signal {
     SIGHUP = 1,
@@ -119,73 +114,43 @@ impl Signal {
     }
 }
 
-pub type SignalHandler = fn();
-
-#[derive(Copy, Clone)]
-struct ScheduledSignal {
-    active: bool,
-    signal: Signal,
-    ticks_remaining: u64,
+pub unsafe fn register_signal_handler(sig: Signal, handler: u32) {
+    let Some(task) = &mut sched::current().as_mut() else {
+        pr_err!("Failed to register signal handler: no current task\n");
+        return;
+    };
+    let task_sigs = &mut task.signals;
+    task_sigs.handlers[sig as usize] = handler;
 }
 
-struct SignalRegistry {
-    handlers: [Option<SignalHandler>; MAX_SIGNALS],
-}
-
-struct SignalScheduler {
-    pending: [ScheduledSignal; MAX_SCHEDULED_SIGNALS],
-}
-
-static REGISTRY: Spinlock<SignalRegistry> =
-    Spinlock::new(SignalRegistry { handlers: [None; MAX_SIGNALS] });
-
-static SCHEDULER: Spinlock<SignalScheduler> = Spinlock::new(SignalScheduler {
-    pending: [ScheduledSignal {
-        active: false,
-        signal: Signal::SIGHUP,
-        ticks_remaining: 0,
-    }; MAX_SCHEDULED_SIGNALS],
-});
-
-pub fn register_signal_handler(sig: Signal, handler: SignalHandler) {
-    let mut reg = REGISTRY.lock();
-    reg.handlers[sig as usize] = Some(handler);
-}
-
-pub fn send_signal(sig: Signal) {
-    let reg = REGISTRY.lock();
-    if let Some(handler) = reg.handlers[sig as usize] {
-        schedule_task(handler);
-    } else {
-        pr_warn!("Unhandled signal: {}\n", sig as u8);
+pub unsafe fn send_signal(sig: Signal) {
+    let Some(task) = sched::current().as_mut() else {
+        pr_err!("Failed to send signal: no current task\n");
+        return;
+    };
+    let task_sigs = &mut task.signals;
+    let next_tail = (task_sigs.tail + 1) % task_sigs.pending.len();
+    if next_tail != task_sigs.head {
+        task_sigs.pending[task_sigs.tail] = sig as u8;
+        task_sigs.tail = next_tail;
     }
 }
 
-pub fn schedule_signal(sig: Signal, delay_ms: u64) {
-    let mut sched = SCHEDULER.lock();
-    for i in 0..MAX_SCHEDULED_SIGNALS {
-        if !sched.pending[i].active {
-            sched.pending[i] =
-                ScheduledSignal { active: true, signal: sig, ticks_remaining: delay_ms };
-            return;
-        }
-    }
-    pr_warn!("Signal scheduler queue full!\n");
-}
+pub unsafe fn process_scheduled_signals() {
+    let Some(task) = sched::current().as_mut() else {
+        pr_err!("Failed to process scheduled signals: no current task\n");
+        return;
+    };
+    let task_sigs = &mut task.signals;
 
-pub fn process_scheduled_signals() {
-    let mut sched = SCHEDULER.lock();
-    for i in 0..MAX_SCHEDULED_SIGNALS {
-        if sched.pending[i].active {
-            if sched.pending[i].ticks_remaining > 0 {
-                sched.pending[i].ticks_remaining -= 1;
-            }
+    while task_sigs.head != task_sigs.tail {
+        let sig_num = task_sigs.pending[task_sigs.head];
+        let handler_addr = task_sigs.handlers[sig_num as usize];
 
-            if sched.pending[i].ticks_remaining == 0 {
-                // Time is up, send the signal to the task queue
-                send_signal(sched.pending[i].signal);
-                sched.pending[i].active = false;
-            }
+        if handler_addr != 0 {
+            let handler: extern "C" fn(u32) = core::mem::transmute(handler_addr);
+            handler(sig_num as u32);
         }
+        task_sigs.head = (task_sigs.head + 1) % task_sigs.pending.len();
     }
 }
