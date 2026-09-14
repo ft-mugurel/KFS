@@ -58,6 +58,7 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
             parent.state = ProcessState::Ready;
         }
     }
+    drop(table);
 
     // DO NOT touch CR3 or free memory here.
     // Memory is preserved until the parent calls waitpid().
@@ -93,7 +94,11 @@ pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
                 parent_task.family.child_count -= 1;
 
                 paging::free_user_address_space(old_cr3);
-                paging::free_physical_page(k_stack_bottom)
+                let Some(k_stack_phys) = paging::virt_to_phys(k_stack_bottom) else {
+                    crate::pr_err!("Failed to translate reaped child kernel stack\n");
+                    return;
+                };
+                paging::free_physical_page(k_stack_phys)
                     .consume_err("Failed to free kernel stack for reaped child process");
 
                 pr_info!(

@@ -69,7 +69,7 @@ impl ContextFrame {
     }
 }
 
-pub(super) const STACK_CANARY: u32 = 0xDEAD_C0DE;
+pub(crate) const STACK_CANARY: u32 = 0xDEAD_C0DE;
 
 #[repr(C, packed)]
 pub struct ThreadInfo {

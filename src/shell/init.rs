@@ -3,6 +3,7 @@ use core::fmt;
 use core::str;
 
 use crate::{
+    drivers,
     dump::{
         self, DumpStackOptions, DEFAULT_DUMP_WORDS, DEFAULT_TRACE_FRAMES, MAX_DUMP_WORDS,
         MEMDUMP_DEFAULT_LEN, MEMDUMP_MAX_LEN,
@@ -30,9 +31,34 @@ const PROMPT: &str = "mysh > ";
 const MAX_INPUT_LEN: usize = startup_config::shell::MAX_INPUT_LEN;
 const SCREEN_INDEX: usize = startup_config::shell::SCREEN_INDEX;
 const COMMANDS: &[&str] = &[
-    "help", "clear", "echo", "reboot", "shutdown", "screen", "loglevel", "color", "memstat",
-    "memdebug", "memdump", "pte", "memtest", "stack", "crash", "layout", "signal", "spawn", "wait",
-    "kill", "ps", "fs_test", "fs_tree",
+    "help",
+    "clear",
+    "echo",
+    "reboot",
+    "shutdown",
+    "screen",
+    "loglevel",
+    "color",
+    "memstat",
+    "memdebug",
+    "memdump",
+    "pte",
+    "memtest",
+    "stack",
+    "crash",
+    "layout",
+    "signal",
+    "spawn",
+    "wait",
+    "kill",
+    "ps",
+    "fs_test",
+    "fs_tree",
+    "devices",
+    "storage_test",
+    "mkdir",
+    "mount",
+    "umount",
 ];
 
 struct ShellState {
@@ -508,6 +534,11 @@ unsafe fn run_command(line: &str) {
         "fs_test" => command_fs_test(),
         "ps" => command_ps(),
         "fs_tree" => command_fs_tree(),
+        "devices" => command_devices(),
+        "storage_test" => command_storage_test(parts),
+        "mkdir" => command_mkdir(parts),
+        "mount" => command_mount(parts),
+        "umount" => command_umount(parts),
         _ => {
             print("unknown command: ");
             print(command);
@@ -613,6 +644,11 @@ fn command_help(mut parts: str::SplitWhitespace<'_>) {
         "fs_test" => print("fs_test\n  Exercise mknod, mount, umount, open(O_CREAT|O_TRUNC), write, and read.\n"),
         "spawn" => print("spawn\n  Spawn a user process with 'test::most_syscalls_we_have_probably' entry point. Change the code for something else.\n"),
         "fs_tree" => print("fs_tree\n  Print the virtual file system tree starting from the root node.\n"),
+        "devices" => print("devices\n  List registered disks and partitions.\n"),
+        "storage_test" => print("storage_test <device-id>\n  Read and validate a device MBR or EXT2 superblock.\n"),
+        "mkdir" => print("mkdir <path>\n  Create an empty directory.\n"),
+        "mount" => print("mount <device-id> <target>\n  Mount an EXT2 partition at an empty directory.\n"),
+        "umount" => print("umount <target>\n  Unmount a filesystem from a directory.\n"),
         _ => print("Unknown command. Type 'help' for a list of commands.\n"),
     }
 }
@@ -762,6 +798,191 @@ fn command_layout(mut parts: str::SplitWhitespace<'_>) {
 
     keyboard::set_layout(layout);
     print("keyboard layout updated\n");
+}
+
+#[inline(always)]
+fn command_devices() {
+    print("ID  NAME       KIND       PARENT  START     SECTORS\n");
+    for device_id in 0..drivers::MAX_BLOCK_DEVICES {
+        let Some(device) = drivers::device_at(device_id) else {
+            continue;
+        };
+        let name_len = device
+            .name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(device.name.len());
+        let name = core::str::from_utf8(&device.name[..name_len]).unwrap_or("?");
+        let kind = if device.partition {
+            "partition"
+        } else {
+            "disk"
+        };
+        print_fmt(&format_args!(
+            "{:<3} {:<10} {:<10} {:<7} {:<9} {}\n",
+            device_id, name, kind, device.parent, device.start_lba, device.sector_count
+        ));
+    }
+}
+
+#[inline(always)]
+fn command_storage_test(mut parts: str::SplitWhitespace<'_>) {
+    let Some(device_str) = parts.next() else {
+        print("usage: storage_test <device-id>\n");
+        return;
+    };
+    let Some(device_id) = parse_usize(device_str) else {
+        print("invalid device id\n");
+        return;
+    };
+    let Some(device) = drivers::device_at(device_id) else {
+        print("device not found\n");
+        return;
+    };
+
+    let mut buffer = [0u8; 1024];
+    if drivers::read_sectors(device_id, 0, 1, &mut buffer).is_err() {
+        print("device read failed\n");
+        return;
+    }
+
+    if device.partition {
+        if drivers::read_sectors(device_id, 2, 2, &mut buffer).is_err() {
+            print("partition superblock read failed\n");
+            return;
+        }
+        let magic = u16::from_le_bytes([buffer[56], buffer[57]]);
+        print_fmt(&format_args!(
+            "device {} EXT2 magic: {:#06x}\n",
+            device_id, magic
+        ));
+        if magic == 0xEF53 {
+            print("EXT2 superblock valid\n");
+        } else {
+            print("invalid EXT2 superblock\n");
+        }
+    } else if buffer[510] == 0x55 && buffer[511] == 0xAA {
+        print("valid MBR signature\n");
+        for index in 0..4 {
+            let offset = 446 + index * 16;
+            let partition_type = buffer[offset + 4];
+            let start = u32::from_le_bytes([
+                buffer[offset + 8],
+                buffer[offset + 9],
+                buffer[offset + 10],
+                buffer[offset + 11],
+            ]);
+            let sectors = u32::from_le_bytes([
+                buffer[offset + 12],
+                buffer[offset + 13],
+                buffer[offset + 14],
+                buffer[offset + 15],
+            ]);
+            if partition_type != 0 && sectors != 0 {
+                print_fmt(&format_args!(
+                    "partition {}: type {:#04x}, start {}, sectors {}\n",
+                    index + 1,
+                    partition_type,
+                    start,
+                    sectors
+                ));
+            }
+        }
+    } else {
+        print("no valid MBR signature\n");
+    }
+}
+
+#[inline(always)]
+unsafe fn command_mount(mut parts: str::SplitWhitespace<'_>) {
+    let Some(device_str) = parts.next() else {
+        print("usage: mount <device-id> <target>\n");
+        return;
+    };
+    let Some(device_id) = parse_usize(device_str) else {
+        print("invalid device id\n");
+        return;
+    };
+    let Some(target_path) = parts.next() else {
+        print("usage: mount <device-id> <target>\n");
+        return;
+    };
+    let cwd = (*sched::current().as_mut().unwrap()).cwd;
+    let target = match fs::resolve_path(target_path, cwd) {
+        Ok(node) => node,
+        Err(error) => {
+            print_fmt(&format_args!("mount target lookup failed: {:?}\n", error));
+            return;
+        }
+    };
+    match fs::ext2::mount_device_at(device_id, target) {
+        Ok(()) => print("filesystem mounted\n"),
+        Err(error) => print_fmt(&format_args!("mount failed: {:?}\n", error)),
+    }
+}
+
+#[inline(always)]
+unsafe fn command_mkdir(mut parts: str::SplitWhitespace<'_>) {
+    let Some(path) = parts.next() else {
+        print("usage: mkdir <path>\n");
+        return;
+    };
+    if path.is_empty() || path == "/" {
+        print("invalid directory path\n");
+        return;
+    }
+
+    let (parent_path, name) = match path.rsplit_once('/') {
+        Some((parent, name)) => (if parent.is_empty() { "/" } else { parent }, name),
+        None => ("", path),
+    };
+    if name.is_empty() {
+        print("invalid directory path\n");
+        return;
+    }
+
+    let cwd = (*sched::current().as_mut().unwrap()).cwd;
+    let parent = match fs::resolve_path(parent_path, cwd) {
+        Ok(node) => node,
+        Err(error) => {
+            print_fmt(&format_args!("mkdir parent lookup failed: {:?}\n", error));
+            return;
+        }
+    };
+    if (*parent).node_type != fs::VfsNodeType::Directory {
+        print("mkdir parent is not a directory\n");
+        return;
+    }
+
+    match fs::create_child_node(parent, name, fs::VfsNodeType::Directory, 0o755) {
+        Ok(_) => print("directory created\n"),
+        Err(error) => print_fmt(&format_args!("mkdir failed: {:?}\n", error)),
+    }
+}
+
+#[inline(always)]
+unsafe fn command_umount(mut parts: str::SplitWhitespace<'_>) {
+    let Some(target_path) = parts.next() else {
+        print("usage: umount <target>\n");
+        return;
+    };
+    let cwd = (*sched::current().as_mut().unwrap()).cwd;
+    let target = match fs::resolve_path(target_path, cwd) {
+        Ok(node) => node,
+        Err(error) => {
+            print_fmt(&format_args!("unmount target lookup failed: {:?}\n", error));
+            return;
+        }
+    };
+    if target == fs::ROOT_NODE {
+        print("cannot unmount the root filesystem\n");
+        return;
+    }
+    (*target).children = core::ptr::null_mut();
+    match fs::umount_node(target) {
+        Ok(()) => print("filesystem unmounted\n"),
+        Err(error) => print_fmt(&format_args!("unmount failed: {:?}\n", error)),
+    }
 }
 
 #[inline(always)]

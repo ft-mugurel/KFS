@@ -23,7 +23,13 @@ KERNEL_DBG_LIB  = $(TARGET_DIR)/debug/libkernel.a
 ISO_OUT         = $(BUILD_DIR)/kernel.iso
 ISO_FULL_OUT    = $(BUILD_DIR)/kernel-full.iso
 
-ATA_DRIVE_IMG   = $(BUILD_DIR)/ata_drive.img
+ATA_DRIVE_IMG           = $(BUILD_DIR)/ata_drive.img
+ATA_DRIVE_IMG_1         = $(BUILD_DIR)/ata_drive_1.img
+ATA_DRIVE_IMGS          = $(ATA_DRIVE_IMG) $(ATA_DRIVE_IMG_1)
+ATA_DRIVE_SIZE_MB       = 64
+ATA_DRIVE_SECTORS       = $(shell expr $(ATA_DRIVE_SIZE_MB) \* 2048)
+ATA_PARTITION_START     = 2048
+ATA_PARTITION_SECTORS   = $(shell expr $(ATA_DRIVE_SECTORS) - $(ATA_PARTITION_START))
 
 LINKER          = linker/linker.ld
 
@@ -100,13 +106,14 @@ $(BUILD_DIR)/%.o: $(ASM_DIR)/%.asm
 	@$(NASM) -f elf32 $< -o $@
 	@echo -e "$(CYAN)[+] NASM compiled: $<$(RESET)"
 
-$(ATA_DRIVE_IMG):
+$(ATA_DRIVE_IMGS): Makefile
 	@mkdir -p $(BUILD_DIR)
-	@echo -e "$(YELLOW)[~] Creating ATA drive image...$(RESET)"
-	@dd if=/dev/zero of=$(ATA_DRIVE_IMG) bs=1M count=64 status=none
-	@echo -e "$(YELLOW)[~] Formatting ATA drive image with ext2 filesystem...$(RESET)"
-	@mkfs.ext2 -q $(ATA_DRIVE_IMG)
-	@echo -e "$(GREEN)[✓] ATA drive image created: $(ATA_DRIVE_IMG)$(RESET)"
+	@echo -e "$(YELLOW)[~] Creating partitioned ATA drive image: $@...$(RESET)"
+	@dd if=/dev/zero of=$@ bs=1M count=$(ATA_DRIVE_SIZE_MB) status=none
+	@printf 'label: dos\nunit: sectors\n\nstart=$(ATA_PARTITION_START), size=$(ATA_PARTITION_SECTORS), type=83\n' | sfdisk --quiet $@
+	@echo -e "$(YELLOW)[~] Formatting ATA partition with ext2 filesystem...$(RESET)"
+	@mkfs.ext2 -q -E offset=$$(($(ATA_PARTITION_START) * 512)) $@
+	@echo -e "$(GREEN)[✓] ATA drive image created: $@$(RESET)"
 
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC) | $(BUILD_DIR)
 	@echo -e "$(YELLOW)[~] Compiling trampoline.asm...$(RESET)"
@@ -150,24 +157,28 @@ iso-full: build $(ISO_DIR)/boot/grub/grub.cfg
 	@$(GRUB_MKRESCUE) -o $(ISO_FULL_OUT) $(ISO_DIR) --directory=$(GRUB_MODULE_DIR) --modules="multiboot" 2>/dev/null
 	@echo -e "$(BOLD)$(GREEN)[✓] FULL ISO BUILD DONE: $(ISO_FULL_OUT)$(RESET)"
 
-run-iso: iso $(ATA_DRIVE_IMG)
+run-iso: iso $(ATA_DRIVE_IMGS)
 	@$(QEMU_SYSTEM) -m 4G \
 		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
+		-drive file=$(ATA_DRIVE_IMG_1),format=raw,if=ide,index=1,media=disk \
 		-drive format=raw,file=$(ISO_OUT),media=cdrom \
-		-smp 3 \
+		-d int,cpu_reset -no-reboot -no-shutdown \
+		-smp 8 \
 		-boot order=d
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
-run-iso-full: iso-full $(ATA_DRIVE_IMG)
+run-iso-full: iso-full $(ATA_DRIVE_IMGS)
 	@$(QEMU_SYSTEM) -m 4G \
 		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
+		-drive file=$(ATA_DRIVE_IMG_1),format=raw,if=ide,index=1,media=disk \
 		-drive format=raw,file=$(ISO_FULL_OUT),media=cdrom \
 		-boot order=d
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
-run-iso-term: iso $(ATA_DRIVE_IMG)
+run-iso-term: iso $(ATA_DRIVE_IMGS)
 	@$(QEMU_SYSTEM) -m 4G \
 		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
+		-drive file=$(ATA_DRIVE_IMG_1),format=raw,if=ide,index=1,media=disk \
 		-drive format=raw,file=$(ISO_OUT),media=cdrom \
 		-boot order=d -nographic
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"

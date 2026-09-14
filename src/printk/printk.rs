@@ -1,6 +1,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::locks::Spinlock;
 use crate::startup_config;
 use crate::vga::text_mod;
 
@@ -40,6 +41,17 @@ fn is_enabled(level: KernelLogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(Ordering::Relaxed)
 }
 
+static LOCKS: [Spinlock<()>; 8] = [
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+];
+
 pub fn printk_level_to_screen(
     screen_index: usize,
     level: KernelLogLevel,
@@ -48,6 +60,8 @@ pub fn printk_level_to_screen(
     if !is_enabled(level) {
         return;
     }
+    let lock = &LOCKS[screen_index % LOCKS.len()];
+    let _guard = lock.lock();
     text_mod::print_str_on(screen_index, level_tag(level));
     text_mod::print_fmt_on(
         screen_index,
@@ -74,6 +88,5 @@ pub fn printk_to_debug(args: &fmt::Arguments<'_>) {
     } else {
         startup_config::logging::DEFAULT_DEBUG_LOG_SCREEN
     };
-    text_mod::print_str_on(screen_index, level_tag(KernelLogLevel::Debug));
-    text_mod::print_fmt_on(screen_index, args);
+    printk_level_to_screen(screen_index, KernelLogLevel::Debug, args);
 }

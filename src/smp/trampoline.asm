@@ -2,7 +2,7 @@ BITS 16
 ORG 0x8000
 
 %define MAX_CPUS 8
-%define STACK_SIZE 512
+%define STACK_SIZE 4096
 
 trampoline_start:
     cli

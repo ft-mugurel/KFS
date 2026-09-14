@@ -38,6 +38,33 @@ fn read_class_info(bus: u8, device: u8, function: u8) -> (u8, u8, u8) {
     (class_code, subclass, prog_if)
 }
 
+fn read_bar(bus: u8, device: u8, function: u8, index: u8) -> u16 {
+    (read_config_dword(bus, device, function, 0x10 + index * 4) & 0xFFFC) as u16
+}
+
+fn register_ide_drive(io_base: u16, control_base: u16, drive: u8, name_index: u8) -> KResult<bool> {
+    let Some(sector_count) = ide::identify(io_base, control_base, drive) else {
+        return Ok(false);
+    };
+
+    let mut name = [0u8; 32];
+    name[..3].copy_from_slice(b"ide");
+    name[3] = b'0' + name_index;
+    block_device::register_block_device(BlockDevice {
+        name,
+        sector_size: SECTOR_SIZE,
+        parent: 0,
+        start_lba: 0,
+        sector_count,
+        partition: false,
+        io_base,
+        drive,
+        read: ide::read_sectors,
+        write: ide::write_sectors,
+    })?;
+    Ok(true)
+}
+
 pub fn scan_and_register_block_devices() -> KResult<()> {
     let mut ide_count = 0u8;
 
@@ -53,17 +80,37 @@ pub fn scan_and_register_block_devices() -> KResult<()> {
                     continue;
                 }
 
-                let mut name = [0u8; 32];
-                name[..3].copy_from_slice(b"ide");
-                name[3] = b'0' + ide_count as u8;
-                block_device::register_block_device(BlockDevice {
-                    name,
-                    sector_size: SECTOR_SIZE,
-                    read: ide::read_sectors,
-                    write: ide::write_sectors,
-                })?;
+                let primary_io = if prog_if & 1 != 0 {
+                    read_bar(bus, device, function, 0)
+                } else {
+                    0x1F0
+                };
+                let primary_control = if prog_if & 1 != 0 {
+                    read_bar(bus, device, function, 1)
+                } else {
+                    0x3F4
+                };
+                let secondary_io = if prog_if & 4 != 0 {
+                    read_bar(bus, device, function, 2)
+                } else {
+                    0x170
+                };
+                let secondary_control = if prog_if & 4 != 0 {
+                    read_bar(bus, device, function, 3)
+                } else {
+                    0x374
+                };
 
-                ide_count += 1;
+                for (io_base, control_base) in [
+                    (primary_io, primary_control),
+                    (secondary_io, secondary_control),
+                ] {
+                    for drive in [0xA0, 0xB0] {
+                        if register_ide_drive(io_base, control_base, drive, ide_count)? {
+                            ide_count += 1;
+                        }
+                    }
+                }
 
                 pr_info!(
                     "PCI: IDE controller {:02x}:{:02x}.{:x} discovered (prog_if={:02x})\n",
@@ -77,14 +124,13 @@ pub fn scan_and_register_block_devices() -> KResult<()> {
     }
 
     if ide_count == 0 {
-        let mut name = [0u8; 32];
-        name[..4].copy_from_slice(b"ide0");
-        block_device::register_block_device(BlockDevice {
-            name,
-            sector_size: SECTOR_SIZE,
-            read: ide::read_sectors,
-            write: ide::write_sectors,
-        })?;
+        for (io_base, control_base) in [(0x1F0, 0x3F4), (0x170, 0x374)] {
+            for drive in [0xA0, 0xB0] {
+                if register_ide_drive(io_base, control_base, drive, ide_count)? {
+                    ide_count += 1;
+                }
+            }
+        }
         pr_info!("PCI: no IDE controller discovered, falling back to legacy IDE ports\n");
     }
 

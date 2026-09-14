@@ -204,8 +204,8 @@ unsafe fn allocate_zeroed_block(mount: &Ext2Mount) -> KResult<u32> {
         mount,
         new_block,
         &zero_buf[..(mount.sb.block_size() as usize)],
-    )
-    .expect("Ext2: Failed to zero new block");
+    )?;
+    pr_err!("Ext2: Failed to zero new block");
 
     Ok(new_block)
 }
@@ -496,6 +496,19 @@ unsafe fn parse_directory_block(
 // TODO: safeguard all `.unwrap()` calls with rollback in case of failure
 #[unsafe(no_mangle)]
 pub unsafe fn mount_device(device_id: BlockDeviceId) -> KResult<()> {
+    mount_device_at(device_id, core::ptr::null_mut())
+}
+
+pub unsafe fn mount_device_at(device_id: BlockDeviceId, target: *mut VfsNode) -> KResult<()> {
+    if !target.is_null() {
+        if (*target).node_type != VfsNodeType::Directory {
+            return Err(KernelError::ENOTDIR);
+        }
+        if !(*target).children.is_null() {
+            return Err(KernelError::EBUSY);
+        }
+    }
+
     pr_info!("Mounting EXT2 filesystem on device {}\n", device_id);
     let mut buffer = [0u8; 1024];
     let Ok(()) = drivers::read_sectors(device_id, 2, 2, &mut buffer) else {
@@ -577,7 +590,9 @@ pub unsafe fn mount_device(device_id: BlockDeviceId) -> KResult<()> {
     (*root_vfs).links = root_inode.i_links_count as u32;
     (*root_vfs).rights = root_inode.i_mode & 0x0FFF;
     (*root_vfs).mount = mount_wrapper;
-    vfs::ROOT_NODE = root_vfs;
+    if target.is_null() {
+        vfs::ROOT_NODE = root_vfs;
+    }
     let dir_block_num = root_inode.i_block[0];
     let dir_lba = dir_block_num * (mount.sb.block_size() / 512);
     let mut dir_buffer: [u8; 4096] = [0; 4096];
@@ -596,6 +611,16 @@ pub unsafe fn mount_device(device_id: BlockDeviceId) -> KResult<()> {
         root_vfs,
         root_vfs,
     );
+
+    if !target.is_null() {
+        (*target).children = (*root_vfs).children;
+        let mut child = (*target).children;
+        while !child.is_null() {
+            (*child).father = target;
+            child = (*child).next_of_kin;
+        }
+        vfs::mount_node(target, root_vfs)?;
+    }
 
     let dev_dir = vfs::alloc_vfs_node().unwrap();
     (*dev_dir).name[0] = b'd';

@@ -14,7 +14,9 @@ static mut VFS_NODE_COUNT: usize = 0;
 
 impl VfsNode {
     pub unsafe fn read(&self, buffer: &mut [u8], offset: u32) -> KResult<usize> {
-        // TODO: Other types will be supported too
+        if self.node_type == VfsNodeType::CharDevice {
+            return crate::tty::read(self.inode as usize, buffer);
+        }
         if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
             pr_warn!("VFS: Attempted to read from a non-file node\n");
             return Err(KernelError::EINVAL);
@@ -27,6 +29,9 @@ impl VfsNode {
     }
 
     pub unsafe fn write(&mut self, buffer: &[u8], offset: u32) -> KResult<usize> {
+        if self.node_type == VfsNodeType::CharDevice {
+            return crate::tty::write(self.inode as usize, buffer);
+        }
         if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
             pr_warn!("VFS: Attempted to write to a non-file node\n");
             return Err(KernelError::EINVAL);

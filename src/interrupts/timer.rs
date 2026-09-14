@@ -1,10 +1,11 @@
-use crate::interrupts::idt::register_interrupt_handler;
-use crate::interrupts::pit::init_pit;
-use crate::{pr_debug};
-use crate::sched::{schedule};
-use crate::signals::process_scheduled_signals;
-use crate::startup_config::{pic, power::CONFIG_HZ};
-use crate::x86::outb;
+use crate::{
+    interrupts::{idt::register_interrupt_handler, pit::init_pit},
+    pr_debug,
+    sched::schedule,
+    signals::process_scheduled_signals,
+    startup_config::{pic, power::CONFIG_HZ},
+    x86::outb,
+};
 
 static mut TICKS: u64 = 0;
 static mut INITIAL_TSC: u64 = 0;
@@ -16,9 +17,7 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
-    unsafe {
-        TICKS = TICKS.wrapping_add(1);
-    }
+    TICKS = TICKS.wrapping_add(1);
 
     process_scheduled_signals();
 
@@ -35,8 +34,7 @@ pub fn init_timer() {
 }
 
 pub fn get_ticks() -> u64 {
-    let ticks = unsafe { TICKS };
-    ticks
+    unsafe { TICKS }
 }
 
 pub fn get_tsc_delta() -> u64 {

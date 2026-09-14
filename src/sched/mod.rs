@@ -130,10 +130,18 @@ pub(crate) fn reserve_process_slot() -> Option<usize> {
 
 pub(crate) use process::create_user_process;
 pub(crate) use scheduler::{idle_stack_top, init_scheduler_for_cpu, schedule};
-pub(crate) use thread_info::{current, current_pid, ContextFrame};
+pub(crate) use thread_info::{
+    current, current_cpu, current_pid, ContextFrame, ThreadInfo, STACK_CANARY,
+};
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn idle_loop() -> ! {
+    if let Err(error) = crate::tty::bind_stdio() {
+        crate::pr_err!(
+            "Failed to bind standard terminal descriptors: {:?}\n",
+            error
+        );
+    }
     x86::enable_interrupts();
     loop {
         x86::hlt();
