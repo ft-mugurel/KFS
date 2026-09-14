@@ -56,6 +56,8 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let child_frame_ptr =
         (child_kstack_top - core::mem::size_of::<ContextFrame>() as u32) as *mut ContextFrame;
 
+    core::ptr::copy_nonoverlapping(regs, child_frame_ptr, 1);
+
     let cf_eip = (*child_frame_ptr).eip;
     let cf_cs = (*child_frame_ptr).cs;
     let cf_eflags = (*child_frame_ptr).eflags;
@@ -70,9 +72,14 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
         cf_user_ss
     );
 
-    core::ptr::copy_nonoverlapping(regs, child_frame_ptr, 1);
-
     (*child_frame_ptr).eax = 0;
+
+    let thread_info = child_kstack_bottom as *mut sched::ThreadInfo;
+    (*thread_info).task_pid = child_pid as u32;
+    (*thread_info).cpu_id = sched::current_cpu();
+    (*thread_info).preempt_count = 0;
+    (*thread_info).flags = 0;
+    (*thread_info).canary = sched::STACK_CANARY;
 
     let mut child_task: sched::TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
     child_task.pid = child_pid as u32;

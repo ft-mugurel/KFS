@@ -55,9 +55,9 @@ static mut SYSCALL_ENTRIES: [Option<SyscallEntry>; MAX_SYSCALL_NUMBER] = {
     table[4] = Some(SyscallEntry::Normal(syscall_write)); // write(fd, buf, len)
     table[5] = Some(SyscallEntry::Normal(syscall_open)); // open(path, flags)
     table[6] = Some(SyscallEntry::Normal(syscall_close)); // close(fd)
-    table[8] = Some(SyscallEntry::Normal(syscall_mknod)); // mknod(path, mode)
-    table[9] = Some(SyscallEntry::Normal(syscall_mount)); // mount(source, target)
-    table[10] = Some(SyscallEntry::Normal(syscall_umount)); // umount(target)
+    table[14] = Some(SyscallEntry::Normal(syscall_mknod)); // mknod(path, mode)
+    table[21] = Some(SyscallEntry::Normal(syscall_mount)); // mount(source, target, fstype, flags, data)
+    table[52] = Some(SyscallEntry::Normal(syscall_umount)); // umount(target)
 
     // System info
     table[24] = Some(SyscallEntry::Normal(syscall_getuid)); // getuid()

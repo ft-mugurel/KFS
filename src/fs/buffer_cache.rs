@@ -41,7 +41,7 @@ unsafe fn flush_buffer(bh: &mut BufferHead) -> KResult<()> {
     let sectors_per_block = (BUFFER_SIZE / SECTOR_SIZE) as u8;
     let lba = bh.block_num * (sectors_per_block as u32);
 
-    (device.write)(lba, sectors_per_block, &bh.data)?;
+    (device.write)(&device, lba, sectors_per_block, &bh.data)?;
     bh.is_dirty = false;
     Ok(())
 }
@@ -90,7 +90,7 @@ pub unsafe fn bread(device_id: u32, block_num: u32) -> KResult<&'static mut Buff
     let sectors_per_block = (BUFFER_SIZE / SECTOR_SIZE) as u8;
     let lba = block_num * (sectors_per_block as u32);
 
-    (device.read)(lba, sectors_per_block, &mut bh.data)?;
+    (device.read)(&device, lba, sectors_per_block, &mut bh.data)?;
 
     bh.device_id = device_id;
     bh.block_num = block_num;

@@ -12,7 +12,7 @@ const TRAMPOLINE_LOAD_ADDR: u32 = 0x8000;
 static TRAMPOLINE_BLOB: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/build/trampoline.bin"));
 const PAGE_SIZE: usize = 0x1000;
-const TR_STACK_SIZE: usize = 512; // must match STACK_SIZE in trampoline.asm
+const TR_STACK_SIZE: usize = 4096; // must match STACK_SIZE in trampoline.asm
 const TR_TMP_STACK_OFF: usize = TR_AP_ENTRY_OFF + 4; // stack array starts right after tr_ap_entry_addr
 const TR_DATA_BASE: usize = 0x100; // must match `TIMES 0x100 - ...` in trampoline.asm
 const TR_GDT_PTR_OFF: usize = TR_DATA_BASE; // dw+dd = 6 bytes
@@ -31,6 +31,8 @@ pub unsafe extern "C" fn ap_entry(cpu_id: u32) -> ! {
 
     AP_BOOTED_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
+    lapic::calibrate();
+    lapic::start_periodic_timer(10);
     let idle_esp = sched::idle_stack_top(cpu_id);
     sched::switch_to_idle_stack(idle_esp);
 }

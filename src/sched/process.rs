@@ -28,7 +28,7 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
             return false;
         }
     };
-    let k_stack_bottom = k_stack_frame;
+    let k_stack_bottom = paging::phys_to_virt(k_stack_frame) as u32;
     let k_stack_top = k_stack_bottom + 4096;
 
     let frame_ptr = (k_stack_top - size_of::<ContextFrame>() as u32) as *mut ContextFrame;
@@ -120,6 +120,14 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
 
     new_task.kernel_stack_top = k_stack_top;
     new_task.kernel_stack_bottom = k_stack_bottom;
+
+    let parent_task = super::current().as_ref().unwrap();
+    new_task.fd_tbl = parent_task.fd_tbl;
+    for global_fd in new_task.fd_tbl.iter().flatten() {
+        if let Some(open_file) = &mut crate::fs::OPEN_FILE_TABLE[*global_fd] {
+            open_file.ref_count += 1;
+        }
+    }
 
     let mut locked_process_table = PROCESS_TABLE.lock();
     locked_process_table[pid] = Some(new_task);

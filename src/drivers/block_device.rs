@@ -1,21 +1,29 @@
 use crate::error::{KResult, KernelError};
-use crate::pr_info;
 use crate::locks::Spinlock;
+use crate::pr_info;
 
-pub type BlockReadFn = fn(lba: u32, sector_count: u8, buffer: &mut [u8]) -> KResult<()>;
-pub type BlockWriteFn = fn(lba: u32, sector_count: u8, buffer: &[u8]) -> KResult<()>;
+pub type BlockReadFn =
+    fn(device: &BlockDevice, lba: u32, sector_count: u8, buffer: &mut [u8]) -> KResult<()>;
+pub type BlockWriteFn =
+    fn(device: &BlockDevice, lba: u32, sector_count: u8, buffer: &[u8]) -> KResult<()>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockDevice {
     pub name: [u8; 32],
     pub sector_size: usize,
+    pub parent: BlockDeviceId,
+    pub start_lba: u32,
+    pub sector_count: u32,
+    pub partition: bool,
+    pub io_base: u16,
+    pub drive: u8,
     pub read: BlockReadFn,
     pub write: BlockWriteFn,
 }
 
 pub type BlockDeviceId = usize;
 
-const MAX_BLOCK_DEVICES: usize = 16;
+pub const MAX_BLOCK_DEVICES: usize = 16;
 
 static BLOCK_DEVICE_TABLE: Spinlock<[Option<BlockDevice>; MAX_BLOCK_DEVICES]> = {
     const EMPTY: Option<BlockDevice> = None;
@@ -59,7 +67,10 @@ pub fn read_sectors(
     if buffer.len() < required {
         return Err(KernelError::EINVAL);
     }
-    (device.read)(lba, sector_count, buffer)
+    if (lba as u64) + (sector_count as u64) > device.sector_count as u64 {
+        return Err(KernelError::EINVAL);
+    }
+    (device.read)(&device, lba, sector_count, buffer)
 }
 
 pub fn write_sectors(
@@ -73,7 +84,117 @@ pub fn write_sectors(
     if buffer.len() < required {
         return Err(KernelError::EINVAL);
     }
-    (device.write)(lba, sector_count, buffer)
+    if (lba as u64) + (sector_count as u64) > device.sector_count as u64 {
+        return Err(KernelError::EINVAL);
+    }
+    (device.write)(&device, lba, sector_count, buffer)
+}
+
+fn partition_read(
+    device: &BlockDevice,
+    lba: u32,
+    sector_count: u8,
+    buffer: &mut [u8],
+) -> KResult<()> {
+    let end = (lba as u64) + (sector_count as u64);
+    if end > device.sector_count as u64 {
+        return Err(KernelError::EINVAL);
+    }
+    let parent = device_at(device.parent).ok_or(KernelError::ENODEV)?;
+    (parent.read)(
+        &parent,
+        device
+            .start_lba
+            .checked_add(lba)
+            .ok_or(KernelError::EOVERFLOW)?,
+        sector_count,
+        buffer,
+    )
+}
+
+fn partition_write(device: &BlockDevice, lba: u32, sector_count: u8, buffer: &[u8]) -> KResult<()> {
+    let end = (lba as u64) + (sector_count as u64);
+    if end > device.sector_count as u64 {
+        return Err(KernelError::EINVAL);
+    }
+    let parent = device_at(device.parent).ok_or(KernelError::ENODEV)?;
+    (parent.write)(
+        &parent,
+        device
+            .start_lba
+            .checked_add(lba)
+            .ok_or(KernelError::EOVERFLOW)?,
+        sector_count,
+        buffer,
+    )
+}
+
+pub fn discover_mbr_partitions(device_id: BlockDeviceId) -> KResult<usize> {
+    let device = device_at(device_id).ok_or(KernelError::ENODEV)?;
+    let mut sector = [0u8; 512];
+    (device.read)(&device, 0, 1, &mut sector)?;
+
+    if sector[510] != 0x55 || sector[511] != 0xAA {
+        pr_info!("Block device {} has no valid MBR\n", device_id);
+        return Ok(0);
+    }
+
+    let mut found = 0;
+    for index in 0..4 {
+        let offset = 446 + index * 16;
+        let partition_type = sector[offset + 4];
+        let start_lba = u32::from_le_bytes([
+            sector[offset + 8],
+            sector[offset + 9],
+            sector[offset + 10],
+            sector[offset + 11],
+        ]);
+        let sector_count = u32::from_le_bytes([
+            sector[offset + 12],
+            sector[offset + 13],
+            sector[offset + 14],
+            sector[offset + 15],
+        ]);
+
+        if partition_type == 0 || sector_count == 0 {
+            continue;
+        }
+        if start_lba >= device.sector_count || sector_count > device.sector_count - start_lba {
+            pr_info!(
+                "Skipping partition {} on device {}: outside disk capacity\n",
+                index + 1,
+                device_id
+            );
+            continue;
+        }
+
+        let mut name = [0u8; 32];
+        name[..2].copy_from_slice(b"hd");
+        name[2] = b'a' + (device_id as u8);
+        name[3] = b'1' + index as u8;
+        let partition_id = register_block_device(BlockDevice {
+            name,
+            sector_size: device.sector_size,
+            parent: device_id,
+            start_lba,
+            sector_count,
+            partition: true,
+            io_base: 0,
+            drive: 0,
+            read: partition_read,
+            write: partition_write,
+        })?;
+        pr_info!(
+            "Registered partition {}: type {:#x}, start {}, sectors {}\n",
+            partition_id,
+            partition_type,
+            start_lba,
+            sector_count
+        );
+        found += 1;
+    }
+
+    Ok(found)
 }
 
 /* pub unsafe fn read_from_device(device_id: u32, buffer: &mut [u8], offset: u32) -> KResult<usize> {

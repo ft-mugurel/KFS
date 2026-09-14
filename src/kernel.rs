@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use crate::startup_config::pic::{MASK_ENABLE_TIMER_KEYBOARD, MASTER_DATA_PORT};
+
 mod drivers;
 mod dump;
 mod error;
@@ -21,6 +23,7 @@ mod smp;
 mod startup_config;
 mod syscalls;
 mod test;
+mod tty;
 mod utils;
 mod vga;
 mod x86;
@@ -73,7 +76,7 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     interrupts::init_pic();
 
     vga::text_mod::init_virtual_screens();
-
+    interrupts::init_keyboard();
     interrupts::init_timer();
     // --- SMP bring-up ---
     let Some(acpi_info) = acpi::init() else {
@@ -86,11 +89,20 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     // not sure where to put this
     // test::run_memory_tests();
     sched::init_scheduler_for_cpu(0); // BSP = cpu_id 0
+    let cr = sched::current();
+    pr_info!(
+        "Current task struct for CPU 0: {:#X}\n",
+        cr.as_ref().map_or(0, |t| t as *const _ as u32)
+    );
 
     smp::ipi::init_ipi();
     smp::lapic::map_lapic(acpi_info.local_apic_addr);
     smp::lapic::enable_local_apic(0);
-
+    x86::enable_interrupts();
+    smp::lapic::calibrate();
+    x86::disable_interrupts();
+    smp::lapic::start_periodic_timer(10);
+    x86::outb(MASTER_DATA_PORT, MASK_ENABLE_TIMER_KEYBOARD);
     smp::trampoline::install_trampoline();
 
     let bsp_apic_id = smp::lapic::this_cpu_apic_id();
@@ -114,9 +126,15 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     let _ = drivers::init();
     syscalls::init_syscalls();
 
-    let _ = fs::ext2::mount_device(0);
+    if let Some(device_id) = drivers::first_ext2_partition() {
+        let _ = fs::ext2::mount_device(device_id);
+    } else {
+        pr_warn!("No EXT2 partition found for the root filesystem\n");
+    }
+    if let Err(error) = tty::init() {
+        pr_err!("Failed to initialize virtual terminals: {:?}\n", error);
+    }
     test::fs_boot_probe();
-    interrupts::init_keyboard();
     shell::init_shell();
 
     let idle_esp = sched::idle_stack_top(0);
