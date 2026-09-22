@@ -59,6 +59,9 @@ pub struct HeapStats {
     pub used_usable_bytes: usize,
 }
 
+use crate::locks::Spinlock;
+
+static HEAP_LOCK: Spinlock<()> = Spinlock::new(());
 static mut HEAP_READY: bool = false;
 static mut HEAP_CHUNKS: *mut HeapChunk = ptr::null_mut();
 static mut HEAP_FREE_LIST: *mut BlockHeader = ptr::null_mut();
@@ -581,6 +584,7 @@ pub fn kmalloc(size: usize) -> KResult<*mut u8> {
         return Err(KernelError::EINVAL);
     }
 
+    let _guard = HEAP_LOCK.lock();
     ensure_heap_ready();
 
     let payload_size = align_up(size, HEAP_ALIGNMENT).ok_or_else(|| {
@@ -652,6 +656,7 @@ pub fn kfree(ptr: *mut u8) -> KResult<()> {
         return Err(KernelError::EINVAL);
     }
 
+    let _guard = HEAP_LOCK.lock();
     ensure_heap_ready();
 
     unsafe {
@@ -724,6 +729,7 @@ pub fn ksize(ptr: *const u8) -> KResult<usize> {
         return Err(KernelError::EINVAL);
     }
 
+    let _guard = HEAP_LOCK.lock();
     ensure_heap_ready();
 
     unsafe {
@@ -742,6 +748,7 @@ pub fn ksize(ptr: *const u8) -> KResult<usize> {
 }
 
 pub fn debug_stats() -> HeapStats {
+    let _guard = HEAP_LOCK.lock();
     unsafe {
         let ready = HEAP_READY;
         if !ready {
@@ -809,6 +816,58 @@ pub fn debug_stats() -> HeapStats {
             used_block_count,
             used_requested_bytes,
             used_usable_bytes,
+        }
+    }
+}
+
+pub struct HeapBuffer {
+    ptr: *mut u8,
+    size: usize,
+}
+
+impl HeapBuffer {
+    pub fn new(size: usize) -> KResult<Self> {
+        let ptr = kmalloc(size)?;
+        Ok(Self { ptr, size })
+    }
+
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl core::ops::Deref for HeapBuffer {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.size) }
+    }
+}
+
+impl core::ops::DerefMut for HeapBuffer {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+}
+
+impl Drop for HeapBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = kfree(self.ptr);
         }
     }
 }

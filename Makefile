@@ -162,7 +162,8 @@ run-iso: iso $(ATA_DRIVE_IMGS)
 		-drive file=$(ATA_DRIVE_IMG),format=raw,if=ide,index=0,media=disk \
 		-drive file=$(ATA_DRIVE_IMG_1),format=raw,if=ide,index=1,media=disk \
 		-drive format=raw,file=$(ISO_OUT),media=cdrom \
-		-d int,cpu_reset -no-reboot -no-shutdown \
+		-d cpu_reset,guest_errors -no-reboot -no-shutdown \
+		-serial stdio \
 		-smp 8 \
 		-boot order=d
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"

@@ -1,4 +1,4 @@
-use super::TaskStruct;
+use super::{Credentials, TaskStruct};
 use crate::error::KernelError;
 use crate::sched::THREAD_SIZE;
 
@@ -98,15 +98,40 @@ pub unsafe fn current_pid() -> u32 {
     if (*ti).canary != STACK_CANARY {
         return 0;
     }
-    (*ti).task_pid
+    let pid = (*ti).task_pid;
+    if (pid as usize) >= crate::sched::MAX_PROCESSES {
+        return 0;
+    }
+    pid
 }
 
 #[inline(always)]
 pub unsafe fn current() -> *mut TaskStruct {
-    (*current_thread_info()).task
+    let ti = current_thread_info();
+    if (*ti).canary != STACK_CANARY {
+        return core::ptr::null_mut();
+    }
+    (*ti).task
 }
 
 #[inline(always)]
 pub unsafe fn current_cpu() -> u32 {
-    (*current_thread_info()).cpu_id
+    let ti = current_thread_info();
+    if (*ti).canary != STACK_CANARY {
+        return 0;
+    }
+    let cpu = (*ti).cpu_id;
+    if (cpu as usize) >= crate::smp::MAX_CPUS {
+        return 0;
+    }
+    cpu
+}
+
+#[inline(always)]
+pub unsafe fn current_cred() -> *mut Credentials {
+    let task = current();
+    if task.is_null() {
+        return core::ptr::null_mut();
+    }
+    &mut (*task).credentials as *mut Credentials
 }

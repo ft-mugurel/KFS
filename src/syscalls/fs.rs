@@ -2,6 +2,7 @@ use crate::error::KernelError;
 use crate::fs::{self, VfsNodeType};
 use crate::sched::{self, ContextFrame};
 use crate::utils;
+use crate::security::{self, Decision, Operation};
 
 fn parse_parent_path(path: &str) -> Result<(&str, &str), KernelError> {
     if path.is_empty() || path == "/" {
@@ -83,6 +84,16 @@ pub unsafe fn syscall_mknod(regs: *mut ContextFrame) {
         return;
     }
 
+    if security::check(
+        &task.credentials,
+        &security::object_for_node(parent),
+        Operation::Create,
+    ) == Decision::Deny
+    {
+        (*regs).set_return_error(KernelError::EACCES);
+        return;
+    }
+
     if !find_child((*parent).children, name).is_null() {
         (*regs).set_return_error(KernelError::EEXIST);
         return;
@@ -121,6 +132,13 @@ pub unsafe fn syscall_mount(regs: *mut ContextFrame) {
     let source_path = utils::c_str_to_rust(source_ptr);
     let target_path = utils::c_str_to_rust(target_ptr);
     let task = sched::current().as_mut().unwrap();
+
+    if security::check(&task.credentials, &security::SecurityObject::System, Operation::Mount)
+        == Decision::Deny
+    {
+        (*regs).set_return_error(KernelError::EPERM);
+        return;
+    }
 
     let source = match fs::resolve_path(source_path, task.cwd) {
         Ok(node) => node,
@@ -175,6 +193,14 @@ unsafe fn current_cwd() -> *mut fs::VfsNode {
 pub unsafe fn syscall_umount(regs: *mut ContextFrame) {
     let target_ptr = (*regs).arg1() as *const u8;
     let target_path = utils::c_str_to_rust(target_ptr);
+
+    let credentials = &sched::current().as_ref().unwrap().credentials;
+    if security::check(credentials, &security::SecurityObject::System, Operation::Unmount)
+        == Decision::Deny
+    {
+        (*regs).set_return_error(KernelError::EPERM);
+        return;
+    }
 
     let target = match fs::resolve_path(target_path, current_cwd()) {
         Ok(node) => node,

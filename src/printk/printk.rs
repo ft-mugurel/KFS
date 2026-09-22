@@ -57,9 +57,6 @@ pub fn printk_level_to_screen(
     level: KernelLogLevel,
     args: &fmt::Arguments<'_>,
 ) {
-    if !is_enabled(level) {
-        return;
-    }
     let lock = &LOCKS[screen_index % LOCKS.len()];
     let _guard = lock.lock();
     text_mod::print_str_on(screen_index, level_tag(level));

@@ -1,13 +1,14 @@
+use core::sync::atomic::AtomicUsize;
+
 use crate::{
     interrupts::{idt::register_interrupt_handler, pit::init_pit},
     pr_debug,
     sched::schedule,
-    signals::process_scheduled_signals,
     startup_config::{pic, power::CONFIG_HZ},
     x86::outb,
 };
 
-static mut TICKS: u64 = 0;
+static TICKS: AtomicUsize = AtomicUsize::new(0);
 static mut INITIAL_TSC: u64 = 0;
 static mut LAST_TSC: u64 = 0;
 
@@ -17,13 +18,16 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
-    TICKS = TICKS.wrapping_add(1);
-
-    process_scheduled_signals();
+    TICKS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
     outb(pic::MASTER_COMMAND_PORT, pic::EOI);
+    crate::smp::lapic::send_eoi();
 
-    schedule(old_esp)
+    let next_esp = schedule(old_esp);
+    if next_esp != old_esp {
+        crate::pr_info!("[TIMER] Pivot old_esp={:#x} -> next_esp={:#x}\n", old_esp, next_esp);
+    }
+    next_esp
 }
 
 pub fn init_timer() {
@@ -33,8 +37,8 @@ pub fn init_timer() {
     unsafe { INITIAL_TSC = get_tsc_delta() };
 }
 
-pub fn get_ticks() -> u64 {
-    unsafe { TICKS }
+pub fn get_ticks() -> usize {
+    TICKS.load(core::sync::atomic::Ordering::SeqCst)
 }
 
 pub fn get_tsc_delta() -> u64 {

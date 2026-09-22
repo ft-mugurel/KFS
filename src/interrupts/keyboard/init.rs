@@ -5,7 +5,7 @@ use crate::interrupts::keyboard::{
 };
 use crate::locks::Spinlock;
 use crate::shell::handle_shell_key_event;
-use crate::signals::{send_signal, Signal};
+use crate::signals::Signal;
 use crate::smp::ipi::request_shutdown;
 use crate::startup_config::pic;
 use crate::vga::text_mod::{
@@ -27,6 +27,8 @@ const PIC_EOI: u8 = pic::EOI;
 const KEYBOARD_IRQ_VECTOR: u8 = pic::KEYBOARD_IRQ_VECTOR;
 
 fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
+    crate::security::mix_entropy();
+
     if modifiers.shift() && modifiers.alt() {
         if event.key == KeyCode::LeftShift || event.key == KeyCode::LeftAlt {
             toggle_layout();
@@ -40,7 +42,15 @@ fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
             return;
         }
         KeyCode::C if modifiers.ctrl() => {
-            unsafe { send_signal(Signal::SIGINT) };
+            unsafe {
+                if let Some(task) = crate::sched::current().as_mut() {
+                    if task.pid > 0 {
+                        task.signals.push(Signal::SIGINT as u8);
+                        return;
+                    }
+                }
+                crate::shell::handle_sigint();
+            }
             return;
         }
         KeyCode::F1 => {

@@ -115,12 +115,11 @@ impl Signal {
 }
 
 pub unsafe fn register_signal_handler(sig: Signal, handler: u32) {
-    let Some(task) = &mut sched::current().as_mut() else {
+    let Some(task) = sched::current().as_mut() else {
         pr_err!("Failed to register signal handler: no current task\n");
         return;
     };
-    let task_sigs = &mut task.signals;
-    task_sigs.handlers[sig as usize] = handler;
+    task.signals.set_handler(sig as usize, handler);
 }
 
 pub unsafe fn send_signal(sig: Signal) {
@@ -128,29 +127,5 @@ pub unsafe fn send_signal(sig: Signal) {
         pr_err!("Failed to send signal: no current task\n");
         return;
     };
-    let task_sigs = &mut task.signals;
-    let next_tail = (task_sigs.tail + 1) % task_sigs.pending.len();
-    if next_tail != task_sigs.head {
-        task_sigs.pending[task_sigs.tail] = sig as u8;
-        task_sigs.tail = next_tail;
-    }
-}
-
-pub unsafe fn process_scheduled_signals() {
-    let Some(task) = sched::current().as_mut() else {
-        pr_err!("Failed to process scheduled signals: no current task\n");
-        return;
-    };
-    let task_sigs = &mut task.signals;
-
-    while task_sigs.head != task_sigs.tail {
-        let sig_num = task_sigs.pending[task_sigs.head];
-        let handler_addr = task_sigs.handlers[sig_num as usize];
-
-        if handler_addr != 0 {
-            let handler: extern "C" fn(u32) = core::mem::transmute(handler_addr);
-            handler(sig_num as u32);
-        }
-        task_sigs.head = (task_sigs.head + 1) % task_sigs.pending.len();
-    }
+    task.signals.push(sig as u8);
 }

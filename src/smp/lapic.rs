@@ -1,10 +1,7 @@
-use x86::current;
-
 use crate::{
     error::KResultExt,
     interrupts::timer,
     paging::{self, PAGE_PCD, PAGE_PRESENT, PAGE_WRITABLE},
-    pr_debug,
     startup_config::power::CONFIG_HZ,
     x86::{rdmsr, wrmsr},
 };
@@ -60,14 +57,7 @@ pub unsafe fn calibrate() {
     reg_write(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
 
     let start_pit_tick = timer::get_ticks();
-    let mut current_tick = timer::get_ticks();
-    while current_tick < start_pit_tick + 10 {
-        pr_debug!(
-            "calibrating LAPIC: waiting for PIT ticks, current tick: {}\n",
-            current_tick
-        );
-        current_tick = timer::get_ticks();
-    }
+    while timer::get_ticks() < start_pit_tick + 10 {}
 
     let elapsed_lapic = 0xFFFF_FFFFu32 - reg_read(REG_TIMER_CURRENT_COUNT);
     let ms_elapsed = (10 * 1000) / CONFIG_HZ; // however you expose the configured PIT rate
@@ -141,7 +131,9 @@ pub unsafe fn send_sipi(apic_id: u8, vector: u8) {
 }
 
 pub unsafe fn send_eoi() {
-    lapic_write(REG_EOI, 0);
+    if LAPIC_BASE.load(Ordering::Relaxed) != 0 {
+        lapic_write(REG_EOI, 0);
+    }
 }
 
 pub unsafe fn send_ipi_all_excluding_self(vector: u8) {

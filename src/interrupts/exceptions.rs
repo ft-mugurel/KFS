@@ -75,6 +75,7 @@ unsafe extern "C" {
     fn isr_exception_29();
     fn isr_exception_30();
     fn isr_exception_31();
+    fn restore_context_and_iret(new_esp: u32) -> !;
 }
 
 #[inline(always)]
@@ -93,11 +94,18 @@ pub struct ExceptionStackFrame {
     pub edx: u32,
     pub ecx: u32,
     pub eax: u32,
-    pub interrupt_number: u32,
+
+    pub gs: u32,
+    pub fs: u32,
+    pub es: u32,
+    pub ds: u32,
+
     pub error_code: u32,
     pub eip: u32,
     pub cs: u32,
     pub eflags: u32,
+    pub user_esp: u32,
+    pub user_ss: u32,
 }
 
 #[unsafe(no_mangle)]
@@ -108,6 +116,17 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         .copied()
         .unwrap_or("Unknown Exception");
     let frame = &*regs;
+    let fault_cr2 = if vector == 14 { x86::read_cr2() } else { 0 };
+    pr_emerg!(
+        "[EXC] Exception #{} ({}) at EIP={:#x}, CS={:#x}, err={:#x}, cr2={:#x}, esp={:#x}\n",
+        vector,
+        name,
+        frame.eip,
+        frame.cs,
+        frame.error_code,
+        fault_cr2,
+        frame.esp
+    );
     let task_opt = sched::current().as_mut();
 
     if (frame.cs & 0x03) == 3 && task_opt.is_none() {
@@ -193,19 +212,8 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         task.state = ProcessState::Zombie;
 
         x86::write_cr3(paging::bootstrap_directory_phys_addr());
-        let next_esp = sched::schedule(frame.esp);
-
-        core::arch::asm!(
-            "mov esp, {}",
-            "popad",
-            "pop gs",
-            "pop fs",
-            "pop es",
-            "pop ds",
-            "iretd",
-            in(reg) next_esp,
-            options(noreturn)
-        );
+        let next_esp = sched::schedule(0);
+        restore_context_and_iret(next_esp);
     }
 
     if idx == 14 || idx == 13 {

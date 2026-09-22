@@ -1,9 +1,5 @@
-// mod mem;
-
 use crate::fs::{self, VfsNodeType};
 use crate::pr_info;
-
-// pub use mem::run_memory_tests;
 
 pub(crate) fn fs_boot_probe() {
     unsafe {

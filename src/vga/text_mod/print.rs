@@ -125,6 +125,20 @@ fn backspace(screen: &mut VirtualScreen) -> Option<(usize, usize)> {
 }
 
 fn write_raw_byte(screen: &mut VirtualScreen, byte: u8) -> WriteOutcome {
+    if byte == b'\n' {
+        for _ in 0..1000 {
+            if (crate::x86::inb(0x3F8 + 5) & 0x20) != 0 {
+                break;
+            }
+        }
+        crate::x86::outb(0x3F8, b'\r');
+    }
+    for _ in 0..1000 {
+        if (crate::x86::inb(0x3F8 + 5) & 0x20) != 0 {
+            break;
+        }
+    }
+    crate::x86::outb(0x3F8, byte);
     match byte {
         b'\n' => {
             let force_full_redraw = newline_with_scroll(screen);

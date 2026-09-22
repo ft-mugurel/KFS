@@ -10,8 +10,20 @@ pub fn alloc_physical_page_below(limit_addr: u64) -> KResult<u32> {
     frame_allocator::alloc_frame_below(limit_addr)
 }
 
+pub fn alloc_contiguous_physical_pages_below(
+    count: usize,
+    align_frames: usize,
+    limit_addr: u64,
+) -> KResult<u32> {
+    frame_allocator::alloc_contiguous_frames_below(count, align_frames, limit_addr)
+}
+
 pub fn free_physical_page(phys_addr: u32) -> KResult<()> {
     frame_allocator::free_frame(phys_addr)
+}
+
+pub fn free_contiguous_physical_pages(phys_addr: u32, count: usize) -> KResult<()> {
+    frame_allocator::free_contiguous_frames(phys_addr, count)
 }
 
 pub fn total_physical_pages() -> usize {

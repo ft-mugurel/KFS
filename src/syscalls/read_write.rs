@@ -1,8 +1,9 @@
 use crate::error::KernelError;
-use crate::fs::{VfsNodeType, OPEN_FILE_TABLE};
+use crate::fs::{self, VfsNodeType};
 use crate::ipc::{self};
 use crate::sched::{self, ContextFrame, MAX_FDS_PER_PROCESS};
 use crate::{pr_debug, pr_warn};
+use crate::security::{self, Decision, Operation};
 
 unsafe fn valid_user_buffer(ptr: u32, len: usize) -> bool {
     if len == 0 {
@@ -64,7 +65,7 @@ pub unsafe fn syscall_read(regs: *mut ContextFrame) {
         }
     };
 
-    let open_file = match &mut OPEN_FILE_TABLE[global_fd] {
+    let open_file = match fs::get_open_file(global_fd) {
         Some(file) => file,
         None => {
             pr_warn!("sys_read: invalid global file descriptor {}\n", global_fd);
@@ -75,11 +76,21 @@ pub unsafe fn syscall_read(regs: *mut ContextFrame) {
 
     let user_buffer = core::slice::from_raw_parts_mut(buf_ptr, count);
     let node = open_file.node;
+    let credentials = &sched::current().as_ref().unwrap().credentials;
     match (*node).node_type {
         VfsNodeType::File | VfsNodeType::BlockDevice | VfsNodeType::CharDevice => {
+            if security::check(
+                credentials,
+                &security::object_for_node(node),
+                Operation::Read,
+            ) == Decision::Deny
+            {
+                (*regs).set_return_error(KernelError::EACCES);
+                return;
+            }
             match (*node).read(user_buffer, open_file.offset) {
                 Ok(read) => {
-                    open_file.offset += read as u32;
+                    fs::update_open_file_offset(global_fd, read as u32);
                     (*regs).set_return_value(read as u32);
                 }
                 Err(e) => {
@@ -140,7 +151,7 @@ pub unsafe fn syscall_write(regs: *mut ContextFrame) {
         }
     };
 
-    let open_file = match &mut OPEN_FILE_TABLE[global_fd] {
+    let open_file = match fs::get_open_file(global_fd) {
         Some(file) => file,
         None => {
             pr_warn!("sys_write: invalid global file descriptor {}\n", global_fd);
@@ -151,12 +162,22 @@ pub unsafe fn syscall_write(regs: *mut ContextFrame) {
 
     let user_buffer = core::slice::from_raw_parts(buf_ptr, count);
     let node = open_file.node;
+    let credentials = &sched::current().as_ref().unwrap().credentials;
 
     match (*node).node_type {
         VfsNodeType::File | VfsNodeType::BlockDevice | VfsNodeType::CharDevice => {
+            if security::check(
+                credentials,
+                &security::object_for_node(node),
+                Operation::Write,
+            ) == Decision::Deny
+            {
+                (*regs).set_return_error(KernelError::EACCES);
+                return;
+            }
             match (*node).write(user_buffer, open_file.offset) {
                 Ok(written) => {
-                    open_file.offset += written as u32;
+                    fs::update_open_file_offset(global_fd, written as u32);
                     (*regs).set_return_value(written as u32);
                 }
                 Err(e) => {

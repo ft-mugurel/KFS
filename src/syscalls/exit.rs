@@ -1,7 +1,7 @@
 use crate::error::{KResultExt, KernelError};
-use crate::fs::{VfsNodeType, OPEN_FILE_TABLE};
+use crate::fs;
 use crate::sched::{ContextFrame, ProcessState, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE};
-use crate::{ipc, sched};
+use crate::sched;
 use crate::{paging, pr_info};
 
 pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
@@ -14,39 +14,25 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
     // VFS Cleanup
     for i in 0..MAX_FDS_PER_PROCESS {
         if let Some(global_fd) = task.fd_tbl[i] {
-            if let Some(open_file) = &mut OPEN_FILE_TABLE[global_fd] {
-                if open_file.ref_count > 0 {
-                    open_file.ref_count -= 1;
-                }
-
-                if open_file.ref_count == 0 {
-                    let node = open_file.node;
-
-                    if (*node).node_type == VfsNodeType::Socket {
-                        let sock_idx = (*node).inode as usize;
-                        ipc::close_socket(sock_idx);
-                    }
-
-                    OPEN_FILE_TABLE[global_fd] = None;
-                }
-            }
+            fs::close_open_file(global_fd);
             task.fd_tbl[i] = None;
         }
     }
 
-    // Reparent orphans to PID 1
+    // Reparent orphans to PID 0 (root/idle process)
     let mut table = PROCESS_TABLE.lock();
-    let mut init_task = table.as_mut_slice()[1].unwrap();
     for i in 0..task.family.child_count {
         let orphan_pid = task.family.children[i];
 
         if let Some(ref mut orphan) = table[orphan_pid as usize] {
-            orphan.family.parent_pid = 1;
+            orphan.family.parent_pid = 0;
         }
 
-        if init_task.family.child_count < MAX_CHILDREN {
-            init_task.family.children[init_task.family.child_count] = orphan_pid;
-            init_task.family.child_count += 1;
+        if let Some(ref mut init_task) = table[0] {
+            if init_task.family.child_count < MAX_CHILDREN {
+                init_task.family.children[init_task.family.child_count] = orphan_pid;
+                init_task.family.child_count += 1;
+            }
         }
     }
     task.family.child_count = 0;
@@ -98,7 +84,8 @@ pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
                     crate::pr_err!("Failed to translate reaped child kernel stack\n");
                     return;
                 };
-                paging::free_physical_page(k_stack_phys)
+                let frames_needed = sched::THREAD_SIZE / paging::PAGE_SIZE;
+                paging::free_contiguous_physical_pages(k_stack_phys, frames_needed)
                     .consume_err("Failed to free kernel stack for reaped child process");
 
                 pr_info!(

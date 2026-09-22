@@ -102,6 +102,7 @@ pub struct Ext2DirEntry {
 const EXT2_ROOT_INODE: u32 = 2;
 
 pub const EXT2_BACKEND: FsBackend = FsBackend {
+    create: create_node,
     read: read_from_inode,
     write: write_to_inode,
     truncate: truncate_inode,
