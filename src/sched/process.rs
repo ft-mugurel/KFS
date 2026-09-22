@@ -1,7 +1,10 @@
 use super::thread_info;
-use super::{ContextFrame, ProcessState, TaskStruct, EMPTY_VMA, MAX_VMAS, PROCESS_TABLE};
+use super::{
+    ContextFrame, Credentials, ProcessState, TaskStruct, EMPTY_VMA, MAX_VMAS, PROCESS_TABLE,
+};
+use crate::error::KResult;
 use crate::gdt::{USER_CODE_SEL, USER_DATA_SEL};
-use crate::{paging, pr_err, pr_info, pr_warn, x86};
+use crate::{paging, pr_err, pr_warn, x86};
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
@@ -10,14 +13,19 @@ const USER_DATA_VADDR: u32 = 0x0804A000;
 const USER_BSS_VADDR: u32 = 0x0804B000;
 const USER_STACK_VADDR: u32 = 0xBFFFF000;
 
-pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -> bool {
+pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -> KResult<usize> {
     let pid = super::reserve_process_slot();
     if pid.is_none() {
         pr_err!("No available PID for new user process\n");
-        return false;
+        return Err(crate::error::KernelError::ENOMEM);
     }
     let pid = pid.unwrap();
-    let k_stack_frame = match paging::alloc_physical_page() {
+    let frames_needed = super::THREAD_SIZE / paging::PAGE_SIZE;
+    let k_stack_frame = match paging::alloc_contiguous_physical_pages_below(
+        frames_needed,
+        frames_needed,
+        paging::PAGE_TABLE_ALLOC_LIMIT,
+    ) {
         Ok(frame) => frame,
         Err(e) => {
             pr_err!(
@@ -25,11 +33,11 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
                 e
             );
             PROCESS_TABLE.lock()[pid] = None; // Free the reserved slot
-            return false;
+            return Err(e);
         }
     };
     let k_stack_bottom = paging::phys_to_virt(k_stack_frame) as u32;
-    let k_stack_top = k_stack_bottom + 4096;
+    let k_stack_top = k_stack_bottom + super::THREAD_SIZE as u32;
 
     let frame_ptr = (k_stack_top - size_of::<ContextFrame>() as u32) as *mut ContextFrame;
     write_bytes(frame_ptr, 0, 1);
@@ -39,8 +47,9 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
         Ok(cr3) => cr3,
         Err(e) => {
             pr_err!("Failed to create address space for user process: {:?}\n", e);
+            let _ = paging::free_contiguous_physical_pages(k_stack_frame, frames_needed);
             PROCESS_TABLE.lock()[pid] = None;
-            return false;
+            return Err(e);
         }
     };
 
@@ -48,18 +57,51 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
 
     x86::write_cr3(new_cr3);
 
-    let code_frame = paging::alloc_physical_page().unwrap();
-    let stack_frame = paging::alloc_physical_page().unwrap();
+    let fail_cleanup = |unmapped_frame: Option<u32>, err: crate::error::KernelError| -> crate::error::KernelError {
+        x86::write_cr3(old_cr3);
+        if let Some(frame) = unmapped_frame {
+            let _ = paging::free_physical_page(frame);
+        }
+        paging::free_user_address_space(new_cr3);
+        let _ = paging::free_contiguous_physical_pages(k_stack_frame, frames_needed);
+        PROCESS_TABLE.lock()[pid] = None;
+        x86::enable_interrupts();
+        err
+    };
 
+    let code_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+        Ok(frame) => frame,
+        Err(e) => return Err(fail_cleanup(None, e)),
+    };
     let user_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
-    paging::map_page(USER_CODE_VADDR, code_frame, user_flags).unwrap();
-    paging::map_page(USER_STACK_VADDR - 4096, stack_frame, user_flags).unwrap();
-    let data_frame = paging::alloc_physical_page().unwrap();
-    paging::map_page(USER_DATA_VADDR, data_frame, user_flags).unwrap();
+    if let Err(e) = paging::map_page(USER_CODE_VADDR, code_frame, user_flags) {
+        return Err(fail_cleanup(Some(code_frame), e));
+    }
+
+    let stack_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+        Ok(frame) => frame,
+        Err(e) => return Err(fail_cleanup(None, e)),
+    };
+    if let Err(e) = paging::map_page(USER_STACK_VADDR - 4096, stack_frame, user_flags) {
+        return Err(fail_cleanup(Some(stack_frame), e));
+    }
+
+    let data_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+        Ok(frame) => frame,
+        Err(e) => return Err(fail_cleanup(None, e)),
+    };
+    if let Err(e) = paging::map_page(USER_DATA_VADDR, data_frame, user_flags) {
+        return Err(fail_cleanup(Some(data_frame), e));
+    }
 
     // map and zero the BSS Sector
-    let bss_frame = paging::alloc_physical_page().unwrap();
-    paging::map_page(USER_BSS_VADDR, bss_frame, user_flags).unwrap();
+    let bss_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+        Ok(frame) => frame,
+        Err(e) => return Err(fail_cleanup(None, e)),
+    };
+    if let Err(e) = paging::map_page(USER_BSS_VADDR, bss_frame, user_flags) {
+        return Err(fail_cleanup(Some(bss_frame), e));
+    }
     write_bytes(USER_BSS_VADDR as *mut u8, 0, 4096);
 
     let code_ptr = USER_CODE_VADDR as *mut u8;
@@ -80,8 +122,6 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
 
     x86::write_cr3(old_cr3);
 
-    x86::enable_interrupts();
-
     // Ring 3 Execution Frame
     let frame = &mut *frame_ptr;
     let user_data = (USER_DATA_SEL | 3) as u32;
@@ -100,8 +140,17 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
 
     let mut new_task: TaskStruct = MaybeUninit::zeroed().assume_init();
     new_task.pid = pid as u32;
-    new_task.uid = 1000;
-    new_task.state = ProcessState::Ready;
+    new_task.credentials = Credentials {
+        uid: 1000,
+        gid: 1000,
+        euid: 1000,
+        egid: 1000,
+        fsuid: 1000,
+        fsgid: 1000,
+        groups: [0; 8],
+        group_count: 0,
+    };
+    new_task.state = ProcessState::Terminated;
     new_task.context.esp = frame_ptr as u32;
     new_task.context.cr3 = new_cr3;
 
@@ -122,11 +171,10 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     new_task.kernel_stack_bottom = k_stack_bottom;
 
     let parent_task = super::current().as_ref().unwrap();
+    new_task.cwd = parent_task.cwd;
     new_task.fd_tbl = parent_task.fd_tbl;
     for global_fd in new_task.fd_tbl.iter().flatten() {
-        if let Some(open_file) = &mut crate::fs::OPEN_FILE_TABLE[*global_fd] {
-            open_file.ref_count += 1;
-        }
+        crate::fs::retain_open_file(*global_fd);
     }
 
     let mut locked_process_table = PROCESS_TABLE.lock();
@@ -141,14 +189,21 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     let ti = k_stack_bottom as *mut thread_info::ThreadInfo;
     (*ti).task = locked_process_table[pid].as_mut().unwrap() as *mut _;
     (*ti).task_pid = pid as u32;
+    (*ti).cpu_id = super::current_cpu();
     (*ti).preempt_count = 0;
     (*ti).flags = 0;
     (*ti).canary = thread_info::STACK_CANARY;
 
     // Add the new process to the parent's child list
     let parent_task = locked_process_table[0].as_mut().unwrap();
-    parent_task.family.children[parent_task.family.child_count] = pid as u32;
-    parent_task.family.child_count += 1;
-    pr_info!("Spawned Isolated User Process PID {}\n", pid);
-    true
+    if parent_task.family.child_count < super::MAX_CHILDREN {
+        parent_task.family.children[parent_task.family.child_count] = pid as u32;
+        parent_task.family.child_count += 1;
+    }
+
+    locked_process_table[pid].as_mut().unwrap().state = ProcessState::Ready;
+    drop(locked_process_table);
+
+    x86::enable_interrupts();
+    Ok(pid)
 }

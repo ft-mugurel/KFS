@@ -12,11 +12,81 @@ pub struct OpenFile {
     pub ref_count: usize,
 }
 
+unsafe impl Send for OpenFile {}
+
 pub const MAX_OPEN_FILES: usize = 256;
-pub static mut OPEN_FILE_TABLE: [Option<OpenFile>; MAX_OPEN_FILES] = {
+pub static OPEN_FILE_TABLE: Spinlock<[Option<OpenFile>; MAX_OPEN_FILES]> = {
     const EMPTY: Option<OpenFile> = None;
-    [EMPTY; MAX_OPEN_FILES]
+    Spinlock::new([EMPTY; MAX_OPEN_FILES])
 };
+
+pub fn alloc_open_file(node: *mut VfsNode, ref_count: usize) -> KResult<usize> {
+    let mut table = OPEN_FILE_TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(OpenFile { node, offset: 0, ref_count });
+            return Ok(i);
+        }
+    }
+    Err(KernelError::ENFILE)
+}
+
+pub fn get_open_file(global_fd: usize) -> Option<OpenFile> {
+    if global_fd >= MAX_OPEN_FILES {
+        return None;
+    }
+    let table = OPEN_FILE_TABLE.lock();
+    table[global_fd]
+}
+
+pub fn retain_open_file(global_fd: usize) {
+    if global_fd >= MAX_OPEN_FILES {
+        return;
+    }
+    let mut table = OPEN_FILE_TABLE.lock();
+    if let Some(Some(ref mut open_file)) = table.get_mut(global_fd) {
+        open_file.ref_count += 1;
+    }
+}
+
+pub fn update_open_file_offset(global_fd: usize, delta: u32) {
+    if global_fd >= MAX_OPEN_FILES {
+        return;
+    }
+    let mut table = OPEN_FILE_TABLE.lock();
+    if let Some(Some(ref mut open_file)) = table.get_mut(global_fd) {
+        open_file.offset = open_file.offset.saturating_add(delta);
+    }
+}
+
+pub unsafe fn close_open_file(global_fd: usize) {
+    if global_fd >= MAX_OPEN_FILES {
+        return;
+    }
+    let mut table = OPEN_FILE_TABLE.lock();
+    let should_close = if let Some(ref mut open_file) = table[global_fd] {
+        if open_file.ref_count > 0 {
+            open_file.ref_count -= 1;
+        }
+        if open_file.ref_count == 0 {
+            let node = open_file.node;
+            table[global_fd] = None;
+            Some(node)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    drop(table);
+
+    if let Some(node) = should_close {
+        if !node.is_null() && (*node).node_type == VfsNodeType::Socket {
+            let sock_idx = (*node).inode as usize;
+            crate::ipc::close_socket(sock_idx);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsNodeType {
@@ -41,13 +111,16 @@ pub struct VfsNode {
     pub children: *mut VfsNode,
     pub next_of_kin: *mut VfsNode,
 
-    pub rights: u16, // don't have users/groups yet
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub rights: u16,
 
     pub mount: *const Mount, // if this node is a mount point
 }
 
 #[derive(Clone, Copy)]
 pub struct Mount {
+    #[allow(dead_code)]
     pub device: BlockDeviceId,
     pub backend: &'static FsBackend,
     pub private_data: MountPrivate,
@@ -56,10 +129,20 @@ pub struct Mount {
 #[derive(Clone, Copy)]
 pub enum MountPrivate {
     Ext2(Ext2Mount),
+    #[allow(dead_code)]
     Raw,
 }
 
 pub struct FsBackend {
+    pub create: unsafe fn(
+        mount: *const Mount,
+        parent_inode: u32,
+        name: &str,
+        node_type: VfsNodeType,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> KResult<u32>,
     pub read: unsafe fn(
         mount: *const Mount,
         inode_num: u32,
@@ -73,7 +156,8 @@ pub struct FsBackend {
         offset: u32,
     ) -> KResult<usize>,
     pub truncate: unsafe fn(mount: *const Mount, inode_num: u32) -> KResult<()>,
-    pub lazy_load_directory: unsafe fn(mount: *const Mount, dir_node_num: u32) -> KResult<()>,
+    pub lazy_load_directory:
+        unsafe fn(mount: *const Mount, dir_node: *mut VfsNode, dir_node_num: u32) -> KResult<()>,
 }
 
 const MOUNT_TABLE_SIZE: usize = 16;
@@ -94,6 +178,7 @@ where
     Err(KernelError::ENOSPC)
 }
 
+#[allow(dead_code)]
 pub(self) fn get_mount(index: usize) -> KResult<Mount> {
     let table = MOUNT_TABLE.lock();
     if index < MOUNT_TABLE_SIZE {

@@ -1,5 +1,5 @@
 use super::{
-    ContextFrame, ProcessState, TaskStruct, MAX_PROCESSES, PROCESS_TABLE, SIGNAL_QUEUE_SIZE,
+    ContextFrame, Credentials, ProcessState, TaskStruct, MAX_PROCESSES, PROCESS_TABLE,
     THREAD_SIZE,
 };
 use crate::gdt;
@@ -17,6 +17,12 @@ use crate::x86;
 // One dedicated kernel stack + idle TaskStruct per core. PIDs 0..MAX_CPUS
 // are reserved for idle tasks; real processes start at MAX_CPUS.
 #[repr(C, align(4096))]
+struct GuardPage([u8; 4096]);
+
+#[unsafe(no_mangle)]
+static mut IDLE_STACK_GUARD: GuardPage = GuardPage([0; 4096]);
+
+#[repr(C, align(16384))]
 struct IdleStack([u8; THREAD_SIZE]);
 
 #[unsafe(no_mangle)]
@@ -40,6 +46,16 @@ pub unsafe fn init_scheduler_for_cpu(cpu_id: usize) {
 
     let mut idle_task: TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
     idle_task.pid = cpu_id as u32;
+    idle_task.credentials = Credentials {
+        uid: 0,
+        gid: 0,
+        euid: 0,
+        egid: 0,
+        fsuid: 0,
+        fsgid: 0,
+        groups: [0; 8],
+        group_count: 0,
+    };
     idle_task.state = ProcessState::Running;
     idle_task.context.cr3 = boot_cr3;
     idle_task.kernel_stack_top = k_stack_top;
@@ -77,7 +93,7 @@ pub unsafe fn init_scheduler_for_cpu(cpu_id: usize) {
 pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
     let cpu_id = thread_info::current_cpu() as usize;
     let current_pid = thread_info::current_pid() as usize;
-    let current_ticks = timer::get_ticks();
+    let current_ticks = timer::get_ticks() as u64;
 
     for task in PROCESS_TABLE.lock().iter_mut() {
         if let Some(ref mut task) = task {
@@ -93,7 +109,9 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
                 current_task.context.esp = old_esp;
                 current_task.state = ProcessState::Ready;
             }
-            ProcessState::Sleeping => current_task.context.esp = old_esp,
+            ProcessState::Sleeping | ProcessState::Waiting => {
+                current_task.context.esp = old_esp;
+            }
             _ => {}
         }
     }
@@ -126,23 +144,23 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
         }
 
         let next_task = table[next_pid].as_mut().unwrap();
-        let queue = &mut next_task.signals;
         let mut killed = false;
 
-        if queue.head != queue.tail {
-            let sig_num = queue.pending[queue.tail];
-            let handler_addr = queue.handlers[sig_num as usize];
+        if let Some(sig_num) = next_task.signals.pop() {
+            let handler_addr = next_task.signals.get_handler(sig_num as usize);
 
             if handler_addr != 0 {
                 let frame = &mut *(next_task.context.esp as *mut ContextFrame);
                 if (frame.cs & 0x03) == 3 {
-                    queue.tail = (queue.tail + 1) % SIGNAL_QUEUE_SIZE;
+                    let next_cr3 = next_task.context.cr3;
+                    if next_cr3 != x86::read_cr3() {
+                        x86::write_cr3(next_cr3);
+                    }
                     frame.user_esp -= 4;
                     *(frame.user_esp as *mut u32) = frame.eip;
                     frame.eip = handler_addr;
                 }
             } else {
-                queue.tail = (queue.tail + 1) % SIGNAL_QUEUE_SIZE;
                 pr_info!(
                     "PID {} terminated by unhandled signal {}\n",
                     next_pid,
@@ -177,6 +195,7 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
                 STACK_CANARY,
                 (*ti).canary as u32
             );
+            panic::save_stack_trace();
             panic::clean_registers_and_halt();
         }
 

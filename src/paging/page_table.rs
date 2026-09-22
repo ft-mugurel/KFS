@@ -11,7 +11,7 @@ const ENTRIES_PER_TABLE: usize = 1024;
 const PAGE_SIZE_4K: u32 = 0x1000;
 const TABLE_FLAGS: u32 = PAGE_PRESENT | PAGE_WRITABLE;
 const PAGE_FRAME_MASK: u32 = 0xFFFF_F000;
-const PAGE_TABLE_ALLOC_LIMIT: u64 = 0x0040_0000;
+pub(crate) const PAGE_TABLE_ALLOC_LIMIT: u64 = 0x0040_0000;
 
 #[repr(C, align(4096))]
 struct PageDirectory([u32; ENTRIES_PER_TABLE]);
@@ -133,7 +133,7 @@ fn validate_virtual_address(virt_addr: u32, flags: u32) -> KResult<()> {
     Ok(())
 }
 
-fn ensure_page_table(pde_index: usize) -> KResult<u32> {
+fn ensure_page_table(pde_index: usize, flags: u32) -> KResult<u32> {
     let pd_ptr = active_pd_ptr();
     let pde = unsafe { pd_ptr.add(pde_index).read() };
 
@@ -141,22 +141,45 @@ fn ensure_page_table(pde_index: usize) -> KResult<u32> {
         return Ok(pde & PAGE_FRAME_MASK);
     }
 
+    if pde_index >= 768 {
+        let boot_pde = unsafe {
+            let boot_pd = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32;
+            boot_pd.add(pde_index).read()
+        };
+        if (boot_pde & PAGE_PRESENT) != 0 {
+            unsafe { pd_ptr.add(pde_index).write(boot_pde) };
+            x86::write_cr3(x86::read_cr3());
+            return Ok(boot_pde & PAGE_FRAME_MASK);
+        }
+    }
+
     let table_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
 
     zero_page_table(table_phys);
+    let pde_flags = if pde_index >= 768 {
+        TABLE_FLAGS
+    } else {
+        TABLE_FLAGS | (flags & PAGE_USER)
+    };
+
     unsafe {
         pd_ptr
             .add(pde_index)
-            .write(table_phys | TABLE_FLAGS | PAGE_USER)
+            .write(table_phys | pde_flags);
+
+        if pde_index >= 768 {
+            let boot_pd = (&raw mut BOOT_PAGE_DIRECTORY.0) as *mut u32;
+            boot_pd.add(pde_index).write(table_phys | TABLE_FLAGS);
+        }
     };
     x86::write_cr3(x86::read_cr3());
 
     Ok(table_phys)
 }
 
-fn get_page_entry_ptr(virt_addr: u32) -> KResult<*mut u32> {
+fn get_page_entry_ptr(virt_addr: u32, flags: u32) -> KResult<*mut u32> {
     let pde = pde_index(virt_addr);
-    let pt_phys = ensure_page_table(pde)?;
+    let pt_phys = ensure_page_table(pde, flags)?;
     let pt_ptr = phys_to_virt(pt_phys);
     Ok(unsafe { pt_ptr.add(pte_index(virt_addr)) })
 }
@@ -220,17 +243,10 @@ pub fn map_page(virt_addr: u32, phys_addr: u32, flags: u32) -> KResult<()> {
     validate_virtual_address(virt_addr, flags)?;
 
     unsafe {
-        let entry_ptr = get_page_entry_ptr(virt_addr)?;
+        let entry_ptr = get_page_entry_ptr(virt_addr, flags)?;
         entry_ptr.write((phys_addr & PAGE_FRAME_MASK) | (flags | PAGE_PRESENT));
         x86::invalidate_page(virt_addr);
     }
-
-    // pr_debug!(
-    //     "map_page: va={:#x} -> pa={:#x} flags={:#x}\n",
-    //     virt_addr,
-    //     phys_addr,
-    //     flags | PAGE_PRESENT
-    // );
 
     Ok(())
 }
@@ -249,15 +265,8 @@ pub fn get_page(virt_addr: u32) -> Option<u32> {
     }
 
     unsafe {
-        let pde = pde_index(virt_addr);
-        let pd_ptr = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32;
-        let pde_entry = pd_ptr.add(pde).read();
-        if (pde_entry & PAGE_PRESENT) == 0 {
-            return None;
-        }
-
-        let pt_ptr = (pde_entry & PAGE_FRAME_MASK) as *const u32;
-        let entry = pt_ptr.add(pte_index(virt_addr)).read();
+        let entry_ptr = lookup_page_entry_ptr(virt_addr)?;
+        let entry = entry_ptr.read();
         if (entry & PAGE_PRESENT) == 0 {
             None
         } else {
@@ -306,7 +315,7 @@ pub fn unmap_page(virt_addr: u32) -> KResult<()> {
 }
 
 pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
-    let child_pd_phys = physical::alloc_physical_page()?;
+    let child_pd_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
     let child_pd = phys_to_virt(child_pd_phys) as *mut u32;
     let parent_pd = phys_to_virt(parent_cr3) as *const u32;
 
@@ -318,7 +327,7 @@ pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
         let pde = parent_pd.add(pde_idx).read();
 
         if (pde & PAGE_PRESENT) != 0 && (pde & PAGE_USER) != 0 {
-            let child_pt_phys = physical::alloc_physical_page()?;
+            let child_pt_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
             let child_pt = phys_to_virt(child_pt_phys) as *mut u32;
             let parent_pt = phys_to_virt(pde & PAGE_FRAME_MASK) as *const u32;
 
@@ -330,7 +339,7 @@ pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
 
                 if (pte & PAGE_PRESENT) != 0 && (pte & PAGE_USER) != 0 {
                     // Allocate a new physical frame for the actual data
-                    let data_phys = physical::alloc_physical_page()?;
+                    let data_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
                     let data_virt_child = phys_to_virt(data_phys) as *mut u8;
                     let data_virt_parent = phys_to_virt(pte & PAGE_FRAME_MASK) as *const u8;
 

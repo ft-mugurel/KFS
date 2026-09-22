@@ -88,8 +88,7 @@ impl TaskStateSegment {
 
 const GDT_TSS_BASE_INDEX: usize = 7;
 const GDT_ENTRIES_COUNT: usize = GDT_TSS_BASE_INDEX + MAX_CPUS;
-const GDT_LIMIT_BYTES: u32 = 0xfffff; // 4GiB
-const GDT_LIMIT: u32 = (GDT_LIMIT_BYTES >> 12) - 1;
+const GDT_LIMIT: u32 = 0x000F_FFFF;
 
 // Mirror Linux arch/x86/include/asm/desc_defs.h flags.
 const _DESC_ACCESSED: u16 = 0x0001;

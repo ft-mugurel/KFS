@@ -17,13 +17,15 @@ const CMD_WRITE_PIO: u8 = 0x30;
 const CMD_CACHE_FLUSH: u8 = 0xE7;
 const CMD_IDENTIFY: u8 = 0xEC;
 
+const MAX_POLL_RETRIES: u32 = 1_000_000;
+
 fn wait_busy(io_base: u16) -> KResult<()> {
     for _ in 0..4 {
         inb(io_base + 7);
     }
 
-    // Poll until BSY clears
-    loop {
+    // Poll until BSY clears with timeout
+    for _ in 0..MAX_POLL_RETRIES {
         let status = inb(io_base + 7);
         if (status & STATUS_BSY) == 0 {
             if (status & STATUS_ERR) != 0 || (status & STATUS_DF) != 0 {
@@ -32,6 +34,8 @@ fn wait_busy(io_base: u16) -> KResult<()> {
             return Ok(());
         }
     }
+    pr_warn!("IDE wait_busy timed out on port {:#x}", io_base);
+    Err(KernelError::ETIMEDOUT)
 }
 
 pub fn identify(io_base: u16, control_base: u16, drive: u8) -> Option<u32> {
@@ -71,7 +75,7 @@ pub fn identify(io_base: u16, control_base: u16, drive: u8) -> Option<u32> {
 }
 
 fn wait_drq(io_base: u16) -> KResult<()> {
-    loop {
+    for _ in 0..MAX_POLL_RETRIES {
         let status = inb(io_base + 7);
         if (status & STATUS_ERR) != 0 || (status & STATUS_DF) != 0 {
             return Err(KernelError::EIO);
@@ -80,6 +84,8 @@ fn wait_drq(io_base: u16) -> KResult<()> {
             return Ok(());
         }
     }
+    pr_warn!("IDE wait_drq timed out on port {:#x}", io_base);
+    Err(KernelError::ETIMEDOUT)
 }
 
 pub fn read_sectors(

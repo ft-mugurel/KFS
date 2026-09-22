@@ -5,9 +5,12 @@ use crate::{
     vga::text_mod::{print_fmt_on, print_str_on},
 };
 
+use crate::locks::Spinlock;
+
 pub const MAX_VFS_NODES: usize = 1024;
 pub static mut ROOT_NODE: *mut VfsNode = core::ptr::null_mut();
 
+static VFS_NODE_LOCK: Spinlock<()> = Spinlock::new(());
 // static pool
 static mut VFS_NODE_POOL: [VfsNode; MAX_VFS_NODES] = unsafe { core::mem::zeroed() };
 static mut VFS_NODE_COUNT: usize = 0;
@@ -78,11 +81,12 @@ impl VfsNode {
         let fn_load_dir = (*mount).backend.lazy_load_directory;
         let inode = self.inode;
 
-        fn_load_dir(mount, inode)
+        fn_load_dir(mount, self as *const VfsNode as *mut VfsNode, inode)
     }
 }
 
 pub unsafe fn alloc_vfs_node() -> KResult<*mut VfsNode> {
+    let _guard = VFS_NODE_LOCK.lock();
     if VFS_NODE_COUNT >= MAX_VFS_NODES {
         return Err(KernelError::ENFILE);
     }
@@ -128,12 +132,37 @@ pub unsafe fn create_child_node(
 
     (*node).size = 0;
     (*node).node_type = node_type;
-    (*node).inode = 0;
+    let credentials = crate::sched::current_cred()
+        .as_ref()
+        .copied()
+        .unwrap_or_else(crate::sched::Credentials::root);
+    let mount = (*parent).master;
+    let inode = if matches!(node_type, VfsNodeType::File | VfsNodeType::Directory)
+        && !mount.is_null()
+        && !(*mount).mount.is_null()
+    {
+        ((*(*mount).mount).backend.create)(
+            (*mount).mount,
+            (*parent).inode,
+            name,
+            node_type,
+            rights,
+            credentials.uid,
+            credentials.gid,
+        )?
+    } else if matches!(node_type, VfsNodeType::CharDevice | VfsNodeType::Socket) {
+        0
+    } else {
+        return Err(KernelError::EOPNOTSUPP);
+    };
+    (*node).inode = inode;
     (*node).links = 1;
     (*node).master = (*parent).master;
     (*node).father = parent;
     (*node).children = core::ptr::null_mut();
     (*node).next_of_kin = core::ptr::null_mut();
+    (*node).owner_uid = credentials.uid;
+    (*node).owner_gid = credentials.gid;
     (*node).rights = rights;
 
     append_child(parent, node);
@@ -208,6 +237,10 @@ pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNod
         return Err(KernelError::EINVAL);
     }
 
+    let credentials = crate::sched::current_cred()
+        .as_ref()
+        .copied()
+        .unwrap_or_else(crate::sched::Credentials::root);
     for segment in path.split('/') {
         if segment.is_empty() || segment == "." {
             continue;
@@ -222,6 +255,16 @@ pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNod
 
         if (*current).node_type == VfsNodeType::Directory {
             (*current).lazy_load_directory()?;
+            let object = crate::security::SecurityObject::File {
+                owner_uid: (*current).owner_uid,
+                owner_gid: (*current).owner_gid,
+                mode: (*current).rights,
+            };
+            if crate::security::check(&credentials, &object, crate::security::Operation::Traverse)
+                == crate::security::Decision::Deny
+            {
+                return Err(KernelError::EACCES);
+            }
         }
 
         let mut child = (*current).children;

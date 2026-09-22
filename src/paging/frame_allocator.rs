@@ -225,6 +225,70 @@ pub(super) fn alloc_frame_below(limit_addr: u64) -> KResult<u32> {
 }
 
 #[inline(never)]
+pub(super) fn alloc_contiguous_frames_below(
+    count: usize,
+    align_frames: usize,
+    limit_addr: u64,
+) -> KResult<u32> {
+    if count == 0 {
+        return Err(KernelError::EINVAL);
+    }
+    let mut state = ALLOCATOR_STATE.lock();
+    let limit_frame = (limit_addr as usize / PAGE_SIZE).min(MAX_FRAMES);
+    let align = align_frames.max(1);
+    let mut start_idx = 0;
+
+    while start_idx + count <= limit_frame {
+        if start_idx % align != 0 {
+            start_idx += align - (start_idx % align);
+            continue;
+        }
+
+        let mut all_free = true;
+        for i in 0..count {
+            let idx = start_idx + i;
+            let word = idx / BITMAP_WORD_BITS;
+            let bit = idx % BITMAP_WORD_BITS;
+            if (state.bitmap[word] & (1u32 << bit)) != 0 {
+                all_free = false;
+                start_idx = ((idx + 1) + (align - 1)) & !(align - 1);
+                break;
+            }
+        }
+
+        if all_free {
+            for i in 0..count {
+                state.mark_used(start_idx + i);
+            }
+            return Ok(frame_addr(start_idx));
+        }
+    }
+
+    pr_warn!(
+        "alloc_contiguous_frames_below({}, {}, {:#x}) failed: no contiguous free frames\n",
+        count,
+        align,
+        limit_addr
+    );
+    Err(KernelError::ENOMEM)
+}
+
+#[inline(never)]
+pub(super) fn free_contiguous_frames(phys_addr: u32, count: usize) -> KResult<()> {
+    let start_frame = frame_index(phys_addr);
+    if start_frame + count > MAX_FRAMES || (phys_addr as usize % PAGE_SIZE) != 0 {
+        pr_warn!("free_contiguous_frames rejected invalid addr={:#x}\n", phys_addr);
+        return Err(KernelError::EINVAL);
+    }
+
+    let mut state = ALLOCATOR_STATE.lock();
+    for i in 0..count {
+        state.mark_free(start_frame + i);
+    }
+    Ok(())
+}
+
+#[inline(never)]
 pub(super) fn free_frame(phys_addr: u32) -> KResult<()> {
     let frame_idx = frame_index(phys_addr);
     if frame_idx >= MAX_FRAMES || (phys_addr as usize % PAGE_SIZE) != 0 {

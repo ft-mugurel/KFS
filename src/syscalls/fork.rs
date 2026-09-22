@@ -1,19 +1,10 @@
-use crate::error::{KResultExt, KernelError};
-use crate::fs::OPEN_FILE_TABLE;
+use crate::error::KernelError;
 use crate::sched::{
     self, current_pid, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE,
 };
 use crate::{paging, pr_info, pr_warn};
 
 pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
-    let mut child_pid_opt = None;
-    for (i, task_opt) in PROCESS_TABLE.lock().iter().enumerate() {
-        if task_opt.is_none() {
-            child_pid_opt = Some(i);
-            break;
-        }
-    }
-
     let parent_task = sched::current().as_mut().unwrap();
     let cc = parent_task.family.child_count;
     if cc >= MAX_CHILDREN {
@@ -25,7 +16,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
         return;
     }
 
-    let child_pid = match child_pid_opt {
+    let child_pid = match sched::reserve_process_slot() {
         Some(pid) => pid,
         None => {
             pr_warn!("[PID {}] No available PID for fork\n", current_pid());
@@ -42,16 +33,34 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
                 parent_task.pid,
                 child_pid
             );
+            PROCESS_TABLE.lock()[child_pid] = None;
             (*regs).set_return_error(KernelError::ENOMEM);
             return;
         }
     };
 
-    let child_kstack_phys = paging::alloc_physical_page()
-        .consume_err("fork: could not allocate memory\n")
-        .unwrap();
-    let child_kstack_top = paging::phys_to_virt(child_kstack_phys) as u32 + 4096;
-    let child_kstack_bottom = child_kstack_top - 4096;
+    let frames_needed = sched::THREAD_SIZE / paging::PAGE_SIZE;
+    let child_kstack_phys = match paging::alloc_contiguous_physical_pages_below(
+        frames_needed,
+        frames_needed,
+        paging::PAGE_TABLE_ALLOC_LIMIT,
+    ) {
+        Ok(frame) => frame,
+        Err(e) => {
+            pr_warn!(
+                "[PID {}] Failed to allocate kernel stack for child PID {}: {:?}\n",
+                parent_task.pid,
+                child_pid,
+                e
+            );
+            paging::free_user_address_space(child_cr3);
+            PROCESS_TABLE.lock()[child_pid] = None;
+            (*regs).set_return_error(KernelError::ENOMEM);
+            return;
+        }
+    };
+    let child_kstack_top = paging::phys_to_virt(child_kstack_phys) as u32 + sched::THREAD_SIZE as u32;
+    let child_kstack_bottom = child_kstack_top - sched::THREAD_SIZE as u32;
 
     let child_frame_ptr =
         (child_kstack_top - core::mem::size_of::<ContextFrame>() as u32) as *mut ContextFrame;
@@ -83,7 +92,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     let mut child_task: sched::TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
     child_task.pid = child_pid as u32;
-    child_task.uid = parent_task.uid;
+    child_task.credentials = parent_task.credentials;
     child_task.state = sched::ProcessState::Ready;
     child_task.exit_code = None;
 
@@ -95,14 +104,13 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     child_task.kernel_stack_top = child_kstack_top;
     child_task.kernel_stack_bottom = child_kstack_bottom;
 
+    child_task.cwd = parent_task.cwd;
     child_task.fd_tbl = parent_task.fd_tbl;
 
     // Increment global reference counts for inherited files
     for i in 0..MAX_FDS_PER_PROCESS {
         if let Some(global_fd) = child_task.fd_tbl[i] {
-            if let Some(open_file) = &mut OPEN_FILE_TABLE[global_fd] {
-                open_file.ref_count += 1;
-            }
+            crate::fs::retain_open_file(global_fd);
         }
     }
 
@@ -110,7 +118,10 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     parent_task.family.children[parent_task.family.child_count] = child_pid as u32;
     parent_task.family.child_count += 1;
 
-    PROCESS_TABLE.lock()[child_pid] = Some(child_task);
+    let mut table = PROCESS_TABLE.lock();
+    table[child_pid] = Some(child_task);
+    (*thread_info).task = table[child_pid].as_mut().unwrap() as *mut _;
+    drop(table);
 
     (*regs).set_return_value(child_pid as u32);
 }

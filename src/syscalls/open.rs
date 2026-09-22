@@ -1,8 +1,8 @@
 use crate::error::KernelError;
-use crate::fs::{self, OpenFile, VfsNodeType, MAX_OPEN_FILES, OPEN_FILE_TABLE};
-use crate::ipc;
+use crate::fs::{self, VfsNodeType};
 use crate::sched::{self, ContextFrame, MAX_FDS_PER_PROCESS};
 use crate::utils;
+use crate::security::{self, Decision, Operation};
 
 const O_CREAT: u32 = 0x40;
 const O_TRUNC: u32 = 0x200;
@@ -32,7 +32,6 @@ pub unsafe fn syscall_open(regs: *mut ContextFrame) {
 
     let task = sched::current().as_mut().unwrap();
     let cwd = task.cwd;
-    let fd_tbl = &mut task.fd_tbl;
 
     let node = match fs::resolve_path(path_str, cwd) {
         Ok(n) => n,
@@ -63,6 +62,16 @@ pub unsafe fn syscall_open(regs: *mut ContextFrame) {
                 return;
             }
 
+            if security::check(
+                &task.credentials,
+                &security::object_for_node(parent),
+                Operation::Create,
+            ) == Decision::Deny
+            {
+                (*regs).set_return_error(KernelError::EACCES);
+                return;
+            }
+
             match fs::create_child_node(parent, name, VfsNodeType::File, (mode & 0x0FFF) as u16) {
                 Ok(new_node) => new_node,
                 Err(create_err) => {
@@ -73,9 +82,44 @@ pub unsafe fn syscall_open(regs: *mut ContextFrame) {
         }
     };
 
+    let requested = match flags & 0x3 {
+        0 => 0o4,
+        1 => 0o2,
+        2 => 0o6,
+        _ => {
+            (*regs).set_return_error(KernelError::EINVAL);
+            return;
+        }
+    };
+    let operation = match requested {
+        0o4 => Operation::Read,
+        0o2 => Operation::Write,
+        0o6 => Operation::ReadWrite,
+        _ => unreachable!(),
+    };
+    if security::check(
+        &task.credentials,
+        &security::object_for_node(node),
+        operation,
+    ) == Decision::Deny
+    {
+        (*regs).set_return_error(KernelError::EACCES);
+        return;
+    }
+
     if (flags & O_TRUNC) != 0 {
         if (*node).node_type == VfsNodeType::Directory {
             (*regs).set_return_error(KernelError::EISDIR);
+            return;
+        }
+
+        if security::check(
+            &task.credentials,
+            &security::object_for_node(node),
+            Operation::Truncate,
+        ) == Decision::Deny
+        {
+            (*regs).set_return_error(KernelError::EACCES);
             return;
         }
 
@@ -85,15 +129,7 @@ pub unsafe fn syscall_open(regs: *mut ContextFrame) {
         }
     }
 
-    let mut local_fd = None;
-    for i in 3..MAX_FDS_PER_PROCESS {
-        if fd_tbl[i].is_none() {
-            local_fd = Some(i);
-            break;
-        }
-    }
-
-    let l_fd = match local_fd {
+    let l_fd = match task.alloc_fd() {
         Some(f) => f,
         None => {
             (*regs).set_return_error(KernelError::EMFILE);
@@ -101,24 +137,15 @@ pub unsafe fn syscall_open(regs: *mut ContextFrame) {
         }
     };
 
-    let mut global_fd = None;
-    for i in 0..MAX_OPEN_FILES {
-        if OPEN_FILE_TABLE[i].is_none() {
-            global_fd = Some(i);
-            break;
-        }
-    }
-    let g_fd = match global_fd {
-        Some(g) => g,
-        None => {
-            (*regs).set_return_error(KernelError::ENFILE);
+    let g_fd = match fs::alloc_open_file(node, 1) {
+        Ok(g) => g,
+        Err(e) => {
+            (*regs).set_return_error(e);
             return;
         }
     };
 
-    OPEN_FILE_TABLE[g_fd] = Some(OpenFile { node, offset: 0, ref_count: 1 });
-    fd_tbl[l_fd] = Some(g_fd);
-
+    task.fd_tbl[l_fd] = Some(g_fd);
     (*regs).set_return_value(l_fd as u32);
 }
 
@@ -141,22 +168,6 @@ pub unsafe fn syscall_close(regs: *mut ContextFrame) {
     };
 
     fd_tbl[local_fd] = None;
-
-    if let Some(open_file) = &mut OPEN_FILE_TABLE[global_fd] {
-        if open_file.ref_count > 0 {
-            open_file.ref_count -= 1;
-        }
-
-        if open_file.ref_count == 0 {
-            let node = open_file.node;
-            if (*node).node_type == VfsNodeType::Socket {
-                let sock_idx = (*node).inode as usize;
-                ipc::close_socket(sock_idx);
-            }
-
-            OPEN_FILE_TABLE[global_fd] = None;
-        }
-    }
-
+    fs::close_open_file(global_fd);
     (*regs).set_return_value(0);
 }

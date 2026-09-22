@@ -1,47 +1,47 @@
 use crate::smp::MAX_CPUS;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 pub struct CpuTable {
-    apic_id: [u8; MAX_CPUS],
+    apic_id: [AtomicU8; MAX_CPUS],
     online: [AtomicBool; MAX_CPUS],
     count: AtomicUsize,
 }
 
-static mut CPU_TABLE: CpuTable = CpuTable {
-    apic_id: [0; MAX_CPUS],
+static CPU_TABLE: CpuTable = CpuTable {
+    apic_id: [const { AtomicU8::new(0) }; MAX_CPUS],
     online: [const { AtomicBool::new(false) }; MAX_CPUS],
     count: AtomicUsize::new(0),
 };
 
-pub unsafe fn register_cpu(cpu_id: usize, apic_id: u8) {
-    CPU_TABLE.apic_id[cpu_id] = apic_id;
+pub fn register_cpu(cpu_id: usize, apic_id: u8) {
+    CPU_TABLE.apic_id[cpu_id].store(apic_id, Ordering::SeqCst);
     CPU_TABLE.count.fetch_add(1, Ordering::SeqCst);
 }
 
 #[allow(dead_code)]
-pub unsafe fn cpu_count() -> usize {
+pub fn cpu_count() -> usize {
     CPU_TABLE.count.load(Ordering::SeqCst)
 }
 
 #[allow(dead_code)]
-pub unsafe fn mark_online(cpu_id: usize) {
+pub fn mark_online(cpu_id: usize) {
     CPU_TABLE.online[cpu_id].store(true, Ordering::SeqCst);
 }
 
 #[allow(dead_code)]
-pub unsafe fn mark_offline(cpu_id: usize) {
+pub fn mark_offline(cpu_id: usize) {
     CPU_TABLE.online[cpu_id].store(false, Ordering::SeqCst);
 }
 
-pub unsafe fn is_online(cpu_id: usize) -> bool {
+pub fn is_online(cpu_id: usize) -> bool {
     CPU_TABLE.online[cpu_id].load(Ordering::SeqCst)
 }
 
-pub unsafe fn online_count() -> usize {
+pub fn online_count() -> usize {
     (0..MAX_CPUS).filter(|&i| is_online(i)).count()
 }
 
 #[allow(dead_code)]
 pub fn apic_id_of(cpu_id: usize) -> u8 {
-    unsafe { CPU_TABLE.apic_id[cpu_id] }
+    CPU_TABLE.apic_id[cpu_id].load(Ordering::SeqCst)
 }

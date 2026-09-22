@@ -127,6 +127,7 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
         }
     };
 
+    x86::disable_interrupts();
     let old_cr3 = x86::read_cr3();
     x86::write_cr3(task.context.cr3);
 
@@ -146,6 +147,7 @@ pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
     }
 
     x86::write_cr3(old_cr3);
+    x86::enable_interrupts();
 
     let vma = &mut task.memory.vmas[vma_idx];
     if addr == vma.base && aligned_length == vma.size {

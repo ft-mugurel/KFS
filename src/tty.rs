@@ -1,5 +1,5 @@
 use crate::error::{KResult, KernelError};
-use crate::fs::{self, OpenFile, VfsNodeType, MAX_OPEN_FILES, OPEN_FILE_TABLE};
+use crate::fs::{self, VfsNodeType};
 use crate::locks::Spinlock;
 use crate::sched::{self, MAX_FDS_PER_PROCESS};
 use crate::vga::text_mod::{active_screen_index, print_str_on};
@@ -98,15 +98,11 @@ pub unsafe fn init() -> KResult<()> {
 pub(crate) unsafe fn bind_stdio() -> KResult<()> {
     let node = fs::resolve_path("/dev/tty1", fs::ROOT_NODE)?;
     let task = sched::current().as_mut().ok_or(KernelError::ENXIO)?;
-    let fd_tbl = &mut task.fd_tbl;
 
-    let global_fd = (0..MAX_OPEN_FILES)
-        .find(|&index| OPEN_FILE_TABLE[index].is_none())
-        .ok_or(KernelError::ENFILE)?;
-    OPEN_FILE_TABLE[global_fd] = Some(OpenFile { node, offset: 0, ref_count: 3 });
+    let global_fd = fs::alloc_open_file(node, 3)?;
 
     for fd in 0..3.min(MAX_FDS_PER_PROCESS) {
-        fd_tbl[fd] = Some(global_fd);
+        task.fd_tbl[fd] = Some(global_fd);
     }
 
     Ok(())

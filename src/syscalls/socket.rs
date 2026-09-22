@@ -1,6 +1,6 @@
 use crate::error::KernelError;
-use crate::fs::{self, OpenFile, VfsNodeType, MAX_OPEN_FILES, OPEN_FILE_TABLE};
-use crate::sched::{self, ContextFrame, MAX_FDS_PER_PROCESS};
+use crate::fs::{self, VfsNodeType};
+use crate::sched::{self, ContextFrame};
 use crate::{ipc, pr_warn};
 
 const AF_UNIX: u32 = 1;
@@ -17,36 +17,13 @@ pub unsafe fn syscall_socket(regs: *mut ContextFrame) {
         return;
     }
 
-    let fd_tbl = &mut sched::current().as_mut().unwrap().fd_tbl;
+    let task = sched::current().as_mut().unwrap();
 
-    let mut local_fd = None;
-    for i in 3..MAX_FDS_PER_PROCESS {
-        if fd_tbl[i].is_none() {
-            local_fd = Some(i);
-            break;
-        }
-    }
-    let fd = match local_fd {
+    let fd = match task.alloc_fd() {
         Some(f) => f,
         None => {
             pr_warn!("sys_socket: no available file descriptors\n");
             (*regs).set_return_error(KernelError::EMFILE);
-            return;
-        }
-    };
-
-    let mut global_fd = None;
-    for i in 0..MAX_OPEN_FILES {
-        if crate::fs::OPEN_FILE_TABLE[i].is_none() {
-            global_fd = Some(i);
-            break;
-        }
-    }
-    let g_fd = match global_fd {
-        Some(g) => g,
-        None => {
-            pr_warn!("sys_socket: no available global file descriptors\n");
-            (*regs).set_return_error(KernelError::ENFILE);
             return;
         }
     };
@@ -87,12 +64,15 @@ pub unsafe fn syscall_socket(regs: *mut ContextFrame) {
     let name = b"anon_socket\0";
     core::ptr::copy_nonoverlapping(name.as_ptr(), (*node).name.as_mut_ptr(), name.len());
 
-    OPEN_FILE_TABLE[g_fd] = Some(OpenFile {
-        node,
-        offset: 0, // (read/write)_socket will ignore this
-        ref_count: 1,
-    });
+    let g_fd = match fs::alloc_open_file(node, 1) {
+        Ok(g) => g,
+        Err(e) => {
+            ipc::close_socket(kernel_sock_idx);
+            (*regs).set_return_error(e);
+            return;
+        }
+    };
 
-    fd_tbl[fd] = Some(g_fd); // Process local points to VFS global
+    task.fd_tbl[fd] = Some(g_fd); // Process local points to VFS global
     (*regs).set_return_value(fd as u32);
 }
