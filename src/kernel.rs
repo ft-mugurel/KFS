@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::startup_config::pic::{MASK_ENABLE_TIMER_KEYBOARD, MASTER_DATA_PORT};
 
@@ -8,7 +9,7 @@ mod dump;
 mod error;
 mod fs;
 mod gdt;
-// mod initcall;
+pub mod initcall;
 mod acpi;
 mod interrupts;
 mod ipc;
@@ -32,6 +33,7 @@ mod x86;
 static mut BOOT_MULTIBOOT_MAGIC: u32 = 0;
 static mut BOOT_MULTIBOOT_INFO_ADDR: u32 = 0;
 
+#[unsafe(link_section = ".init.text")]
 unsafe fn load_account_records() {
     let Ok(shadow) = fs::resolve_path("/etc/shadow", fs::ROOT_NODE) else {
         security::ensure_root_account();
@@ -61,39 +63,9 @@ unsafe fn load_account_records() {
     }
 }
 
-/* unsafe fn free_init_memory() {
-    let start_addr = core::ptr::addr_of!(__init_start) as u32;
-    let end_addr = core::ptr::addr_of!(__init_end) as u32;
+late_initcall!(load_account_records);
 
-    let page_size = 4096;
-    let mut current_addr = start_addr;
-
-    crate::pr_info!(
-        "Freeing init memory: {:#X} - {:#X} ({} bytes)\n",
-        start_addr,
-        end_addr,
-        end_addr - start_addr
-    );
-
-    // Ensure we only free full pages
-    while current_addr < end_addr {
-        let Some(phys_addr) = paging::virt_to_phys(current_addr) else {
-            crate::pr_err!(
-                "Failed to convert virtual address to physical: {:#X}\n",
-                current_addr
-            );
-            break;
-        };
-
-        paging::free_physical_page(phys_addr)
-            .consume_err("Failed to free physical page for init memory");
-
-        paging::unmap_page(current_addr).consume_err("Failed to unmap page for init memory");
-
-        current_addr += page_size;
-    }
-} */
-
+#[unsafe(link_section = ".init.text")]
 fn prepare_serial_output() {
     x86::outb(0x3F8 + 1, 0x00); // Disable all interrupts
     x86::outb(0x3F8 + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -104,7 +76,7 @@ fn prepare_serial_output() {
     x86::outb(0x3F8 + 4, 0x0B); // IRQs enabled, RTS/DSR set
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -> ! {
     BOOT_MULTIBOOT_MAGIC = multiboot_magic;
     BOOT_MULTIBOOT_INFO_ADDR = multiboot_info_addr;
@@ -163,20 +135,10 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
         next_cpu_id += 1;
     }
 
-    let _ = drivers::init();
-    syscalls::init_syscalls();
+    initcall::do_initcalls();
+    initcall::free_init_memory();
 
-    if let Some(device_id) = drivers::first_ext2_partition() {
-        let _ = fs::ext2::mount_device(device_id);
-    } else {
-        pr_warn!("No EXT2 partition found for the root filesystem\n");
-    }
-    load_account_records();
-    if let Err(error) = tty::init() {
-        pr_err!("Failed to initialize virtual terminals: {:?}\n", error);
-    }
     shell::init_shell();
-    test::fs_boot_probe();
 
     let idle_esp = sched::idle_stack_top(0);
     sched::switch_to_idle_stack(idle_esp);

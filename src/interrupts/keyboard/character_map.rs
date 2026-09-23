@@ -25,7 +25,7 @@ pub fn get_layout() -> KeyboardLayout {
 
 pub fn toggle_layout() {
     ACTIVE_LAYOUT
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             let next = (current + 1) % (KeyboardLayout::LayoutEnd as u8);
             Some(next)
         })

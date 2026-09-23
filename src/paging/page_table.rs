@@ -85,6 +85,7 @@ const fn pte_index(virt_addr: u32) -> usize {
     ((virt_addr >> 12) & 0x3FF) as usize
 }
 
+#[unsafe(link_section = ".init.text")]
 fn clear_page_directory() {
     let pd_ptr = (unsafe { &raw mut BOOT_PAGE_DIRECTORY.0 }) as *mut u32;
     for i in 0usize..ENTRIES_PER_TABLE {
@@ -92,6 +93,7 @@ fn clear_page_directory() {
     }
 }
 
+#[unsafe(link_section = ".init.text")]
 fn fill_identity_low_table() {
     let pt_ptr = (unsafe { &raw mut BOOT_LOW_TABLE.0 }) as *mut u32;
     for i in 0usize..ENTRIES_PER_TABLE {
@@ -100,6 +102,7 @@ fn fill_identity_low_table() {
     }
 }
 
+#[unsafe(link_section = ".init.text")]
 fn fill_kernel_low_alias_table() {
     let pt_ptr = (unsafe { &raw mut BOOT_KERNEL_TABLE.0 }) as *mut u32;
     for i in 0usize..ENTRIES_PER_TABLE {
@@ -199,6 +202,7 @@ fn lookup_page_entry_ptr(virt_addr: u32) -> Option<*mut u32> {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 unsafe fn install_boot_mappings() {
     let pd_ptr = (&raw mut BOOT_PAGE_DIRECTORY.0) as *mut u32;
     let low_table_phys = (&raw const BOOT_LOW_TABLE.0) as *const u32 as u32;
@@ -213,6 +217,7 @@ unsafe fn install_boot_mappings() {
         .write(kernel_table_phys | TABLE_FLAGS)
 }
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn enable_bootstrap_paging() {
     clear_page_directory();
     fill_identity_low_table();

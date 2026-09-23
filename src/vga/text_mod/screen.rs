@@ -325,6 +325,7 @@ pub fn set_active(screen_index: usize) {
     ACTIVE_SCREEN_IDX.store(screen_index, Ordering::Relaxed);
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_virtual_screens() {
     for screen_index in 0..VIRTUAL_SCREENS_COUNT {
         with_screen_mut(screen_index, |screen| {

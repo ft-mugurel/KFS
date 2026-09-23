@@ -10,6 +10,9 @@ pub(crate) fn handle_login_line(line: &str, raw_line: &[u8]) {
     match stage {
         1 => {
             if line.is_empty() || line.len() > MAX_INPUT_LEN {
+                with_shell_state_mut(|state| {
+                    state.rendered_len = 7;
+                });
                 print("login: ");
                 return;
             }
@@ -269,4 +272,18 @@ pub(crate) fn command_logout() {
         state.rendered_len = 7;
     });
     print("login: ");
+}
+
+pub(crate) fn command_users() {
+    print(" UID  | GID  | USERNAME\n");
+    print("------+------+-----------------\n");
+    let mut count = 0usize;
+    security::for_each_account(|name, uid, gid| {
+        count += 1;
+        let name_str = core::str::from_utf8(name).unwrap_or("<invalid utf-8>");
+        print_fmt(&format_args!(" {:<4} | {:<4} | {}\n", uid, gid, name_str));
+    });
+    if count == 0 {
+        print("No user accounts found.\n");
+    }
 }

@@ -84,7 +84,7 @@ endif
 
 define link_kernel
 	@echo -e "$(YELLOW)[~] Linking Stage 1...$(RESET)"
-	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) $(1)
+	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) --whole-archive $(1) --no-whole-archive
 	@echo -e "$(YELLOW)[~] Generating kallsyms map...$(RESET)"
 	@nm -n $(KERNEL_BIN) | awk '$$2 ~ /[tTwW]/ { if ($$3 != "") print $$1 " " $$3 }' > $(BUILD_DIR)/kallsyms.tmp
 	@cmp -s $(BUILD_DIR)/kallsyms.tmp $(BUILD_DIR)/kallsyms.map || mv $(BUILD_DIR)/kallsyms.tmp $(BUILD_DIR)/kallsyms.map
@@ -92,7 +92,7 @@ define link_kernel
 	@echo -e "$(YELLOW)[~] Rebuilding Rust with embedded symbols...$(RESET)"
 	@$(CARGO) build $(CARGO_ARGS) $(2)
 	@echo -e "$(YELLOW)[~] Linking Stage 2 (Final)...$(RESET)"
-	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) $(1)
+	@$(LD) -m elf_i386 -T $(LINKER) -o $(KERNEL_BIN) $(ASM_OBJS) --whole-archive $(1) --no-whole-archive
 endef
 
 # **************************************************************************** #
@@ -119,10 +119,10 @@ $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC) | $(BUILD_DIR)
 	@echo -e "$(YELLOW)[~] Compiling trampoline.asm...$(RESET)"
 	@nasm -f bin $(TRAMPOLINE_SRC) -o $(TRAMPOLINE_BIN)
 
-build: CARGO_ARGS = --no-default-features
+build: CARGO_ARGS = --no-default-features -Zjson-target-spec
 build: $(ASM_OBJS) $(TRAMPOLINE_BIN)
 	@echo -e "$(BOLD)$(CYAN)[~] Building Release Kernel...$(RESET)"
-	@$(CARGO) build --release
+	@$(CARGO) build --release -Zjson-target-spec
 	$(call link_kernel, $(KERNEL_REL_LIB), --release)
 	@echo -e "$(BOLD)$(GREEN)[✓] RELEASE KERNEL BUILD DONE$(RESET)"
 

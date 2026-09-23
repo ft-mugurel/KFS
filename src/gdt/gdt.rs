@@ -163,6 +163,7 @@ pub fn tss_selector(cpu_id: usize) -> u16 {
 
 // pub(crate) static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn load_gdt_bsp() {
     for cpu in 0..MAX_CPUS {
         let tss_base = &raw const TSS[cpu] as u32;
@@ -181,6 +182,7 @@ pub unsafe fn load_gdt_bsp() {
     // BSP = cpu 0
 }
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn load_gdt_ap(cpu_id: usize) {
     lgdt_and_reload_segments();
     asm!(
@@ -190,6 +192,7 @@ pub unsafe fn load_gdt_ap(cpu_id: usize) {
     );
 }
 
+#[unsafe(link_section = ".init.text")]
 unsafe fn lgdt_and_reload_segments() {
     let gdt_ptr = GdtPointer {
         limit: (size_of::<[GdtEntry; GDT_ENTRIES_COUNT]>() - 1) as u16,
@@ -215,6 +218,7 @@ unsafe fn lgdt_and_reload_segments() {
     );
 }
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn gdt_pointer_bytes() -> [u8; 6] {
     let gdt_ptr = GdtPointer {
         limit: (size_of::<[GdtEntry; GDT_ENTRIES_COUNT]>() - 1) as u16,

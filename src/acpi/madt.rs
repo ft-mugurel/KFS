@@ -56,6 +56,7 @@ pub enum AcpiError {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn init() -> Option<AcpiInfo> {
     let Ok(rsdp_addr) = find_rsdp() else {
         pr_err!("Failed to find RSDP");
@@ -85,6 +86,7 @@ pub unsafe fn init() -> Option<AcpiInfo> {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 unsafe fn find_rsdp() -> Result<u32, AcpiError> {
     let ebda_seg = *(0x40E as *const u16);
     let ebda_addr = (ebda_seg as u32) << 4;
@@ -97,6 +99,7 @@ unsafe fn find_rsdp() -> Result<u32, AcpiError> {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 unsafe fn scan_for_signature(start: u32, end: u32) -> Result<u32, AcpiError> {
     let mut addr = start;
     while addr < end {
@@ -115,6 +118,7 @@ unsafe fn scan_for_signature(start: u32, end: u32) -> Result<u32, AcpiError> {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 unsafe fn checksum_ok(addr: u32, len: usize) -> bool {
     let bytes = core::slice::from_raw_parts(addr as *const u8, len);
     let mut sum: u16 = 0;
@@ -125,6 +129,7 @@ unsafe fn checksum_ok(addr: u32, len: usize) -> bool {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 unsafe fn parse(rsdp_addr: u32) -> Result<AcpiInfo, AcpiError> {
     let rsdp = rsdp_addr as *const RsdpV1;
     let rsdt = (*rsdp).rsdt_addr as *const SdtHeader;

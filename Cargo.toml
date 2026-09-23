@@ -1,7 +1,7 @@
 [package]
 name = "kernel"
-version = "0.1.0"
-edition = "2018"
+version = "0.6.0"
+edition = "2024"
 
 [profile.dev]
 opt-level = "s"
@@ -12,14 +12,13 @@ lto = true
 
 [lib]
 name = "kernel"
-edition = "2018"
+edition = "2024"
 path = "src/kernel.rs"
 crate-type = ["staticlib"]
 test = false
 bench = false
 
 [dependencies]
-x86 = "0.52"  # Check for latest version
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = { version = "0.10", default-features = false }
 

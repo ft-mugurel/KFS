@@ -211,6 +211,7 @@ unsafe extern "C" {
     fn isr_keyboard(); // the ISR we defined in NASM
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_keyboard() {
     register_interrupt_handler(KEYBOARD_IRQ_VECTOR, isr_keyboard); // IRQ1 = IDT index 32 + 1 = 33
     while (inb(pic::KEYBOARD_COMMAND_PORT) & 0x1) != 0 {

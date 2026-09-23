@@ -100,6 +100,7 @@ impl PhysicalState {
 
 static ALLOCATOR_STATE: Spinlock<PhysicalState> = Spinlock::new(PhysicalState::new());
 
+#[unsafe(link_section = ".init.text")]
 pub(super) fn init_from_multiboot(info: &MultibootInfo) {
     let mut state = ALLOCATOR_STATE.lock();
     // Start with every frame reserved, then free only bootloader-reported usable ranges.

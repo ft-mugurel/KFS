@@ -4,6 +4,7 @@ use crate::startup_config::pic;
 const PIT_MODE_SQUARE_WAVE: u8 = 0x36;
 const PIT_BASE_FREQUENCY: u32 = 1193182;
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_pit(target_hz: u32) {
     let divisor = PIT_BASE_FREQUENCY / target_hz;
 

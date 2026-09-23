@@ -30,6 +30,8 @@ static mut IDT: [IdtEntry; startup_config::idt::ENTRIES] = [IdtEntry {
     offset_high: 0,
 }; startup_config::idt::ENTRIES];
 
+
+#[unsafe(link_section = ".init.text")]
 pub fn init_idt() {
     // Initialize the IDTPointer first entry the size second the address of the first IDT entry
     let idt_ptr = IdtPointer {

@@ -135,6 +135,9 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
     0
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_syscalls() {
     register_user_interrupt_handler(SYSCALL_VECTOR, isr_syscall);
 }
+
+crate::core_initcall!(init_syscalls);

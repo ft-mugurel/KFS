@@ -69,8 +69,7 @@ pub(crate) fn has_accounts() -> bool {
 pub(crate) fn has_root_account() -> bool {
     let accounts = ACCOUNT_TABLE.lock();
     accounts.iter().flatten().any(|account| {
-        account.password.uid == 0
-            || constant_time_equal(b"root", username_bytes(&account.username))
+        account.password.uid == 0 || constant_time_equal(b"root", username_bytes(&account.username))
     })
 }
 
@@ -165,6 +164,17 @@ pub(crate) fn next_user_id() -> Option<u32> {
         .max()
         .unwrap_or(999)
         .checked_add(1)
+}
+
+pub(crate) fn for_each_account<F>(mut f: F)
+where
+    F: FnMut(&[u8], u32, u32),
+{
+    let accounts = ACCOUNT_TABLE.lock();
+    for account in accounts.iter().flatten() {
+        let name = username_bytes(&account.username);
+        f(name, account.password.uid, account.password.gid);
+    }
 }
 
 pub(crate) fn verify_password(record: &PasswordRecord, password: &[u8]) -> bool {
@@ -437,7 +447,7 @@ unsafe fn read_tsc() -> u64 {
 }
 
 fn rdrand_supported() -> bool {
-    let features = unsafe { core::arch::x86::__cpuid(1) };
+    let features = core::arch::x86::__cpuid(1);
     features.ecx & (1 << 30) != 0
 }
 

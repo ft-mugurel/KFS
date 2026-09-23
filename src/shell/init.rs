@@ -54,11 +54,13 @@ const COMMANDS: &[&str] = &[
     "mount",
     "umount",
     "useradd",
+    "users",
     "login",
     "su",
     "passwd",
     "whoami",
     "logout",
+    "initcalls",
 ];
 
 pub(crate) struct ShellState {
@@ -321,14 +323,26 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
             true
         }
         KeyCode::ArrowUp => {
-            let changed = with_shell_state_mut(|state| state.history_up());
+            let changed = with_shell_state_mut(|state| {
+                if state.login_stage == 0 {
+                    state.history_up()
+                } else {
+                    false
+                }
+            });
             if changed {
                 redraw_input_line();
             }
             true
         }
         KeyCode::ArrowDown => {
-            let changed = with_shell_state_mut(|state| state.history_down());
+            let changed = with_shell_state_mut(|state| {
+                if state.login_stage == 0 {
+                    state.history_down()
+                } else {
+                    false
+                }
+            });
             if changed {
                 redraw_input_line();
             }
@@ -354,6 +368,9 @@ pub fn handle_shell_key_event(event: KeyEvent, modifiers: Modifiers) -> bool {
             true
         }
         KeyCode::Tab => {
+            if with_shell_state_mut(|state| state.login_stage != 0) {
+                return true;
+            }
             with_shell_state_mut(|state| {
                 if state.idx == 0 || state.input[state.idx - 1] == b' ' {
                     print("\n");
@@ -477,7 +494,12 @@ fn redraw_input_line() {
             }
         }
 
-        let cursor_offset = PROMPT.len() + state.idx;
+        let visible_idx = if state.login_stage == 2 || state.login_stage == 3 {
+            0
+        } else {
+            state.idx
+        };
+        let cursor_offset = prompt.len() + visible_idx;
         let new_cursor_x = (cursor_offset % VGA_WIDTH) as u16;
         let new_cursor_y = cursor_y + (cursor_offset / VGA_WIDTH) as u16;
         set_cursor_position_on(SCREEN_INDEX, new_cursor_x, new_cursor_y);
@@ -519,7 +541,7 @@ fn run_command_line() {
         state.add_to_history(line);
     });
 
-    if is_screen_active(SCREEN_INDEX) {
+    if is_screen_active(SCREEN_INDEX) && with_shell_state_mut(|state| state.login_stage == 0) {
         print(PROMPT);
         with_shell_state_mut(|state| {
             state.idx = 0;
@@ -573,16 +595,50 @@ unsafe fn run_command(line: &str) {
         "mount" => commands::fs::command_mount(parts),
         "umount" => commands::fs::command_umount(parts),
         "useradd" => commands::auth::command_useradd(parts),
+        "users" | "userlist" => commands::auth::command_users(),
         "login" => commands::auth::command_login(parts),
         "su" => commands::auth::command_su(parts),
         "passwd" => commands::auth::command_passwd(parts),
         "whoami" => commands::auth::command_whoami(),
         "logout" => commands::auth::command_logout(),
+        "initcalls" => command_initcalls(),
         _ => {
             print("unknown command: ");
             print(command);
             print("\n");
         }
+    }
+}
+
+fn command_initcalls() {
+    print("=== Linux-Style Initcalls ===\n");
+    if let Some((start, end, pages)) = crate::initcall::freed_memory_info() {
+        print_fmt(&format_args!(
+            "Init memory reclaimed: {:#010X} - {:#010X} ({} KiB, {} pages)\n",
+            start,
+            end,
+            (end - start) / 1024,
+            pages
+        ));
+    } else {
+        print("Init memory: active / not freed\n");
+    }
+
+    let history = crate::initcall::boot_history();
+    print_fmt(&format_args!("Boot initcalls executed: {}\n", history.len()));
+    print("Lvl       Name                                Status  Address\n");
+    print("-------   ----------------------------------  ------  ----------\n");
+    for record in history {
+        let lvl_name = crate::initcall::InitcallLevel::from_u8(record.level)
+            .map_or("???", |l| l.as_str());
+        let status = if record.result == 0 { "OK" } else { "ERR" };
+        print_fmt(&format_args!(
+            "[{:<7}] {:<34}  {:<6}  {:#010X}\n",
+            lvl_name,
+            record.name,
+            status,
+            record.func_addr
+        ));
     }
 }
 
@@ -636,11 +692,14 @@ fn command_help(mut parts: str::SplitWhitespace<'_>) {
         "mount" => "mount <device-id> <target>\n  Mount an EXT2 partition at an empty directory.\n",
         "umount" => "umount <target>\n  Unmount a filesystem from a directory.\n",
         "useradd" => "useradd <name>\n  Add or update a user account.\n",
+        "users" => "users\n  List existing user accounts (UID, GID, username).\n",
+        "userlist" => "userlist\n  Alias for 'users'. List existing user accounts.\n",
         "login" => "login [user]\n  Log in with existing user credentials.\n",
         "su" => "su [user]\n  Switch user to root (default) or specified user.\n",
         "passwd" => "passwd [user]\n  Change user password.\n",
         "whoami" => "whoami\n  Print current user name.\n",
         "logout" => "logout\n  Log out from the current session.\n",
+        "initcalls" => "initcalls\n  Display boot initcall execution history and reclaimed memory stats.\n",
         _ => "Unknown command. Type 'help' for a list of commands.\n",
     });
 }

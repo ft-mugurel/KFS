@@ -29,6 +29,7 @@ pub fn first_ext2_partition() -> Option<BlockDeviceId> {
     None
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init() -> KResult<()> {
     pci::scan_and_register_block_devices()?;
     for device_id in 0..block_device::MAX_BLOCK_DEVICES {
@@ -48,3 +49,6 @@ pub fn init() -> KResult<()> {
     }
     Ok(())
 }
+
+crate::arch_initcall!(init);
+

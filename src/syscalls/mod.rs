@@ -10,5 +10,3 @@ mod signal;
 mod socket;
 mod sys;
 mod time;
-
-pub use syscalls::init_syscalls;

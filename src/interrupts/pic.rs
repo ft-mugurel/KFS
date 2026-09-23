@@ -1,6 +1,7 @@
 use crate::startup_config::pic;
 use crate::x86::{io_wait, outb};
 
+#[unsafe(link_section = ".init.text")]
 pub(crate) fn init_pic() {
     outb(pic::MASTER_COMMAND_PORT, pic::ICW1_INIT);
     io_wait();
