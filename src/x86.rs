@@ -147,7 +147,6 @@ pub fn read_ebp() -> u32 {
     value
 }
 
-#[inline(always)]
 #[unsafe(no_mangle)]
 pub fn enable_paging() {
     const CR0_PG: u32 = 1 << 31;

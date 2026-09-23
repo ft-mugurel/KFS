@@ -138,18 +138,14 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     frame.user_esp = USER_STACK_VADDR - 4;
     frame.user_ss = user_data;
 
+    let parent_opt = super::current().as_ref();
+    let credentials = parent_opt
+        .map(|p| p.credentials)
+        .unwrap_or_else(Credentials::root);
+
     let mut new_task: TaskStruct = MaybeUninit::zeroed().assume_init();
     new_task.pid = pid as u32;
-    new_task.credentials = Credentials {
-        uid: 1000,
-        gid: 1000,
-        euid: 1000,
-        egid: 1000,
-        fsuid: 1000,
-        fsgid: 1000,
-        groups: [0; 8],
-        group_count: 0,
-    };
+    new_task.credentials = credentials;
     new_task.state = ProcessState::Terminated;
     new_task.context.esp = frame_ptr as u32;
     new_task.context.cr3 = new_cr3;
@@ -170,11 +166,14 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     new_task.kernel_stack_top = k_stack_top;
     new_task.kernel_stack_bottom = k_stack_bottom;
 
-    let parent_task = super::current().as_ref().unwrap();
-    new_task.cwd = parent_task.cwd;
-    new_task.fd_tbl = parent_task.fd_tbl;
-    for global_fd in new_task.fd_tbl.iter().flatten() {
-        crate::fs::retain_open_file(*global_fd);
+    if let Some(parent_task) = parent_opt {
+        new_task.cwd = parent_task.cwd;
+        new_task.fd_tbl = parent_task.fd_tbl;
+        for global_fd in new_task.fd_tbl.iter().flatten() {
+            crate::fs::retain_open_file(*global_fd);
+        }
+    } else {
+        new_task.cwd = crate::fs::ROOT_NODE;
     }
 
     let mut locked_process_table = PROCESS_TABLE.lock();
@@ -195,10 +194,12 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
     (*ti).canary = thread_info::STACK_CANARY;
 
     // Add the new process to the parent's child list
-    let parent_task = locked_process_table[0].as_mut().unwrap();
-    if parent_task.family.child_count < super::MAX_CHILDREN {
-        parent_task.family.children[parent_task.family.child_count] = pid as u32;
-        parent_task.family.child_count += 1;
+    let parent_pid = parent_opt.map_or(0, |p| p.pid as usize);
+    if let Some(Some(parent_task)) = locked_process_table.get_mut(parent_pid) {
+        if parent_task.family.child_count < super::MAX_CHILDREN {
+            parent_task.family.children[parent_task.family.child_count] = pid as u32;
+            parent_task.family.child_count += 1;
+        }
     }
 
     locked_process_table[pid].as_mut().unwrap().state = ProcessState::Ready;

@@ -261,6 +261,7 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
     panic::clean_registers_and_halt();
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_exceptions() {
     let handlers: [unsafe extern "C" fn(); 32] = [
         isr_exception_0,

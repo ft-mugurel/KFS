@@ -81,6 +81,7 @@ pub unsafe fn write(tty: usize, input: &[u8]) -> KResult<usize> {
     Ok(input.len())
 }
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn init() -> KResult<()> {
     let root = fs::ROOT_NODE;
     let dev = fs::resolve_path("/dev", root)?;
@@ -94,6 +95,9 @@ pub unsafe fn init() -> KResult<()> {
 
     Ok(())
 }
+
+crate::device_initcall!(init);
+
 
 pub(crate) unsafe fn bind_stdio() -> KResult<()> {
     let node = fs::resolve_path("/dev/tty1", fs::ROOT_NODE)?;

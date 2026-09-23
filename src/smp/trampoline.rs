@@ -20,7 +20,8 @@ const TR_CR3_OFF: usize = TR_DATA_BASE + 6; // dd = 4 bytes
 const TR_CPU_ID_OFF: usize = TR_DATA_BASE + 10; // dd = 4 bytes
 const TR_AP_ENTRY_OFF: usize = TR_DATA_BASE + 14;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 pub unsafe extern "C" fn ap_entry(cpu_id: u32) -> ! {
     let cpu_id = cpu_id as usize;
 
@@ -37,6 +38,7 @@ pub unsafe extern "C" fn ap_entry(cpu_id: u32) -> ! {
     sched::switch_to_idle_stack(idle_esp);
 }
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn install_trampoline() {
     let required_len = TR_TMP_STACK_OFF + (super::MAX_CPUS * TR_STACK_SIZE);
     let pages_needed = (required_len + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -78,10 +80,11 @@ pub unsafe fn install_trampoline() {
 
     core::ptr::write_unaligned(
         dst.add(TR_AP_ENTRY_OFF) as *mut u32,
-        ap_entry as usize as u32,
+        ap_entry as *const () as u32,
     );
 }
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn start_ap(apic_id: u8, cpu_id: usize) {
     // tell this specific AP which cpu_id slot it is before waking it
     core::ptr::write_unaligned(

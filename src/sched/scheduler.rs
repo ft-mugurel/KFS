@@ -1,6 +1,5 @@
 use super::{
-    ContextFrame, Credentials, ProcessState, TaskStruct, MAX_PROCESSES, PROCESS_TABLE,
-    THREAD_SIZE,
+    ContextFrame, Credentials, MAX_PROCESSES, PROCESS_TABLE, ProcessState, THREAD_SIZE, TaskStruct,
 };
 use crate::gdt;
 use crate::interrupts::timer;
@@ -37,6 +36,7 @@ pub unsafe fn idle_stack_top(cpu_id: usize) -> u32 {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn init_scheduler_for_cpu(cpu_id: usize) {
     pr_info!("Initializing scheduler for CPU {}\n", cpu_id);
     let boot_cr3 = paging::bootstrap_directory_phys_addr();
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
     let current_ticks = timer::get_ticks() as u64;
 
     for task in PROCESS_TABLE.lock().iter_mut() {
-        if let Some(ref mut task) = task {
+        if let Some(task) = task {
             if task.state == ProcessState::Sleeping && current_ticks >= task.wakeup_time {
                 task.state = ProcessState::Ready;
             }

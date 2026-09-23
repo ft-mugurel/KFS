@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const SHUTDOWN_VECTOR: u8 = 0xFE;
 static PARKED_CORES: AtomicU32 = AtomicU32::new(0);
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_ipi() {
     interrupts::register_interrupt_handler(SHUTDOWN_VECTOR, shutdown_ipi_handler);
 }

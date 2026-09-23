@@ -44,7 +44,7 @@ pub fn retain_open_file(global_fd: usize) {
         return;
     }
     let mut table = OPEN_FILE_TABLE.lock();
-    if let Some(Some(ref mut open_file)) = table.get_mut(global_fd) {
+    if let Some(Some(open_file)) = table.get_mut(global_fd) {
         open_file.ref_count += 1;
     }
 }
@@ -54,7 +54,7 @@ pub fn update_open_file_offset(global_fd: usize, delta: u32) {
         return;
     }
     let mut table = OPEN_FILE_TABLE.lock();
-    if let Some(Some(ref mut open_file)) = table.get_mut(global_fd) {
+    if let Some(Some(open_file)) = table.get_mut(global_fd) {
         open_file.offset = open_file.offset.saturating_add(delta);
     }
 }
@@ -198,3 +198,16 @@ pub use vfs::{
     alloc_vfs_node, create_child_node, mount_node, print_vfs_tree, resolve_path, umount_node,
     ROOT_NODE,
 };
+
+#[unsafe(link_section = ".init.text")]
+pub fn init_root_filesystem() -> KResult<()> {
+    if let Some(device_id) = crate::drivers::first_ext2_partition() {
+        unsafe { ext2::mount_device(device_id) }?;
+    } else {
+        crate::pr_warn!("No EXT2 partition found for the root filesystem\n");
+    }
+    Ok(())
+}
+
+crate::fs_initcall!(init_root_filesystem);
+

@@ -1,8 +1,8 @@
 use crate::error::KernelError;
 use crate::fs::{self, VfsNodeType};
 use crate::sched::{self, ContextFrame};
-use crate::utils;
 use crate::security::{self, Decision, Operation};
+use crate::utils;
 
 fn parse_parent_path(path: &str) -> Result<(&str, &str), KernelError> {
     if path.is_empty() || path == "/" {
@@ -49,7 +49,7 @@ unsafe fn find_child(mut node: *mut fs::VfsNode, name: &str) -> *mut fs::VfsNode
             .iter()
             .position(|&c| c == 0)
             .unwrap_or((*node).name.len());
-        if core::str::from_utf8(&(*node).name[..name_len]).unwrap_or("") == name {
+        if core::str::from_utf8(&(&(*node).name)[..name_len]).unwrap_or("") == name {
             return node;
         }
         node = (*node).next_of_kin;
@@ -133,8 +133,11 @@ pub unsafe fn syscall_mount(regs: *mut ContextFrame) {
     let target_path = utils::c_str_to_rust(target_ptr);
     let task = sched::current().as_mut().unwrap();
 
-    if security::check(&task.credentials, &security::SecurityObject::System, Operation::Mount)
-        == Decision::Deny
+    if security::check(
+        &task.credentials,
+        &security::SecurityObject::System,
+        Operation::Mount,
+    ) == Decision::Deny
     {
         (*regs).set_return_error(KernelError::EPERM);
         return;
@@ -195,8 +198,11 @@ pub unsafe fn syscall_umount(regs: *mut ContextFrame) {
     let target_path = utils::c_str_to_rust(target_ptr);
 
     let credentials = &sched::current().as_ref().unwrap().credentials;
-    if security::check(credentials, &security::SecurityObject::System, Operation::Unmount)
-        == Decision::Deny
+    if security::check(
+        credentials,
+        &security::SecurityObject::System,
+        Operation::Unmount,
+    ) == Decision::Deny
     {
         (*regs).set_return_error(KernelError::EPERM);
         return;

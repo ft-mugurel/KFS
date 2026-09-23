@@ -39,6 +39,7 @@ static LAPIC_BASE: AtomicU32 = AtomicU32::new(0);
 /// Called once by the BSP, after ACPI/MADT parsing gives us the physical base.
 /// Physical == virtual here (identity mapping), since page tables are shared
 /// across all cores — every core sees this same mapping once CR3 is loaded.
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn map_lapic(phys_base: u32) {
     paging::map_page(
         phys_base,
@@ -51,6 +52,7 @@ pub unsafe fn map_lapic(phys_base: u32) {
 
 static mut LAPIC_TICKS_PER_MS: u32 = 0;
 
+#[unsafe(link_section = ".init.text")]
 pub unsafe fn calibrate() {
     reg_write(REG_TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
     reg_write(REG_LVT_TIMER, TIMER_MASKED); // don't fire yet, just measuring

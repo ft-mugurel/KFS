@@ -272,7 +272,7 @@ pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNod
 
         while !child.is_null() {
             let name_len = (*child).name.iter().position(|&c| c == 0).unwrap_or(256);
-            let child_name = core::str::from_utf8(&(*child).name[..name_len]).unwrap_or("");
+            let child_name = core::str::from_utf8(&(&(*child).name)[..name_len]).unwrap_or("");
 
             if child_name == segment {
                 current = child;

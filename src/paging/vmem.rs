@@ -64,6 +64,7 @@ fn pages_bytes(pages: usize) -> Option<u32> {
     }
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_vmem() {
     unsafe {
         for i in 0usize..MAX_VIRTUAL_ALLOCS {

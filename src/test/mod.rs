@@ -1,6 +1,7 @@
 use crate::fs::{self, VfsNodeType};
 use crate::pr_info;
 
+#[unsafe(link_section = ".init.text")]
 pub(crate) fn fs_boot_probe() {
     unsafe {
         let root = fs::ROOT_NODE;
@@ -41,6 +42,9 @@ pub(crate) fn fs_boot_probe() {
         pr_info!("fs_boot_probe: mount helpers validated\n");
     }
 }
+
+crate::late_initcall!(fs_boot_probe);
+
 
 #[unsafe(no_mangle)]
 pub(crate) unsafe fn process_socket() {

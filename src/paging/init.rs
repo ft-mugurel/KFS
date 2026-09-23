@@ -9,6 +9,7 @@ use super::vmem;
 
 use crate::{pr_debug, x86};
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_paging(multiboot_magic: u32, multiboot_info_addr: u32) {
     assert_eq!(
         multiboot_magic, MULTIBOOT_BOOTLOADER_MAGIC,

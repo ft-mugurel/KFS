@@ -30,6 +30,7 @@ pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
     next_esp
 }
 
+#[unsafe(link_section = ".init.text")]
 pub fn init_timer() {
     pr_debug!("Initializing timer with {} Hz frequency\n", CONFIG_HZ);
     init_pit(CONFIG_HZ);
