@@ -107,4 +107,5 @@ pub const EXT2_BACKEND: FsBackend = FsBackend {
     write: write_to_inode,
     truncate: truncate_inode,
     lazy_load_directory: lazy_load_directory,
+    unlink: unlink_node,
 };

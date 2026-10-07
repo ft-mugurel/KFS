@@ -1,8 +1,8 @@
-use crate::error::KernelError;
-use crate::sched::{
-    self, current_pid, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE,
+use crate::{
+    error::KernelError,
+    fs, paging, pr_info, pr_warn,
+    sched::{self, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE, current_pid},
 };
-use crate::{paging, pr_info, pr_warn};
 
 pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let parent_task = sched::current().as_mut().unwrap();
@@ -59,7 +59,8 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
             return;
         }
     };
-    let child_kstack_top = paging::phys_to_virt(child_kstack_phys) as u32 + sched::THREAD_SIZE as u32;
+    let child_kstack_top =
+        paging::phys_to_virt(child_kstack_phys) as u32 + sched::THREAD_SIZE as u32;
     let child_kstack_bottom = child_kstack_top - sched::THREAD_SIZE as u32;
 
     let child_frame_ptr =
@@ -110,7 +111,10 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     // Increment global reference counts for inherited files
     for i in 0..MAX_FDS_PER_PROCESS {
         if let Some(global_fd) = child_task.fd_tbl[i] {
-            crate::fs::retain_open_file(global_fd);
+            fs::retain_open_file(global_fd);
+            if let Some(open_file) = fs::get_open_file(global_fd) {
+                fs::vfs_ref_get(open_file.node);
+            }
         }
     }
 

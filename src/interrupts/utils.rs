@@ -3,6 +3,9 @@ use crate::x86::{outb, outw};
 use crate::startup_config::power;
 
 pub(crate) fn request_reboot() {
+    let _ = crate::printk::file_logger::flush_to_file();
+    let _ = unsafe { crate::fs::buffer_cache::bsync() };
+
     outb(
         power::KEYBOARD_CONTROLLER_COMMAND_PORT,
         power::KEYBOARD_CONTROLLER_REBOOT,

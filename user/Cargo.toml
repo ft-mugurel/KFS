@@ -1,0 +1,17 @@
+[package]
+name = "sh"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+[[bin]]
+name = "sh"
+path = "src/main.rs"

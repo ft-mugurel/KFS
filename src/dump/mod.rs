@@ -2,8 +2,6 @@ mod kallsyms;
 mod memory;
 mod stack;
 
-pub const MEMDUMP_DEFAULT_LEN: usize = 128;
-pub const MEMDUMP_MAX_LEN: usize = 512;
 pub const DEFAULT_DUMP_WORDS: usize = 10;
 pub const MAX_DUMP_WORDS: usize = 64;
 pub const DEFAULT_TRACE_FRAMES: usize = 10;

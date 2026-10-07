@@ -84,6 +84,15 @@ pub unsafe fn close_open_file(global_fd: usize) {
         if !node.is_null() && (*node).node_type == VfsNodeType::Socket {
             let sock_idx = (*node).inode as usize;
             crate::ipc::close_socket(sock_idx);
+        } else if !node.is_null() && (*node).node_type == VfsNodeType::Fifo {
+            let inode = (*node).inode;
+            let pipe_id = (inode >> 1) as usize;
+            let dir = inode & 1;
+            if dir == 0 {
+                crate::pipe::close_read_end(pipe_id);
+            } else {
+                crate::pipe::close_write_end(pipe_id);
+            }
         }
     }
 }
@@ -106,6 +115,7 @@ pub struct VfsNode {
     pub node_type: VfsNodeType,
     pub inode: u32,
     pub links: u32,
+    pub ref_count: u32,
     pub master: *mut VfsNode,
     pub father: *mut VfsNode,
     pub children: *mut VfsNode,
@@ -129,6 +139,8 @@ pub struct Mount {
 #[derive(Clone, Copy)]
 pub enum MountPrivate {
     Ext2(Ext2Mount),
+    Procfs,
+    Sysfs,
     #[allow(dead_code)]
     Raw,
 }
@@ -158,13 +170,14 @@ pub struct FsBackend {
     pub truncate: unsafe fn(mount: *const Mount, inode_num: u32) -> KResult<()>,
     pub lazy_load_directory:
         unsafe fn(mount: *const Mount, dir_node: *mut VfsNode, dir_node_num: u32) -> KResult<()>,
+    pub unlink: unsafe fn(mount: *const Mount, parent_inode: u32, name: &str) -> KResult<()>,
 }
 
 const MOUNT_TABLE_SIZE: usize = 16;
 static MOUNT_TABLE: Spinlock<[Option<Mount>; MOUNT_TABLE_SIZE]> =
     Spinlock::new([None; MOUNT_TABLE_SIZE]);
 
-pub(self) fn register_mount<F>(create_mount: F) -> KResult<*const Mount>
+pub(crate) fn register_mount<F>(create_mount: F) -> KResult<*const Mount>
 where
     F: FnOnce(usize) -> Mount,
 {
@@ -178,6 +191,13 @@ where
     Err(KernelError::ENOSPC)
 }
 
+pub fn for_each_mount<F: FnMut(&Mount)>(mut f: F) {
+    let table = MOUNT_TABLE.lock();
+    for entry in table.iter().flatten() {
+        f(entry);
+    }
+}
+
 #[allow(dead_code)]
 pub(self) fn get_mount(index: usize) -> KResult<Mount> {
     let table = MOUNT_TABLE.lock();
@@ -189,25 +209,58 @@ pub(self) fn get_mount(index: usize) -> KResult<Mount> {
     Err(KernelError::EINVAL)
 }
 
-// mod buffer_cache;
+pub mod buffer_cache;
 mod vfs;
 
 pub mod ext2;
+pub mod hierarchy;
+pub mod proc;
+pub mod procfs;
+pub mod sysfs;
 
 pub use vfs::{
-    alloc_vfs_node, create_child_node, mount_node, print_vfs_tree, resolve_path, umount_node,
-    ROOT_NODE,
+    alloc_vfs_node, append_child, create_child_node, mount_node, print_vfs_tree, resolve_path,
+    umount_node, ROOT_NODE,
 };
+pub(crate) use vfs::{vfs_ref_get, vfs_ref_put};
 
+static mut ROOT_FILESYSTEM_READY: bool = false;
+static mut PERSISTENT_HIERARCHY_READY: bool = false;
+static mut RUNTIME_FILESYSTEMS_READY: bool = false;
+static mut DEV_READY: bool = false;
+
+pub fn root_filesystem_ready() -> bool {
+    unsafe {
+        ROOT_FILESYSTEM_READY
+            && PERSISTENT_HIERARCHY_READY
+            && RUNTIME_FILESYSTEMS_READY
+            && DEV_READY
+    }
+}
+
+pub unsafe fn mark_persistent_hierarchy_ready() {
+    PERSISTENT_HIERARCHY_READY = true;
+}
+
+pub unsafe fn mark_runtime_filesystems_ready() {
+    RUNTIME_FILESYSTEMS_READY = true;
+}
+
+pub unsafe fn mark_dev_ready() {
+    DEV_READY = true;
+}
 #[unsafe(link_section = ".init.text")]
 pub fn init_root_filesystem() -> KResult<()> {
-    if let Some(device_id) = crate::drivers::first_ext2_partition() {
-        unsafe { ext2::mount_device(device_id) }?;
-    } else {
-        crate::pr_warn!("No EXT2 partition found for the root filesystem\n");
+    let device_id = crate::drivers::first_ext2_partition()
+        .ok_or(KernelError::ENODEV)?;
+
+    unsafe {
+        ext2::mount_device(device_id)?;
+        hierarchy::init_unix_hierarchy()?;
+        ROOT_FILESYSTEM_READY = true;
     }
+
     Ok(())
 }
 
 crate::fs_initcall!(init_root_filesystem);
-

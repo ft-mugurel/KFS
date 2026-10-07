@@ -1,19 +1,27 @@
-use crate::dump::lookup;
-use crate::error::KernelError;
-use crate::interrupts::register_user_interrupt_handler;
-use crate::sched::{self, ContextFrame};
-use crate::{pr_debug, pr_warn};
+use crate::{
+    dump::lookup,
+    error::KernelError,
+    interrupts::register_user_interrupt_handler,
+    pr_debug, pr_warn,
+    sched::{self, ContextFrame},
+};
 
-use super::exit::{syscall_exit, syscall_wait};
-use super::fork::syscall_fork;
-use super::fs::{syscall_mknod, syscall_mount, syscall_umount};
-use super::mem::{syscall_mmap, syscall_munmap, syscall_sbrk};
-use super::open::{syscall_close, syscall_open};
-use super::read_write::{syscall_read, syscall_write};
-use super::signal::{syscall_kill, syscall_signal};
-use super::socket::syscall_socket;
-use super::sys::syscall_getuid;
-use super::time::syscall_nanosleep;
+use super::{
+    chdir::{syscall_chdir, syscall_getcwd},
+    debug::syscall_debug,
+    exit::{syscall_exit, syscall_wait},
+    fork::syscall_fork,
+    fs::{syscall_getdents, syscall_mknod, syscall_mount, syscall_umount, syscall_unlink},
+    info::{syscall_getpid, syscall_getppid},
+    mem::{syscall_mmap, syscall_munmap, syscall_sbrk},
+    open::{syscall_close, syscall_dup2, syscall_open},
+    pipe::syscall_pipe,
+    read_write::{syscall_read, syscall_write},
+    signal::{syscall_kill, syscall_signal},
+    socket::syscall_socket,
+    sys::{syscall_getttyname, syscall_getuid, syscall_getusername, syscall_login},
+    time::syscall_nanosleep,
+};
 
 unsafe extern "C" {
     fn isr_syscall();
@@ -55,15 +63,29 @@ static mut SYSCALL_ENTRIES: [Option<SyscallEntry>; MAX_SYSCALL_NUMBER] = {
     table[4] = Some(SyscallEntry::Normal(syscall_write)); // write(fd, buf, len)
     table[5] = Some(SyscallEntry::Normal(syscall_open)); // open(path, flags)
     table[6] = Some(SyscallEntry::Normal(syscall_close)); // close(fd)
+    table[10] = Some(SyscallEntry::Normal(syscall_unlink)); // unlink(path)
+    table[12] = Some(SyscallEntry::Normal(syscall_chdir)); // chdir(path)
     table[14] = Some(SyscallEntry::Normal(syscall_mknod)); // mknod(path, mode)
     table[21] = Some(SyscallEntry::Normal(syscall_mount)); // mount(source, target, fstype, flags, data)
     table[52] = Some(SyscallEntry::Normal(syscall_umount)); // umount(target)
+    table[63] = Some(SyscallEntry::Normal(syscall_dup2)); // dup2(old_fd, new_fd)
+    table[141] = Some(SyscallEntry::Normal(syscall_getdents)); // getdents(fd, dirp, count)
+    table[183] = Some(SyscallEntry::Normal(syscall_getcwd)); // getcwd(buf, size)
 
-    // System info
-    table[24] = Some(SyscallEntry::Normal(syscall_getuid)); // getuid()
+    // Debugging & system control
+    table[223] = Some(SyscallEntry::Normal(syscall_debug)); // debug(op, ...)
+
+    // System info & auth
+    table[20] = Some(SyscallEntry::Normal(syscall_getpid)); // getpid()
+    table[64] = Some(SyscallEntry::Normal(syscall_getppid)); // getppid()
+    table[199] = Some(SyscallEntry::Normal(syscall_getuid)); // getuid()
+    table[212] = Some(SyscallEntry::Normal(syscall_login)); // login(user, pass)
+    table[213] = Some(SyscallEntry::Normal(syscall_getusername)); // getusername(buf, size)
+    table[214] = Some(SyscallEntry::Normal(syscall_getttyname)); // getttyname(fd, buf, size)
 
     // Signals
     table[37] = Some(SyscallEntry::Normal(syscall_kill)); // kill(pid, sig)
+    table[42] = Some(SyscallEntry::Normal(syscall_pipe)); // pipe(pipefd)
     table[48] = Some(SyscallEntry::Normal(syscall_signal)); // signal(sig, handler)
 
     // Memory
@@ -105,12 +127,6 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
                 .last()
                 .unwrap_or("unknown");
 
-            pr_debug!(
-                "Syscall: {} from EIP: {:#x}\n",
-                syscall_name,
-                (*regs).eip as u32
-            );
-
             let result = entry.invoke(regs);
 
             if (*regs).is_error() {
@@ -126,7 +142,13 @@ pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
                     (*regs).get_return_value()
                 );
             }
-            return result;
+            if result != 0 {
+                return result;
+            }
+            if task.state == sched::ProcessState::Waiting {
+                return sched::schedule(regs as u32);
+            }
+            return 0;
         }
     }
 

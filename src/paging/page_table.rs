@@ -335,6 +335,7 @@ pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
             let child_pt_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
             let child_pt = phys_to_virt(child_pt_phys) as *mut u32;
             let parent_pt = phys_to_virt(pde & PAGE_FRAME_MASK) as *const u32;
+            let parent_pt_mut = phys_to_virt(pde & PAGE_FRAME_MASK) as *mut u32;
 
             core::ptr::write_bytes(child_pt, 0, 1024);
             child_pd.add(pde_idx).write(child_pt_phys | (pde & 0xFFF)); // Preserve original flags
@@ -343,14 +344,12 @@ pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
                 let pte = parent_pt.add(pte_idx).read();
 
                 if (pte & PAGE_PRESENT) != 0 && (pte & PAGE_USER) != 0 {
-                    // Allocate a new physical frame for the actual data
-                    let data_phys = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
-                    let data_virt_child = phys_to_virt(data_phys) as *mut u8;
-                    let data_virt_parent = phys_to_virt(pte & PAGE_FRAME_MASK) as *const u8;
+                    let data_phys = pte & PAGE_FRAME_MASK;
+                    let new_pte = pte & !PAGE_WRITABLE;
 
-                    core::ptr::copy_nonoverlapping(data_virt_parent, data_virt_child, 4096);
-
-                    child_pt.add(pte_idx).write(data_phys | (pte & 0xFFF));
+                    parent_pt_mut.add(pte_idx).write(new_pte);
+                    physical::frame_ref_inc(data_phys);
+                    child_pt.add(pte_idx).write(new_pte);
                 } else if (pte & PAGE_PRESENT) != 0 {
                     // Present but Kernel-owned
                     child_pt.add(pte_idx).write(pte);
@@ -362,6 +361,8 @@ pub unsafe fn clone_address_space(parent_cr3: u32) -> KResult<u32> {
             child_pd.add(pde_idx).write(0);
         }
     }
+
+    x86::write_cr3(parent_cr3);
 
     Ok(child_pd_phys)
 }
@@ -381,8 +382,10 @@ pub unsafe fn free_user_address_space(cr3: u32) {
 
                 if (pte & PAGE_PRESENT) != 0 && (pte & PAGE_USER) != 0 {
                     let data_phys = pte & PAGE_FRAME_MASK;
-                    physical::free_physical_page(data_phys)
-                        .consume_err("Failed to free physical page in user address space");
+                    if physical::frame_ref_dec(data_phys) == 0 {
+                        physical::free_physical_page(data_phys)
+                            .consume_err("Failed to free physical page in user address space");
+                    }
                 }
             }
 

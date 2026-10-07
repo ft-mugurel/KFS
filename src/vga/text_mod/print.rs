@@ -124,21 +124,7 @@ fn backspace(screen: &mut VirtualScreen) -> Option<(usize, usize)> {
     Some((line, column))
 }
 
-fn write_raw_byte(screen: &mut VirtualScreen, byte: u8) -> WriteOutcome {
-    if byte == b'\n' {
-        for _ in 0..1000 {
-            if (crate::x86::inb(0x3F8 + 5) & 0x20) != 0 {
-                break;
-            }
-        }
-        crate::x86::outb(0x3F8, b'\r');
-    }
-    for _ in 0..1000 {
-        if (crate::x86::inb(0x3F8 + 5) & 0x20) != 0 {
-            break;
-        }
-    }
-    crate::x86::outb(0x3F8, byte);
+fn write_screen_byte(screen: &mut VirtualScreen, byte: u8) -> WriteOutcome {
     match byte {
         b'\n' => {
             let force_full_redraw = newline_with_scroll(screen);
@@ -184,56 +170,99 @@ fn write_raw_byte(screen: &mut VirtualScreen, byte: u8) -> WriteOutcome {
     }
 }
 
-pub fn write_str_on(screen: &mut VirtualScreen, text: &str) {
-    let mut escape_mode = false;
-    for &byte in text.as_bytes() {
-        if byte == 0x1B {
-            escape_mode = true;
-            screen.clear_esc_seq_color();
-            continue;
-        }
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum EscState {
+    Normal,
+    Esc,
+    Csi { buf: [u8; 16], len: usize },
+    CustomColor,
+}
 
-        if !escape_mode {
-            let top_line_before = screen::visible_top_line_of(screen);
-            let outcome = write_raw_byte(screen, byte);
-            finalize_write(screen, top_line_before, outcome);
-        } else {
-            /*
-             * 0x10      -> is_background flag
-             * 0x00-0x0F -> colors
-             * ';'       -> separator for multiple color codes
-             * 'm'       -> end of escape sequence
-             *
-             * Empty sequences or unrecognized codes will reset the modifications
-             * Refer to vga::text_mod::out::Color for mapping
-             */
-            if byte <= 0x20 {
-                let is_background = byte & 0x10 != 0;
-                let color_code = byte & 0x0F;
-                if is_background {
-                    screen.set_esc_seq_color_background(Color::from_u8(color_code));
+pub fn write_str_on(screen: &mut VirtualScreen, text: &str) {
+    let _guard = crate::serial::SERIAL_LOCK.lock();
+    let mut state = EscState::Normal;
+
+    for &byte in text.as_bytes() {
+        crate::serial::write_byte_unlocked(byte);
+
+        match state {
+            EscState::Normal => {
+                if byte == 0x1B {
+                    state = EscState::Esc;
+                    screen.clear_esc_seq_color();
+                } else if byte == 0x0C {
+                    // Form feed (Ctrl+L) -> clear screen
+                    screen::clear_screen_internal(screen);
                 } else {
-                    screen.set_esc_seq_color_foreground(Color::from_u8(color_code));
+                    let top_line_before = screen::visible_top_line_of(screen);
+                    let outcome = write_screen_byte(screen, byte);
+                    finalize_write(screen, top_line_before, outcome);
                 }
-            } else if byte == b';' {
-                continue;
-            } else if byte == b'm' {
-                escape_mode = false;
-            } else {
-                screen.clear_esc_seq_color();
-                escape_mode = false;
+            }
+            EscState::Esc => {
+                if byte == b'[' {
+                    state = EscState::Csi { buf: [0; 16], len: 0 };
+                } else if byte <= 0x20 {
+                    state = EscState::CustomColor;
+                    let is_background = byte & 0x10 != 0;
+                    let color_code = byte & 0x0F;
+                    if is_background {
+                        screen.set_esc_seq_color_background(Color::from_u8(color_code));
+                    } else {
+                        screen.set_esc_seq_color_foreground(Color::from_u8(color_code));
+                    }
+                } else {
+                    screen.clear_esc_seq_color();
+                    state = EscState::Normal;
+                }
+            }
+            EscState::CustomColor => {
+                if byte <= 0x20 {
+                    let is_background = byte & 0x10 != 0;
+                    let color_code = byte & 0x0F;
+                    if is_background {
+                        screen.set_esc_seq_color_background(Color::from_u8(color_code));
+                    } else {
+                        screen.set_esc_seq_color_foreground(Color::from_u8(color_code));
+                    }
+                } else if byte == b';' {
+                    continue;
+                } else if byte == b'm' {
+                    state = EscState::Normal;
+                } else {
+                    screen.clear_esc_seq_color();
+                    state = EscState::Normal;
+                }
+            }
+            EscState::Csi { mut buf, mut len } => {
+                if (byte >= b'0' && byte <= b'9') || byte == b';' || byte == b'?' {
+                    if len < buf.len() {
+                        buf[len] = byte;
+                        len += 1;
+                    }
+                    state = EscState::Csi { buf, len };
+                } else {
+                    match byte {
+                        b'J' => {
+                            // \x1b[2J, \x1b[3J, \x1b[J: clear screen
+                            screen::clear_screen_internal(screen);
+                        }
+                        b'H' | b'f' => {
+                            // \x1b[H, \x1b[1;1H: cursor position to home
+                            screen::set_cursor_home(screen);
+                        }
+                        b'm' => {
+                            if len == 0 || (len == 1 && buf[0] == b'0') {
+                                screen.clear_esc_seq_color();
+                            }
+                        }
+                        _ => {}
+                    }
+                    state = EscState::Normal;
+                }
             }
         }
     }
-}
-
-pub fn print_char_on(screen_index: usize, c: char) {
-    screen::with_screen_mut(screen_index, |screen| {
-        let byte = if (c as u32) <= 0xFF { c as u8 } else { b'?' };
-        let top_line_before = screen::visible_top_line_of(screen);
-        let outcome = write_raw_byte(screen, byte);
-        finalize_write(screen, top_line_before, outcome);
-    });
 }
 
 pub fn print_str_on(screen_index: usize, str: &str) {

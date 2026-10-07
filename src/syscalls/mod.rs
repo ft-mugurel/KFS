@@ -10,3 +10,7 @@ mod signal;
 mod socket;
 mod sys;
 mod time;
+mod chdir;
+mod info;
+mod pipe;
+pub mod debug;

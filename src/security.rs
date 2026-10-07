@@ -62,10 +62,6 @@ pub(crate) static ACCOUNT_TABLE: Spinlock<[Option<AccountRecord>; MAX_ACCOUNTS]>
     Spinlock::new([EMPTY; MAX_ACCOUNTS])
 };
 
-pub(crate) fn has_accounts() -> bool {
-    ACCOUNT_TABLE.lock().iter().any(Option::is_some)
-}
-
 pub(crate) fn has_root_account() -> bool {
     let accounts = ACCOUNT_TABLE.lock();
     accounts.iter().flatten().any(|account| {
@@ -490,6 +486,18 @@ pub(crate) fn install_or_update_account(account: AccountRecord) -> bool {
     }
 }
 
+pub(crate) fn remove_account(username: &[u8]) -> bool {
+    let mut accounts = ACCOUNT_TABLE.lock();
+    let Some(account) = accounts.iter_mut().find(|slot| {
+        slot.as_ref()
+            .is_some_and(|account| constant_time_equal(username, username_bytes(&account.username)))
+    }) else {
+        return false;
+    };
+    *account = None;
+    true
+}
+
 pub(crate) fn serialize_accounts(output: &mut [u8]) -> Option<usize> {
     let accounts = ACCOUNT_TABLE.lock();
     let mut written: usize = 0;
@@ -519,26 +527,9 @@ pub(crate) fn serialize_accounts(output: &mut [u8]) -> Option<usize> {
 
 pub(crate) unsafe fn persist_accounts() -> bool {
     let root = crate::fs::ROOT_NODE;
-    let etc = match crate::fs::resolve_path("/etc", root) {
-        Ok(node) => node,
-        Err(_) => match crate::fs::create_child_node(
-            root,
-            "etc",
-            crate::fs::VfsNodeType::Directory,
-            0o755,
-        ) {
-            Ok(node) => node,
-            Err(_) => return false,
-        },
-    };
     let shadow = match crate::fs::resolve_path("/etc/shadow", root) {
         Ok(node) => node,
-        Err(_) => {
-            match crate::fs::create_child_node(etc, "shadow", crate::fs::VfsNodeType::File, 0o600) {
-                Ok(node) => node,
-                Err(_) => return false,
-            }
-        }
+        Err(_) => return false,
     };
     if (*shadow).inode == 0 || (*shadow).node_type != crate::fs::VfsNodeType::File {
         return false;
@@ -592,11 +583,7 @@ fn append_decimal(output: &mut [u8], mut offset: usize, mut value: u32) -> Optio
         count -= 1;
         offset = append_byte(output, offset, digits[count])?;
     }
-    if offset == start {
-        None
-    } else {
-        Some(offset)
-    }
+    if offset == start { None } else { Some(offset) }
 }
 
 fn append_hex<const SIZE: usize>(

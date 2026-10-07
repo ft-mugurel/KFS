@@ -9,16 +9,6 @@ pub mod vga {
     pub const SCROLLBACK_LINES: usize = 200;
 }
 
-pub mod shell {
-    pub const SCREEN_INDEX: usize = 0;
-    pub const MAX_INPUT_LEN: usize = 128;
-}
-
-pub mod logging {
-    pub const DEFAULT_LOG_SCREEN: usize = 1;
-    pub const DEFAULT_DEBUG_LOG_SCREEN: usize = 2;
-}
-
 pub mod idt {
     pub const ENTRIES: usize = 256; // Max number of IDT entries cpu can have
 }

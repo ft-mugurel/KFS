@@ -52,7 +52,6 @@ pub unsafe fn map_lapic(phys_base: u32) {
 
 static mut LAPIC_TICKS_PER_MS: u32 = 0;
 
-#[unsafe(link_section = ".init.text")]
 pub unsafe fn calibrate() {
     reg_write(REG_TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
     reg_write(REG_LVT_TIMER, TIMER_MASKED); // don't fire yet, just measuring

@@ -41,6 +41,13 @@ ASM_OBJS        = $(patsubst $(ASM_DIR)/%.asm, $(BUILD_DIR)/%.o, $(ASM_SRCS))
 TRAMPOLINE_SRC = src/smp/trampoline.asm
 TRAMPOLINE_BIN = $(BUILD_DIR)/trampoline.bin
 
+USER_SHELL_DIR  = user
+USER_SHELL_SRCS = $(shell find $(USER_SHELL_DIR)/src -name '*.rs') $(USER_SHELL_DIR)/Cargo.toml $(USER_SHELL_DIR)/linker.ld
+USER_SHELL_BIN  = $(BUILD_DIR)/sh.bin
+USER_SHELL_ELF  = $(BUILD_DIR)/user_target/i686-kernel/release/sh
+FHS_STAGE       = $(BUILD_DIR)/fhs-root
+FHS_STAMP       = $(BUILD_DIR)/fhs-root.stamp
+
 # **************************************************************************** #
 # 
 # **************************************************************************** #
@@ -106,29 +113,54 @@ $(BUILD_DIR)/%.o: $(ASM_DIR)/%.asm
 	@$(NASM) -f elf32 $< -o $@
 	@echo -e "$(CYAN)[+] NASM compiled: $<$(RESET)"
 
-$(ATA_DRIVE_IMGS): Makefile
+$(FHS_STAMP): $(USER_SHELL_BIN) Makefile
+	@echo -e "$(YELLOW)[~] Preparing persistent FHS root image tree...$(RESET)"
+	@rm -f $(FHS_STAGE)/.populated
+	@mkdir -p $(FHS_STAGE)/bin $(FHS_STAGE)/boot $(FHS_STAGE)/etc $(FHS_STAGE)/home $(FHS_STAGE)/lib $(FHS_STAGE)/media $(FHS_STAGE)/mnt $(FHS_STAGE)/opt $(FHS_STAGE)/root $(FHS_STAGE)/run $(FHS_STAGE)/sbin $(FHS_STAGE)/srv $(FHS_STAGE)/dev $(FHS_STAGE)/proc $(FHS_STAGE)/sys $(FHS_STAGE)/tmp
+	@mkdir -p $(FHS_STAGE)/usr/bin $(FHS_STAGE)/usr/sbin $(FHS_STAGE)/usr/lib $(FHS_STAGE)/usr/share
+	@mkdir -p $(FHS_STAGE)/var/cache $(FHS_STAGE)/var/lib $(FHS_STAGE)/var/log $(FHS_STAGE)/var/spool $(FHS_STAGE)/var/tmp
+	@cp $(USER_SHELL_BIN) $(FHS_STAGE)/usr/bin/mysh
+	@chmod 0755 $(FHS_STAGE)/usr/bin/mysh
+	@chmod 0700 $(FHS_STAGE)/root
+	@touch $(FHS_STAGE)/etc/shadow $(FHS_STAGE)/var/log/kernel.log
+	@chmod 0600 $(FHS_STAGE)/etc/shadow
+	@chmod 0644 $(FHS_STAGE)/var/log/kernel.log
+	@chmod 01777 $(FHS_STAGE)/tmp $(FHS_STAGE)/var/tmp
+	@touch $(FHS_STAMP)
+	@echo -e "$(GREEN)[✓] Persistent FHS root image tree prepared$(RESET)"
+
+$(ATA_DRIVE_IMGS): Makefile $(FHS_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@echo -e "$(YELLOW)[~] Creating partitioned ATA drive image: $@...$(RESET)"
 	@dd if=/dev/zero of=$@ bs=1M count=$(ATA_DRIVE_SIZE_MB) status=none
 	@printf 'label: dos\nunit: sectors\n\nstart=$(ATA_PARTITION_START), size=$(ATA_PARTITION_SECTORS), type=83\n' | sfdisk --quiet $@
 	@echo -e "$(YELLOW)[~] Formatting ATA partition with ext2 filesystem...$(RESET)"
-	@mkfs.ext2 -q -E offset=$$(($(ATA_PARTITION_START) * 512)) $@
+	@mkfs.ext2 -q -d $(FHS_STAGE) -E offset=$$(($(ATA_PARTITION_START) * 512)) $@
 	@echo -e "$(GREEN)[✓] ATA drive image created: $@$(RESET)"
 
-$(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC) | $(BUILD_DIR)
+$(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
+	@mkdir -p $(BUILD_DIR)
 	@echo -e "$(YELLOW)[~] Compiling trampoline.asm...$(RESET)"
 	@nasm -f bin $(TRAMPOLINE_SRC) -o $(TRAMPOLINE_BIN)
 
+$(USER_SHELL_BIN): $(USER_SHELL_SRCS)
+	@mkdir -p $(BUILD_DIR)
+	@echo -e "$(YELLOW)[~] Building user-space shell in Rust...$(RESET)"
+	@RUSTFLAGS="-C link-arg=-T$(abspath $(USER_SHELL_DIR)/linker.ld)" $(CARGO) build --release --manifest-path $(USER_SHELL_DIR)/Cargo.toml -Zjson-target-spec --target $(abspath i686-kernel.json) --target-dir $(BUILD_DIR)/user_target
+	@objcopy -O binary $(USER_SHELL_ELF) $@
+	@echo -e "$(GREEN)[✓] User shell binary built: $@$(RESET)"
+
 build: CARGO_ARGS = --no-default-features -Zjson-target-spec
-build: $(ASM_OBJS) $(TRAMPOLINE_BIN)
+build: $(ASM_OBJS) $(TRAMPOLINE_BIN) $(USER_SHELL_BIN)
 	@echo -e "$(BOLD)$(CYAN)[~] Building Release Kernel...$(RESET)"
 	@$(CARGO) build --release -Zjson-target-spec
 	$(call link_kernel, $(KERNEL_REL_LIB), --release)
 	@echo -e "$(BOLD)$(GREEN)[✓] RELEASE KERNEL BUILD DONE$(RESET)"
 
-build_debug: $(ASM_OBJS) $(TRAMPOLINE_BIN)
+build_debug: CARGO_ARGS = -Zjson-target-spec
+build_debug: $(ASM_OBJS) $(TRAMPOLINE_BIN) $(USER_SHELL_BIN)
 	@echo -e "$(BOLD)$(YELLOW)[~] Building Debug Kernel...$(RESET)"
-	@$(CARGO) build
+	@$(CARGO) build $(CARGO_ARGS)
 	$(call link_kernel, $(KERNEL_DBG_LIB), )
 	@echo -e "$(BOLD)$(GREEN)[✓] DEBUG KERNEL BUILD DONE$(RESET)"
 

@@ -1,20 +1,22 @@
-use crate::interrupts::idt::register_interrupt_handler;
-use crate::interrupts::keyboard::{
-    decode_set1_scancode, get_input_mode, keycode_to_char, push_char, toggle_layout, InputMode,
-    KeyCode, KeyEvent, Modifiers,
+use crate::{
+    interrupts::{
+        idt::register_interrupt_handler,
+        keyboard::{
+            KeyCode, KeyEvent, Modifiers, decode_set1_scancode, keycode_to_char, push_char,
+            toggle_layout,
+        },
+    },
+    locks::Spinlock,
+    signals::Signal,
+    smp::ipi::request_shutdown,
+    startup_config::pic,
+    vga::text_mod::{
+        disable_cursor, enable_cursor, scroll_view_down, scroll_view_to_bottom, scroll_view_to_top,
+        scroll_view_up, set_big_cursor, set_cursor_shape, set_small_cursor, switch_screen,
+        switch_to_next_screen, switch_to_previous_screen,
+    },
+    x86::{inb, outb},
 };
-use crate::locks::Spinlock;
-use crate::shell::handle_shell_key_event;
-use crate::signals::Signal;
-use crate::smp::ipi::request_shutdown;
-use crate::startup_config::pic;
-use crate::vga::text_mod::{
-    disable_cursor, enable_cursor, move_cursor_down, move_cursor_left, move_cursor_right,
-    move_cursor_up, scroll_view_down, scroll_view_to_bottom, scroll_view_to_top, scroll_view_up,
-    set_big_cursor, set_cursor_shape, set_small_cursor, switch_screen, switch_to_next_screen,
-    switch_to_previous_screen,
-};
-use crate::x86::{inb, outb};
 
 static mut EXTENDED_SCANCODE: bool = false;
 static mut MODIFIERS: Modifiers = Modifiers::empty();
@@ -46,10 +48,8 @@ fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
                 if let Some(task) = crate::sched::current().as_mut() {
                     if task.pid > 0 {
                         task.signals.push(Signal::SIGINT as u8);
-                        return;
                     }
                 }
-                crate::shell::handle_sigint();
             }
             return;
         }
@@ -108,48 +108,72 @@ fn handle_key_press(event: KeyEvent, modifiers: Modifiers) {
         _ => {} // Not a global hotkey, continue down to the router
     }
 
-    if get_input_mode() == InputMode::Blocking {
-        if !modifiers.has_text_blocking_modifier() {
-            if let Some(c) = keycode_to_char(event.key, modifiers) {
-                push_char(c);
-            }
-        }
-    } else {
-        if handle_shell_key_event(event, modifiers) {
+    match event.key {
+        KeyCode::Backspace => {
+            push_char('\x08');
             return;
         }
-
-        match event.key {
-            KeyCode::ArrowUp => {
-                if modifiers.shift() {
-                    scroll_view_up();
-                } else {
-                    move_cursor_up();
-                }
-            }
-            KeyCode::ArrowDown => {
-                if modifiers.shift() {
-                    scroll_view_down();
-                } else {
-                    move_cursor_down();
-                }
-            }
-            KeyCode::ArrowLeft => {
-                if modifiers.shift() {
-                    switch_to_previous_screen();
-                } else {
-                    move_cursor_left();
-                }
-            }
-            KeyCode::ArrowRight => {
-                if modifiers.shift() {
-                    switch_to_next_screen();
-                } else {
-                    move_cursor_right();
-                }
-            }
-            _ => {}
+        KeyCode::Enter => {
+            push_char('\n');
+            return;
         }
+        KeyCode::Tab => {
+            push_char('\t');
+            return;
+        }
+        _ => {}
+    }
+
+    if let Some(c) = keycode_to_char(event.key, modifiers) {
+        push_char(c);
+        return;
+    }
+
+    match event.key {
+        KeyCode::ArrowUp => {
+            if modifiers.shift() {
+                scroll_view_up();
+            } else {
+                push_str("\x1b[A");
+            }
+        }
+        KeyCode::ArrowDown => {
+            if modifiers.shift() {
+                scroll_view_down();
+            } else {
+                push_str("\x1b[B");
+            }
+        }
+        KeyCode::ArrowLeft => {
+            if modifiers.shift() {
+                switch_to_previous_screen();
+            } else {
+                push_str("\x1b[D");
+            }
+        }
+        KeyCode::ArrowRight => {
+            if modifiers.shift() {
+                switch_to_next_screen();
+            } else {
+                push_str("\x1b[C");
+            }
+        }
+        KeyCode::Home => {
+            push_str("\x1b[H");
+        }
+        KeyCode::End => {
+            push_str("\x1b[F");
+        }
+        KeyCode::Delete => {
+            push_str("\x1b[3~");
+        }
+        _ => {}
+    }
+}
+
+fn push_str(s: &str) {
+    for c in s.chars() {
+        push_char(c);
     }
 }
 
@@ -202,9 +226,13 @@ fn pop_scancode() -> Option<u8> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn keyboard_interrupt_handler() {
-    push_scancode(inb(PIC_KEYBOARD_DATA_PORT));
+    while (inb(pic::KEYBOARD_COMMAND_PORT) & 0x01) != 0 {
+        let sc = inb(pic::KEYBOARD_DATA_PORT);
+        push_scancode(sc);
+    }
     process_keyboard_event();
     outb(PIC_MASTER_COMMAND_PORT, PIC_EOI);
+    crate::smp::lapic::send_eoi();
 }
 
 unsafe extern "C" {

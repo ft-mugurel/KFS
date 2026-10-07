@@ -50,9 +50,31 @@ pub fn push_char(c: char) {
     let mut buffers = TTY_BUFFERS.lock();
     let buffer = &mut buffers[tty];
     let next_head = (buffer.head + 1) % BUFFER_SIZE;
-    if next_head != buffer.tail && c.is_ascii() {
+    if next_head != buffer.tail && (c.is_ascii() || c == '\n' || c == '\x08' || c == '\t') {
         buffer.data[buffer.head] = c as u8;
         buffer.head = next_head;
+    }
+    drop(buffers);
+
+    let mut table = sched::PROCESS_TABLE.lock();
+    for task_opt in table.iter_mut() {
+        if let Some(task) = task_opt {
+            if task.state == sched::ProcessState::Waiting {
+                let matches_tty = task.fd_tbl[0].and_then(|gfd| {
+                    fs::get_open_file(gfd).and_then(|f| {
+                        if unsafe { (*f.node).node_type == VfsNodeType::CharDevice } {
+                            Some(unsafe { (*f.node).inode as usize })
+                        } else {
+                            None
+                        }
+                    })
+                }) == Some(tty);
+
+                if matches_tty {
+                    task.state = sched::ProcessState::Ready;
+                }
+            }
+        }
     }
 }
 
@@ -68,6 +90,9 @@ pub unsafe fn read(tty: usize, output: &mut [u8]) -> KResult<usize> {
     }
 
     if read == 0 {
+        if let Some(task) = sched::current().as_mut() {
+            task.state = sched::ProcessState::Waiting;
+        }
         Err(KernelError::EAGAIN)
     } else {
         Ok(read)
@@ -89,15 +114,15 @@ pub unsafe fn init() -> KResult<()> {
     for index in 0..TTY_COUNT {
         let (name, name_len) = tty_node_name(index);
         let name = core::str::from_utf8(&name[..name_len]).unwrap();
-        let node = fs::create_child_node(dev, name, VfsNodeType::CharDevice, 0o620)?;
+        let node = fs::create_child_node(dev, name, VfsNodeType::CharDevice, 0o666)?;
         (*node).inode = index as u32;
     }
 
+    fs::mark_dev_ready();
     Ok(())
 }
 
 crate::device_initcall!(init);
-
 
 pub(crate) unsafe fn bind_stdio() -> KResult<()> {
     let node = fs::resolve_path("/dev/tty1", fs::ROOT_NODE)?;

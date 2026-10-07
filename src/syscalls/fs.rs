@@ -1,8 +1,10 @@
-use crate::error::KernelError;
-use crate::fs::{self, VfsNodeType};
-use crate::sched::{self, ContextFrame};
-use crate::security::{self, Decision, Operation};
-use crate::utils;
+use crate::{
+    error::KernelError,
+    fs::{self, VfsNodeType},
+    sched::{self, ContextFrame},
+    security::{self, Decision, Operation},
+    utils,
+};
 
 fn parse_parent_path(path: &str) -> Result<(&str, &str), KernelError> {
     if path.is_empty() || path == "/" {
@@ -235,5 +237,167 @@ pub unsafe fn syscall_umount(regs: *mut ContextFrame) {
         (*regs).set_return_error(err);
         return;
     }
+    (*regs).set_return_value(0);
+}
+
+#[repr(C, packed)]
+pub struct LinuxDirent {
+    pub d_ino: u32,
+    pub d_off: u32,
+    pub d_reclen: u16,
+}
+
+pub unsafe fn syscall_getdents(regs: *mut ContextFrame) {
+    let local_fd = (*regs).arg1() as usize;
+    let buf_ptr = (*regs).arg2() as *mut u8;
+    let count = (*regs).arg3() as usize;
+
+    if buf_ptr.is_null() || count == 0 {
+        (*regs).set_return_error(KernelError::EINVAL);
+        return;
+    }
+
+    let task = match sched::current().as_mut() {
+        Some(t) => t,
+        None => {
+            (*regs).set_return_error(KernelError::ESRCH);
+            return;
+        }
+    };
+
+    if local_fd >= crate::sched::MAX_FDS_PER_PROCESS {
+        (*regs).set_return_error(KernelError::EBADF);
+        return;
+    }
+
+    let global_fd = match task.fd_tbl[local_fd] {
+        Some(g) => g,
+        None => {
+            (*regs).set_return_error(KernelError::EBADF);
+            return;
+        }
+    };
+
+    let open_file = match fs::get_open_file(global_fd) {
+        Some(f) => f,
+        None => {
+            (*regs).set_return_error(KernelError::EBADF);
+            return;
+        }
+    };
+
+    let dir = open_file.node;
+    if (*dir).node_type != VfsNodeType::Directory {
+        (*regs).set_return_error(KernelError::ENOTDIR);
+        return;
+    }
+
+    if (*dir).children.is_null() && (*dir).inode != 0 {
+        let _ = (*dir).lazy_load_directory();
+    }
+
+    let mut current_child = (*dir).children;
+    let mut skip = open_file.offset;
+    while !current_child.is_null() && skip > 0 {
+        current_child = (*current_child).next_of_kin;
+        skip -= 1;
+    }
+
+    let mut bytes_written = 0usize;
+    let header_size = core::mem::size_of::<LinuxDirent>();
+
+    while !current_child.is_null() {
+        let name_len = (*current_child)
+            .name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or((*current_child).name.len());
+
+        let reclen = ((header_size + name_len + 1 + 3) & !3) as u16;
+        if bytes_written + (reclen as usize) > count {
+            break;
+        }
+
+        let dirent_ptr = buf_ptr.add(bytes_written) as *mut LinuxDirent;
+        (*dirent_ptr).d_ino = (*current_child).inode;
+        (*dirent_ptr).d_off = (open_file.offset + 1) as u32;
+        (*dirent_ptr).d_reclen = reclen;
+
+        let name_dest = buf_ptr.add(bytes_written + header_size);
+        core::ptr::copy_nonoverlapping((*current_child).name.as_ptr(), name_dest, name_len);
+        for pad in (header_size + name_len)..(reclen as usize) {
+            *buf_ptr.add(bytes_written + pad) = 0;
+        }
+
+        bytes_written += reclen as usize;
+        fs::update_open_file_offset(global_fd, 1);
+        current_child = (*current_child).next_of_kin;
+    }
+
+    (*regs).set_return_value(bytes_written as u32);
+}
+
+pub unsafe fn syscall_unlink(regs: *mut ContextFrame) {
+    let path_ptr = (*regs).arg1() as *const u8;
+    let path = utils::c_str_to_rust(path_ptr);
+    let task = sched::current().as_mut().unwrap();
+
+    let (parent_path, name) = match parse_parent_path(path) {
+        Ok(parts) => parts,
+        Err(err) => {
+            (*regs).set_return_error(err);
+            return;
+        }
+    };
+
+    let parent = match lookup_parent(parent_path, task.cwd) {
+        Ok(node) => node,
+        Err(err) => {
+            (*regs).set_return_error(err);
+            return;
+        }
+    };
+
+    if parent.is_null() || (*parent).node_type != VfsNodeType::Directory {
+        (*regs).set_return_error(KernelError::ENOTDIR);
+        return;
+    }
+
+    if security::check(
+        &task.credentials,
+        &security::object_for_node(parent),
+        Operation::Write,
+    ) == Decision::Deny
+    {
+        (*regs).set_return_error(KernelError::EACCES);
+        return;
+    }
+
+    let child = find_child((*parent).children, name);
+    if child.is_null() {
+        (*regs).set_return_error(KernelError::ENOENT);
+        return;
+    }
+
+    if let Some(mount) = (*parent).mount.as_ref() {
+        if let Err(err) = (mount.backend.unlink)((*parent).mount, (*parent).inode, name) {
+            (*regs).set_return_error(err);
+            return;
+        }
+    }
+
+    if (*parent).children == child {
+        (*parent).children = (*child).next_of_kin;
+    } else {
+        let mut curr = (*parent).children;
+        while !curr.is_null() {
+            if (*curr).next_of_kin == child {
+                (*curr).next_of_kin = (*child).next_of_kin;
+                break;
+            }
+            curr = (*curr).next_of_kin;
+        }
+    }
+
     (*regs).set_return_value(0);
 }

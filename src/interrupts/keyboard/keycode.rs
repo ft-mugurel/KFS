@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::{KeyCode, KeyEvent, Modifiers};
 
 impl Modifiers {

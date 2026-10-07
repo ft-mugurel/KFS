@@ -12,7 +12,6 @@ lto = true
 
 [lib]
 name = "kernel"
-edition = "2024"
 path = "src/kernel.rs"
 crate-type = ["staticlib"]
 test = false

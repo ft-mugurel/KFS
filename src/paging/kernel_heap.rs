@@ -15,6 +15,10 @@ const HEAP_VM_START: u32 = KERNEL_SPACE_START as u32 + 0x0100_0000;
 const HEAP_VM_END: u32 = KERNEL_SPACE_START as u32 + 0x0200_0000;
 const HEAP_MAX_FREE_RANGES: usize = 128;
 
+pub(super) fn virtual_start() -> u32 {
+    HEAP_VM_START
+}
+
 #[derive(Clone, Copy)]
 struct HeapFreeRange {
     base: u32,
