@@ -21,7 +21,6 @@ const TR_CPU_ID_OFF: usize = TR_DATA_BASE + 10; // dd = 4 bytes
 const TR_AP_ENTRY_OFF: usize = TR_DATA_BASE + 14;
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".init.text")]
 pub unsafe extern "C" fn ap_entry(cpu_id: u32) -> ! {
     let cpu_id = cpu_id as usize;
 
@@ -29,12 +28,11 @@ pub unsafe extern "C" fn ap_entry(cpu_id: u32) -> ! {
     sched::init_scheduler_for_cpu(cpu_id);
     interrupts::init_idt();
     lapic::enable_local_apic(cpu_id);
+    lapic::start_periodic_timer(10);
+    let idle_esp = sched::idle_stack_top(cpu_id);
 
     AP_BOOTED_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
-    lapic::calibrate();
-    lapic::start_periodic_timer(10);
-    let idle_esp = sched::idle_stack_top(cpu_id);
     sched::switch_to_idle_stack(idle_esp);
 }
 

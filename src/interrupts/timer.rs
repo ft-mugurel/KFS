@@ -23,9 +23,13 @@ pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
     outb(pic::MASTER_COMMAND_PORT, pic::EOI);
     crate::smp::lapic::send_eoi();
 
+    if !crate::sched::is_scheduler_active() {
+        return old_esp;
+    }
+
     let next_esp = schedule(old_esp);
     if next_esp != old_esp {
-        crate::pr_info!("[TIMER] Pivot old_esp={:#x} -> next_esp={:#x}\n", old_esp, next_esp);
+        crate::pr_debug!("[TIMER] Pivot old_esp={:#x} -> next_esp={:#x}\n", old_esp, next_esp);
     }
     next_esp
 }

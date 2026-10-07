@@ -120,7 +120,7 @@ pub(crate) enum InputMode {
     Blocking = 1,
 }
 
-pub(crate) use api::{get_input_mode, push_char};
-pub(crate) use character_map::{keycode_to_char, set_layout, toggle_layout};
+pub(crate) use api::push_char;
+pub(crate) use character_map::{keycode_to_char, toggle_layout};
 pub(crate) use init::init_keyboard;
 pub(crate) use keycode::decode_set1_scancode;

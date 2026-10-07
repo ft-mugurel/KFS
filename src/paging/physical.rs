@@ -34,6 +34,18 @@ pub fn free_physical_pages() -> usize {
     frame_allocator::free_frame_count()
 }
 
+pub fn frame_ref_inc(phys_addr: u32) {
+    frame_allocator::frame_ref_inc(phys_addr)
+}
+
+pub fn frame_ref_dec(phys_addr: u32) -> u8 {
+    frame_allocator::frame_ref_dec(phys_addr)
+}
+
+pub fn frame_ref_count(phys_addr: u32) -> u8 {
+    frame_allocator::frame_ref_count(phys_addr)
+}
+
 pub const fn physical_page_size() -> usize {
     PAGE_SIZE
 }

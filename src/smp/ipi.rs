@@ -29,6 +29,9 @@ pub unsafe extern "C" fn shutdown_ipi_handler() {
 }
 
 pub unsafe fn request_shutdown() {
+    let _ = crate::printk::file_logger::flush_to_file();
+    let _ = crate::fs::buffer_cache::bsync();
+
     send_shutdown_ipi_to_others();
 
     let expected = super::cpu::online_count() as u32 - 1;

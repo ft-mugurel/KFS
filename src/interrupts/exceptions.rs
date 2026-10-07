@@ -1,11 +1,9 @@
-use crate::interrupts::register_interrupt_handler;
-use crate::paging;
-use crate::panic;
-use crate::sched::{self, ProcessState};
-use crate::startup_config::logging::DEFAULT_LOG_SCREEN;
-use crate::vga::text_mod;
-use crate::x86;
-use crate::{pr_emerg, pr_err, pr_info, pr_warn};
+use crate::{
+    interrupts::register_interrupt_handler,
+    paging, panic, pr_emerg, pr_err, pr_info, pr_warn,
+    sched::{self, ProcessState},
+    x86,
+};
 
 const EXCEPTION_NAMES: [&str; 32] = [
     /* 0x00 */ "Divide Error",
@@ -117,16 +115,6 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         .unwrap_or("Unknown Exception");
     let frame = &*regs;
     let fault_cr2 = if vector == 14 { x86::read_cr2() } else { 0 };
-    pr_emerg!(
-        "[EXC] Exception #{} ({}) at EIP={:#x}, CS={:#x}, err={:#x}, cr2={:#x}, esp={:#x}\n",
-        vector,
-        name,
-        frame.eip,
-        frame.cs,
-        frame.error_code,
-        fault_cr2,
-        frame.esp
-    );
     let task_opt = sched::current().as_mut();
 
     if (frame.cs & 0x03) == 3 && task_opt.is_none() {
@@ -143,6 +131,35 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
 
         if idx_usize == 14 {
             let fault_addr = x86::read_cr2();
+
+            let present = (frame.error_code & 0b001) != 0;
+            let write = (frame.error_code & 0b010) != 0;
+            let user = (frame.error_code & 0b100) != 0;
+
+            if present && write && user {
+                let aligned_vaddr = fault_addr & !0xFFF;
+                if let Some(phys) = paging::virt_to_phys(aligned_vaddr) {
+                    let refcount = paging::frame_ref_count(phys);
+                    if refcount > 1 {
+                        if let Ok(new_phys) = paging::alloc_physical_page() {
+                            let src = paging::phys_to_virt(phys) as *const u8;
+                            let dst = paging::phys_to_virt(new_phys) as *mut u8;
+                            core::ptr::copy_nonoverlapping(src, dst, 4096);
+                            paging::frame_ref_dec(phys);
+                            let flags =
+                                paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
+                            let _ = paging::map_page(aligned_vaddr, new_phys, flags);
+                            return;
+                        }
+                    } else if refcount == 1 {
+                        let flags =
+                            paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
+                        let _ = paging::map_page(aligned_vaddr, phys, flags);
+                        return;
+                    }
+                }
+            }
+
             let mem = &task.memory;
 
             let mut is_valid = false;
@@ -194,6 +211,16 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
             }
         }
 
+        pr_emerg!(
+            "[EXC] Exception #{} ({}) at EIP={:#x}, CS={:#x}, err={:#x}, cr2={:#x}, esp={:#x}\n",
+            vector,
+            name,
+            frame.eip,
+            frame.cs,
+            frame.error_code,
+            fault_cr2,
+            frame.esp
+        );
         // If it was not a handled page fault, terminate the process
         let sig_num = match idx_usize {
             0 => 8,        // Divide by Zero -> SIGFPE
@@ -237,7 +264,6 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
 
     pr_emerg!("fatal CPU exception, halting kernel\n");
     x86::disable_interrupts();
-    text_mod::switch_screen(DEFAULT_LOG_SCREEN);
 
     pr_emerg!(
         "Registers:\n\

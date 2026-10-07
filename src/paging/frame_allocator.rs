@@ -100,6 +100,73 @@ impl PhysicalState {
 
 static ALLOCATOR_STATE: Spinlock<PhysicalState> = Spinlock::new(PhysicalState::new());
 
+const MAX_COW_TRACKED_FRAMES: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct CowFrameEntry {
+    frame_idx: u32,
+    count: u16,
+}
+
+impl CowFrameEntry {
+    const fn empty() -> Self {
+        Self {
+            frame_idx: u32::MAX,
+            count: 0,
+        }
+    }
+}
+
+static COW_TABLE: Spinlock<[CowFrameEntry; MAX_COW_TRACKED_FRAMES]> =
+    Spinlock::new([const { CowFrameEntry::empty() }; MAX_COW_TRACKED_FRAMES]);
+
+pub fn frame_ref_inc(phys_addr: u32) {
+    let frame_idx = frame_index(phys_addr) as u32;
+    let mut table = COW_TABLE.lock();
+    for entry in table.iter_mut() {
+        if entry.frame_idx == frame_idx {
+            entry.count = entry.count.saturating_add(1);
+            return;
+        }
+    }
+    for entry in table.iter_mut() {
+        if entry.frame_idx == u32::MAX {
+            entry.frame_idx = frame_idx;
+            entry.count = 2;
+            return;
+        }
+    }
+    pr_warn!("COW_TABLE full, cannot track frame {:#x}\n", phys_addr);
+}
+
+pub fn frame_ref_dec(phys_addr: u32) -> u8 {
+    let frame_idx = frame_index(phys_addr) as u32;
+    let mut table = COW_TABLE.lock();
+    for entry in table.iter_mut() {
+        if entry.frame_idx == frame_idx {
+            entry.count = entry.count.saturating_sub(1);
+            let c = entry.count;
+            if c <= 1 {
+                entry.frame_idx = u32::MAX;
+                entry.count = 0;
+            }
+            return c as u8;
+        }
+    }
+    0
+}
+
+pub fn frame_ref_count(phys_addr: u32) -> u8 {
+    let frame_idx = frame_index(phys_addr) as u32;
+    let table = COW_TABLE.lock();
+    for entry in table.iter() {
+        if entry.frame_idx == frame_idx {
+            return entry.count as u8;
+        }
+    }
+    1
+}
+
 #[unsafe(link_section = ".init.text")]
 pub(super) fn init_from_multiboot(info: &MultibootInfo) {
     let mut state = ALLOCATOR_STATE.lock();
@@ -180,8 +247,6 @@ pub(super) fn alloc_frame() -> KResult<u32> {
             if frame_idx < MAX_FRAMES {
                 state.mark_used(frame_idx);
                 let addr = frame_addr(frame_idx);
-                // let free_frames = state.free_frames;
-                // pr_debug!("alloc_frame -> {:#x} (free_left={})\n", addr, free_frames);
                 return Ok(addr);
             }
         }
@@ -284,7 +349,8 @@ pub(super) fn free_contiguous_frames(phys_addr: u32, count: usize) -> KResult<()
 
     let mut state = ALLOCATOR_STATE.lock();
     for i in 0..count {
-        state.mark_free(start_frame + i);
+        let idx = start_frame + i;
+        state.mark_free(idx);
     }
     Ok(())
 }
@@ -297,8 +363,10 @@ pub(super) fn free_frame(phys_addr: u32) -> KResult<()> {
         return Err(KernelError::EINVAL);
     }
 
-    let mut state = ALLOCATOR_STATE.lock();
-    state.mark_free(frame_idx);
+    if frame_ref_dec(phys_addr) == 0 {
+        let mut state = ALLOCATOR_STATE.lock();
+        state.mark_free(frame_idx);
+    }
     // let free_frames = state.free_frames;
     // pr_debug!(
     //     "free_frame <- {:#x} (free_now={})\n",

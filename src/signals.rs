@@ -1,7 +1,6 @@
 use crate::{pr_err, sched};
 
 // TODO: Implement bitmasks and blocking.
-
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Signal {

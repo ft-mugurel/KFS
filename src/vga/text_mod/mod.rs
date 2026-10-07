@@ -54,28 +54,18 @@ pub(self) struct VirtualScreen {
     pub color: ColorCode,
     pub esc_seq_color: Option<ColorCode>,
     pub active: bool,
-    pub cursor_movement: CursorMovement,
 }
 
 pub(self) struct ScreenFormatter<'a> {
     pub screen: &'a mut VirtualScreen,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorMovement {
-    Horizontal = 0x01,
-    Vertical = 0x02,
-    All = 0x03,
-}
-
 pub(crate) use cursor::{
-    disable_cursor, enable_cursor, move_cursor_down, move_cursor_left, move_cursor_right,
-    move_cursor_up, set_big_cursor, set_cursor_position_on, set_cursor_shape, set_small_cursor,
+    disable_cursor, enable_cursor, set_big_cursor, set_cursor_shape, set_small_cursor,
 };
-pub(crate) use print::{print_char_on, print_fmt_on, print_str_on};
+pub(crate) use print::{print_fmt_on, print_str_on};
 pub(crate) use screen::{
-    active_cursor_position, active_screen_accepts_input, active_screen_index, change_color, clear,
-    init_virtual_screens, is_screen_active, scroll_view_down, scroll_view_to_bottom,
-    scroll_view_to_top, scroll_view_up, set_active as switch_screen, set_cursor_movement_on,
-    set_screen_accepts_input, switch_to_next_screen, switch_to_previous_screen,
+    active_screen_index, change_color, clear, init_virtual_screens, scroll_view_down,
+    scroll_view_to_bottom, scroll_view_to_top, scroll_view_up, set_active as switch_screen,
+    switch_to_next_screen, switch_to_previous_screen,
 };

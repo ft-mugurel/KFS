@@ -1,8 +1,10 @@
-use crate::error::KernelError;
-use crate::fs::{self, VfsNodeType};
-use crate::sched::{self, ContextFrame, MAX_FDS_PER_PROCESS};
-use crate::utils;
-use crate::security::{self, Decision, Operation};
+use crate::{
+    error::KernelError,
+    fs::{self, VfsNodeType},
+    sched::{self, ContextFrame, MAX_FDS_PER_PROCESS},
+    security::{self, Decision, Operation},
+    utils,
+};
 
 const O_CREAT: u32 = 0x40;
 const O_TRUNC: u32 = 0x200;
@@ -145,6 +147,7 @@ pub unsafe fn syscall_open(regs: *mut ContextFrame) {
         }
     };
 
+    fs::vfs_ref_get(node);
     task.fd_tbl[l_fd] = Some(g_fd);
     (*regs).set_return_value(l_fd as u32);
 }
@@ -167,7 +170,49 @@ pub unsafe fn syscall_close(regs: *mut ContextFrame) {
         }
     };
 
+    let node = match fs::get_open_file(global_fd) {
+        Some(f) => f.node,
+        None => core::ptr::null_mut(),
+    };
+
     fd_tbl[local_fd] = None;
     fs::close_open_file(global_fd);
+
+    if !node.is_null() {
+        fs::vfs_ref_put(node);
+    }
+
     (*regs).set_return_value(0);
+}
+
+pub(crate) unsafe fn syscall_dup2(regs: *mut ContextFrame) {
+    let old_fd = (*regs).ebx as usize;
+    let new_fd = (*regs).ecx as usize;
+
+    let task = sched::current().as_mut().unwrap();
+
+    if old_fd >= sched::MAX_FDS_PER_PROCESS || new_fd >= sched::MAX_FDS_PER_PROCESS {
+        (*regs).set_return_error(KernelError::EBADF);
+        return;
+    }
+
+    let Some(global_fd) = task.fd_tbl[old_fd] else {
+        (*regs).set_return_error(KernelError::EBADF);
+        return;
+    };
+
+    if let Some(existing) = task.fd_tbl[new_fd] {
+        if let Some(open_file) = fs::get_open_file(existing) {
+            fs::vfs_ref_put(open_file.node);
+        }
+        fs::close_open_file(existing);
+    }
+
+    fs::retain_open_file(global_fd);
+    if let Some(open_file) = fs::get_open_file(global_fd) {
+        fs::vfs_ref_get(open_file.node);
+    }
+    task.fd_tbl[new_fd] = Some(global_fd);
+
+    (*regs).set_return_value(new_fd as u32);
 }

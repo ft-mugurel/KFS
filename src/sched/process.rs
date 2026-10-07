@@ -4,16 +4,17 @@ use super::{
 };
 use crate::error::KResult;
 use crate::gdt::{USER_CODE_SEL, USER_DATA_SEL};
-use crate::{paging, pr_err, pr_warn, x86};
+use crate::{paging, pr_err, x86};
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 const USER_CODE_VADDR: u32 = 0x08048000;
-const USER_DATA_VADDR: u32 = 0x0804A000;
-const USER_BSS_VADDR: u32 = 0x0804B000;
 const USER_STACK_VADDR: u32 = 0xBFFFF000;
 
-pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -> KResult<usize> {
+pub unsafe fn create_user_process(
+    entry_point: unsafe fn(),
+    entry_size: usize,
+) -> KResult<usize> {
     let pid = super::reserve_process_slot();
     if pid.is_none() {
         pr_err!("No available PID for new user process\n");
@@ -69,40 +70,42 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
         err
     };
 
-    let code_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
-        Ok(frame) => frame,
-        Err(e) => return Err(fail_cleanup(None, e)),
-    };
+    let code_pages = (entry_size + 12 + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+    let code_pages = if code_pages == 0 { 1 } else { code_pages };
     let user_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
-    if let Err(e) = paging::map_page(USER_CODE_VADDR, code_frame, user_flags) {
-        return Err(fail_cleanup(Some(code_frame), e));
+    for i in 0..code_pages {
+        let code_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+            Ok(frame) => frame,
+            Err(e) => return Err(fail_cleanup(None, e)),
+        };
+        if let Err(e) = paging::map_page(USER_CODE_VADDR + (i as u32 * 4096), code_frame, user_flags) {
+            return Err(fail_cleanup(Some(code_frame), e));
+        }
     }
 
-    let stack_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
-        Ok(frame) => frame,
-        Err(e) => return Err(fail_cleanup(None, e)),
-    };
-    if let Err(e) = paging::map_page(USER_STACK_VADDR - 4096, stack_frame, user_flags) {
-        return Err(fail_cleanup(Some(stack_frame), e));
+    let stack_pages = 16u32;
+    for i in 1..=stack_pages {
+        let stack_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+            Ok(frame) => frame,
+            Err(e) => return Err(fail_cleanup(None, e)),
+        };
+        if let Err(e) = paging::map_page(USER_STACK_VADDR - (i * 4096), stack_frame, user_flags) {
+            return Err(fail_cleanup(Some(stack_frame), e));
+        }
     }
 
-    let data_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
-        Ok(frame) => frame,
-        Err(e) => return Err(fail_cleanup(None, e)),
-    };
-    if let Err(e) = paging::map_page(USER_DATA_VADDR, data_frame, user_flags) {
-        return Err(fail_cleanup(Some(data_frame), e));
+    let bss_start_vaddr = USER_CODE_VADDR + (code_pages as u32 * 4096);
+    let bss_pages = 8u32;
+    for i in 0..bss_pages {
+        let bss_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+            Ok(frame) => frame,
+            Err(e) => return Err(fail_cleanup(None, e)),
+        };
+        if let Err(e) = paging::map_page(bss_start_vaddr + (i * 4096), bss_frame, user_flags) {
+            return Err(fail_cleanup(Some(bss_frame), e));
+        }
+        write_bytes((bss_start_vaddr + (i * 4096)) as *mut u8, 0, 4096);
     }
-
-    // map and zero the BSS Sector
-    let bss_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
-        Ok(frame) => frame,
-        Err(e) => return Err(fail_cleanup(None, e)),
-    };
-    if let Err(e) = paging::map_page(USER_BSS_VADDR, bss_frame, user_flags) {
-        return Err(fail_cleanup(Some(bss_frame), e));
-    }
-    write_bytes(USER_BSS_VADDR as *mut u8, 0, 4096);
 
     let code_ptr = USER_CODE_VADDR as *mut u8;
     copy_nonoverlapping(entry_point as *const u8, code_ptr, entry_size);
@@ -152,13 +155,13 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
 
     // Memory Tracking Initialization
     new_task.memory.code_base = USER_CODE_VADDR;
-    new_task.memory.code_size = 4096;
-    new_task.memory.data_base = USER_DATA_VADDR;
-    new_task.memory.data_size = 4096;
-    new_task.memory.bss_base = USER_BSS_VADDR;
-    new_task.memory.bss_size = 4096;
+    new_task.memory.code_size = (code_pages as u32) * 4096;
+    new_task.memory.data_base = USER_CODE_VADDR;
+    new_task.memory.data_size = (code_pages as u32) * 4096;
+    new_task.memory.bss_base = bss_start_vaddr;
+    new_task.memory.bss_size = bss_pages * 4096;
     new_task.memory.stack_base = USER_STACK_VADDR;
-    new_task.memory.stack_limit = USER_STACK_VADDR - 4096;
+    new_task.memory.stack_limit = USER_STACK_VADDR - (stack_pages * 4096);
     new_task.memory.heap_base = 0x4000_0000;
     new_task.memory.heap_brk = 0x4000_0000;
     new_task.memory.vmas = [EMPTY_VMA; MAX_VMAS];
@@ -174,16 +177,12 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
         }
     } else {
         new_task.cwd = crate::fs::ROOT_NODE;
+        new_task.fd_tbl = [None; super::MAX_FDS_PER_PROCESS];
     }
 
     let mut locked_process_table = PROCESS_TABLE.lock();
     locked_process_table[pid] = Some(new_task);
 
-    pr_warn!(
-        "writing thread info for PID {} at {:p}\n",
-        pid,
-        k_stack_bottom as *mut thread_info::ThreadInfo
-    );
     // Getting rid of global CURRENT_PID and using the current thread info to get the PID
     let ti = k_stack_bottom as *mut thread_info::ThreadInfo;
     (*ti).task = locked_process_table[pid].as_mut().unwrap() as *mut _;
@@ -202,9 +201,97 @@ pub unsafe fn create_user_process(entry_point: unsafe fn(), entry_size: usize) -
         }
     }
 
-    locked_process_table[pid].as_mut().unwrap().state = ProcessState::Ready;
+    if parent_opt.is_some() {
+        locked_process_table[pid].as_mut().unwrap().state = ProcessState::Ready;
+    }
     drop(locked_process_table);
 
     x86::enable_interrupts();
     Ok(pid)
+}
+
+pub unsafe fn bind_process_to_tty(pid: usize, tty_dev: &str) -> KResult<()> {
+    let tty_node = crate::fs::resolve_path(tty_dev, crate::fs::ROOT_NODE)?;
+    if (*tty_node).node_type != crate::fs::VfsNodeType::CharDevice {
+        return Err(crate::error::KernelError::ENOTTY);
+    }
+
+    let global_fd = crate::fs::alloc_open_file(tty_node, 3)?;
+    let _ = crate::fs::retain_open_file(global_fd);
+    let _ = crate::fs::retain_open_file(global_fd);
+
+    let mut table = PROCESS_TABLE.lock();
+    let task = match table.get_mut(pid).and_then(|opt| opt.as_mut()) {
+        Some(t) => t,
+        None => {
+            crate::fs::close_open_file(global_fd);
+            crate::fs::close_open_file(global_fd);
+            crate::fs::close_open_file(global_fd);
+            return Err(crate::error::KernelError::ESRCH);
+        }
+    };
+
+    for fd in 0..3 {
+        if let Some(old_gfd) = task.fd_tbl[fd].take() {
+            crate::fs::close_open_file(old_gfd);
+        }
+    }
+
+    task.fd_tbl[0] = Some(global_fd);
+    task.fd_tbl[1] = Some(global_fd);
+    task.fd_tbl[2] = Some(global_fd);
+    task.state = ProcessState::Ready;
+
+    Ok(())
+}
+
+pub unsafe fn start_process(pid: usize) -> KResult<()> {
+    let mut table = PROCESS_TABLE.lock();
+    let task = match table.get_mut(pid).and_then(|opt| opt.as_mut()) {
+        Some(t) => t,
+        None => return Err(crate::error::KernelError::ESRCH),
+    };
+    task.state = ProcessState::Ready;
+    Ok(())
+}
+
+pub unsafe fn create_user_process_on_tty(
+    entry_point: unsafe fn(),
+    entry_size: usize,
+    tty_dev: &str,
+) -> KResult<usize> {
+    let pid = create_user_process(entry_point, entry_size)?;
+    bind_process_to_tty(pid, tty_dev)?;
+    Ok(pid)
+}
+
+pub static USER_SHELL_PAYLOAD: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/build/sh.bin"));
+
+pub unsafe fn spawn_init_shell() -> KResult<usize> {
+    let dummy_fn: unsafe fn() = core::mem::transmute(USER_SHELL_PAYLOAD.as_ptr());
+    create_user_process_on_tty(dummy_fn, USER_SHELL_PAYLOAD.len(), "/dev/tty1")
+}
+
+pub unsafe fn spawn_init_shells() -> KResult<()> {
+    let dummy_fn: unsafe fn() = core::mem::transmute(USER_SHELL_PAYLOAD.as_ptr());
+    let ttys = [
+        "/dev/tty1",
+        "/dev/tty2",
+        "/dev/tty3",
+        "/dev/tty4",
+        "/dev/tty5",
+        "/dev/tty6",
+    ];
+    for tty in ttys {
+        match create_user_process_on_tty(dummy_fn, USER_SHELL_PAYLOAD.len(), tty) {
+            Ok(pid) => {
+                crate::pr_debug!("Spawned user getty/shell on {} (PID {})\n", tty, pid);
+            }
+            Err(e) => {
+                crate::pr_err!("Failed to spawn shell on {}: {:?}\n", tty, e);
+            }
+        }
+    }
+    Ok(())
 }

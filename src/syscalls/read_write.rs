@@ -1,11 +1,13 @@
-use crate::error::KernelError;
-use crate::fs::{self, VfsNodeType};
-use crate::ipc::{self};
-use crate::sched::{self, ContextFrame, MAX_FDS_PER_PROCESS};
-use crate::{pr_debug, pr_warn};
-use crate::security::{self, Decision, Operation};
+use crate::{
+    error::KernelError,
+    fs::{self, VfsNodeType},
+    ipc::{self},
+    sched::{self, ContextFrame, MAX_FDS_PER_PROCESS},
+    security::{self, Decision, Operation},
+    {pr_debug, pr_warn},
+};
 
-unsafe fn valid_user_buffer(ptr: u32, len: usize) -> bool {
+pub(super) unsafe fn valid_user_buffer(ptr: u32, len: usize) -> bool {
     if len == 0 {
         return true;
     }
@@ -93,6 +95,10 @@ pub unsafe fn syscall_read(regs: *mut ContextFrame) {
                     fs::update_open_file_offset(global_fd, read as u32);
                     (*regs).set_return_value(read as u32);
                 }
+                Err(KernelError::EAGAIN) => {
+                    // Waiting for input: rewind EIP so int 0x80 retries upon wakeup
+                    (*regs).eip -= 2;
+                }
                 Err(e) => {
                     pr_warn!("sys_read: error reading from file: {:?}\n", e);
                     (*regs).set_return_error(KernelError::EIO);
@@ -127,8 +133,6 @@ pub unsafe fn syscall_write(regs: *mut ContextFrame) {
     let local_fd = (*regs).arg1() as usize;
     let buf_ptr = (*regs).arg2() as *const u8;
     let count = (*regs).arg3() as usize;
-
-    pr_debug!("sys_write called with fd={}, count={}\n", local_fd, count);
 
     if !valid_user_buffer(buf_ptr as u32, count) {
         (*regs).set_return_error(KernelError::EFAULT);

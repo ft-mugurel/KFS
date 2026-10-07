@@ -1,47 +1,19 @@
 use super::print;
 use super::{
-    cursor, Color, ColorCode, CursorMovement, ScreenCursor, ScreenFormatter, VirtualScreen,
+    cursor, Color, ColorCode, ScreenCursor, ScreenFormatter, VirtualScreen,
 };
 use super::{
     SCREEN_CONTENT_HEIGHT, SCROLLBACK_LINES, VGA_BUFFER, VGA_HEIGHT, VGA_WIDTH,
     VIRTUAL_SCREENS_COUNT,
 };
-use crate::pr_err;
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
-use core::ops::{BitAnd, BitOr};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 impl Write for ScreenFormatter<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         print::write_str_on(self.screen, s);
         Ok(())
-    }
-}
-
-impl BitAnd for CursorMovement {
-    type Output = bool;
-    fn bitand(self, rhs: Self) -> bool {
-        match (self, rhs) {
-            (CursorMovement::Horizontal, CursorMovement::Horizontal)
-            | (CursorMovement::Vertical, CursorMovement::Vertical)
-            | (CursorMovement::All, CursorMovement::All) => true,
-            _ => false,
-        }
-    }
-}
-
-impl BitOr for CursorMovement {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (CursorMovement::Horizontal, CursorMovement::Vertical)
-            | (CursorMovement::Vertical, CursorMovement::Horizontal) => CursorMovement::All,
-            (CursorMovement::Horizontal, CursorMovement::Horizontal)
-            | (CursorMovement::Vertical, CursorMovement::Vertical)
-            | (CursorMovement::All, _)
-            | (_, CursorMovement::All) => self,
-        }
     }
 }
 
@@ -105,7 +77,6 @@ impl VirtualScreenCell {
                 color: ColorCode::new(Color::LightGray, Color::Black),
                 esc_seq_color: None,
                 active: false,
-                cursor_movement: CursorMovement::All,
             }; VIRTUAL_SCREENS_COUNT],
         ))
     }
@@ -115,16 +86,6 @@ unsafe impl Sync for VirtualScreenCell {}
 
 static VIRTUAL_SCREENS: VirtualScreenCell = VirtualScreenCell::new();
 static ACTIVE_SCREEN_IDX: AtomicUsize = AtomicUsize::new(0);
-
-pub fn with_screen<R>(screen_index: usize, f: impl FnOnce(&VirtualScreen) -> R) -> Option<R> {
-    if screen_index >= VIRTUAL_SCREENS_COUNT {
-        pr_err!("Invalid screen index: {}\n", screen_index);
-        return None;
-    }
-
-    let screens = unsafe { &*VIRTUAL_SCREENS.0.get() };
-    Some(f(&screens[screen_index]))
-}
 
 pub fn with_screen_mut<R>(
     screen_index: usize,
@@ -140,10 +101,6 @@ pub fn with_screen_mut<R>(
 
 pub fn active_screen_index() -> usize {
     ACTIVE_SCREEN_IDX.load(Ordering::Relaxed)
-}
-
-pub fn with_active_screen<R>(f: impl FnOnce(&VirtualScreen) -> R) -> Option<R> {
-    with_screen(active_screen_index(), f)
 }
 
 pub fn with_active_screen_mut<R>(f: impl FnOnce(&mut VirtualScreen) -> R) -> Option<R> {
@@ -278,11 +235,18 @@ fn render_screen_buffer(screen: &VirtualScreen) {
 }
 
 pub fn render_screen(screen: &mut VirtualScreen) {
+    if !screen.active {
+        return;
+    }
     render_screen_buffer(screen);
     sync_cursor_of(screen);
 }
 
 pub fn render_cell_if_visible_of(screen: &VirtualScreen, line: usize, column: usize) {
+    if !screen.active {
+        return;
+    }
+
     if line >= SCROLLBACK_LINES || column >= VGA_WIDTH {
         return;
     }
@@ -304,6 +268,9 @@ pub fn render_cell_if_visible_of(screen: &VirtualScreen, line: usize, column: us
 }
 
 pub fn sync_cursor_of(screen: &VirtualScreen) {
+    if !screen.active {
+        return;
+    }
     cursor::sync_hardware_cursor(screen);
 }
 
@@ -327,13 +294,15 @@ pub fn set_active(screen_index: usize) {
 
 #[unsafe(link_section = ".init.text")]
 pub fn init_virtual_screens() {
+    cursor::set_small_cursor();
     for screen_index in 0..VIRTUAL_SCREENS_COUNT {
         with_screen_mut(screen_index, |screen| {
             screen.index = screen_index;
             for line in 0..SCROLLBACK_LINES {
                 clear_buffer_line(screen, line);
             }
-            screen.accepts_input = false;
+            screen.accepts_input = true;
+            screen.cursor_visible = true;
         });
     }
 
@@ -373,36 +342,6 @@ pub fn scroll_view_down() {
     });
 }
 
-pub fn is_screen_active(screen_index: usize) -> bool {
-    active_screen_index() == screen_index
-}
-
-pub fn active_screen_accepts_input() -> bool {
-    if let Some(accepts_input) = with_active_screen(|screen| screen.accepts_input) {
-        accepts_input
-    } else {
-        false
-    }
-}
-
-pub fn active_cursor_position() -> (u16, u16) {
-    if let Some((x, y)) = with_active_screen(|screen| (screen.cursor.x, screen.cursor.y)) {
-        (x, y)
-    } else {
-        (0, 1)
-    }
-}
-
-pub fn set_screen_accepts_input(screen_index: usize, accepts_input: bool) {
-    with_screen_mut(screen_index, |screen| {
-        screen.accepts_input = accepts_input;
-        if screen.cursor_visible != screen.accepts_input {
-            screen.cursor_visible = screen.accepts_input;
-            render_screen(screen);
-        }
-    });
-}
-
 pub fn switch_to_previous_screen() {
     let current_index = active_screen_index();
     let previous_index = (current_index + VIRTUAL_SCREENS_COUNT - 1) % VIRTUAL_SCREENS_COUNT;
@@ -415,26 +354,29 @@ pub fn switch_to_next_screen() {
     set_active(next_index);
 }
 
-pub fn set_cursor_movement_on(screen_index: usize, mode: CursorMovement) {
-    with_screen_mut(screen_index, |screen| {
-        screen.cursor_movement = mode;
-    });
-}
-
 pub fn change_color(color: ColorCode) {
     with_active_screen_mut(|screen| {
         screen.set_color(color);
     });
 }
 
+pub(crate) fn clear_screen_internal(screen: &mut VirtualScreen) {
+    for line in 0..SCROLLBACK_LINES {
+        clear_buffer_line(screen, line);
+    }
+    screen.cursor = ScreenCursor { x: 0, y: 0 };
+    screen.used_lines = 1;
+    screen.viewport = 0;
+    render_screen(screen);
+}
+
+pub(crate) fn set_cursor_home(screen: &mut VirtualScreen) {
+    screen.cursor = ScreenCursor { x: 0, y: 0 };
+    render_screen(screen);
+}
+
 pub fn clear(screen_index: usize) {
     with_screen_mut(screen_index, |screen| {
-        for line in 0..SCROLLBACK_LINES {
-            clear_buffer_line(screen, line);
-        }
-        screen.cursor = ScreenCursor { x: 0, y: 0 };
-        screen.used_lines = 1;
-        screen.viewport = 0;
-        render_screen(screen);
+        clear_screen_internal(screen);
     });
 }

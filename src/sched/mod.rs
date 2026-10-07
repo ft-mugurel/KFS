@@ -10,7 +10,7 @@ mod thread_info;
 pub(crate) const THREAD_SIZE: usize = 16384;
 pub(crate) const MAX_PROCESSES: usize = 64;
 pub(crate) const MAX_CHILDREN: usize = 16;
-pub(crate) const MAX_FDS_PER_PROCESS: usize = 16;
+pub(crate) const MAX_FDS_PER_PROCESS: usize = 64;
 pub(crate) const MAX_SIGNALS: usize = 32;
 pub(crate) const SIGNAL_QUEUE_SIZE: usize = 16;
 pub(crate) const MAX_VMAS: usize = 16;
@@ -229,10 +229,13 @@ pub(crate) fn reserve_process_slot() -> Option<usize> {
     None
 }
 
-pub(crate) use process::create_user_process;
+pub(crate) use process::{
+    bind_process_to_tty, create_user_process, create_user_process_on_tty, spawn_init_shell,
+    spawn_init_shells, start_process,
+};
 pub(crate) use scheduler::{idle_stack_top, init_scheduler_for_cpu, schedule};
 pub(crate) use thread_info::{
-    current, current_cpu, current_cred, current_pid, ContextFrame, ThreadInfo, STACK_CANARY,
+    ContextFrame, STACK_CANARY, ThreadInfo, current, current_cpu, current_cred, current_pid,
 };
 
 #[unsafe(no_mangle)]
@@ -249,9 +252,17 @@ pub unsafe extern "C" fn idle_loop() -> ! {
     }
 }
 
+use core::sync::atomic::{AtomicBool, Ordering};
+static SCHEDULER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_scheduler_active() -> bool {
+    SCHEDULER_ACTIVE.load(Ordering::SeqCst)
+}
+
 /// Moves esp onto the given stack and jumps (not calls) into idle_loop.
 /// Never returns — there is no valid frame to return to on the old stack.
 pub unsafe fn switch_to_idle_stack(new_esp: u32) -> ! {
+    SCHEDULER_ACTIVE.store(true, Ordering::SeqCst);
     core::arch::asm!(
         "mov esp, {esp}",
         "jmp {func}",

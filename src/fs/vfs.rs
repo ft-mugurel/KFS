@@ -1,11 +1,11 @@
-use super::{VfsNode, VfsNodeType};
 use crate::{
     error::{KResult, KernelError},
+    locks::Spinlock,
     pr_warn, utils,
     vga::text_mod::{print_fmt_on, print_str_on},
 };
 
-use crate::locks::Spinlock;
+use super::{VfsNode, VfsNodeType};
 
 pub const MAX_VFS_NODES: usize = 1024;
 pub static mut ROOT_NODE: *mut VfsNode = core::ptr::null_mut();
@@ -17,8 +17,15 @@ static mut VFS_NODE_COUNT: usize = 0;
 
 impl VfsNode {
     pub unsafe fn read(&self, buffer: &mut [u8], offset: u32) -> KResult<usize> {
+        if self.inode >= 0xF000_0000 {
+            return crate::fs::proc::proc_read(self.inode, buffer, offset);
+        }
         if self.node_type == VfsNodeType::CharDevice {
             return crate::tty::read(self.inode as usize, buffer);
+        }
+        if self.node_type == VfsNodeType::Fifo {
+            let pipe_id = (self.inode >> 1) as usize;
+            return crate::pipe::pipe_read(pipe_id, buffer);
         }
         if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
             pr_warn!("VFS: Attempted to read from a non-file node\n");
@@ -34,6 +41,10 @@ impl VfsNode {
     pub unsafe fn write(&mut self, buffer: &[u8], offset: u32) -> KResult<usize> {
         if self.node_type == VfsNodeType::CharDevice {
             return crate::tty::write(self.inode as usize, buffer);
+        }
+        if self.node_type == VfsNodeType::Fifo {
+            let pipe_id = (self.inode >> 1) as usize;
+            return crate::pipe::pipe_write(pipe_id, buffer);
         }
         if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
             pr_warn!("VFS: Attempted to write to a non-file node\n");
@@ -73,11 +84,14 @@ impl VfsNode {
             return Err(KernelError::EINVAL);
         }
 
-        if !self.children.is_null() {
-            return Ok(()); // Already loaded
+        if !self.children.is_null() || self.inode == 0 {
+            return Ok(()); // Already loaded or virtual in-memory directory
         }
 
         let mount = (*self.master).mount;
+        if mount.is_null() {
+            return Ok(());
+        }
         let fn_load_dir = (*mount).backend.lazy_load_directory;
         let inode = self.inode;
 
@@ -91,6 +105,7 @@ pub unsafe fn alloc_vfs_node() -> KResult<*mut VfsNode> {
         return Err(KernelError::ENFILE);
     }
     let node_ptr = &mut VFS_NODE_POOL[VFS_NODE_COUNT] as *mut VfsNode;
+    (*node_ptr).ref_count = 0;
     VFS_NODE_COUNT += 1;
     Ok(node_ptr)
 }
@@ -166,6 +181,7 @@ pub unsafe fn create_child_node(
     (*node).rights = rights;
 
     append_child(parent, node);
+    vfs_ref_get(parent);
     Ok(node)
 }
 
@@ -179,6 +195,7 @@ pub unsafe fn mount_node(target: *mut VfsNode, mounted_root: *mut VfsNode) -> KR
     }
 
     (*target).master = mounted_root;
+    vfs_ref_get(target);
     Ok(())
 }
 
@@ -192,6 +209,7 @@ pub unsafe fn umount_node(target: *mut VfsNode) -> KResult<()> {
     }
 
     (*target).master = target;
+    vfs_ref_put(target);
     Ok(())
 }
 
@@ -213,6 +231,13 @@ pub unsafe fn print_vfs_tree(mut node: *mut VfsNode, depth: usize) {
                 (*node).size
             ),
         );
+
+        if (*node).node_type == VfsNodeType::Directory
+            && (*node).children.is_null()
+            && (*node).inode != 0
+        {
+            let _ = (*node).lazy_load_directory();
+        }
 
         if !(*node).children.is_null() {
             print_vfs_tree((*node).children, depth + 1);
@@ -288,4 +313,18 @@ pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNod
     }
 
     Ok(current)
+}
+
+pub(crate) unsafe fn vfs_ref_get(node: *mut VfsNode) {
+    if !node.is_null() {
+        (*node).ref_count += 1;
+    }
+}
+
+pub(crate) unsafe fn vfs_ref_put(node: *mut VfsNode) {
+    if !node.is_null() {
+        if (*node).ref_count > 0 {
+            (*node).ref_count -= 1;
+        }
+    }
 }

@@ -4,22 +4,23 @@
 
 use crate::startup_config::pic::{MASK_ENABLE_TIMER_KEYBOARD, MASTER_DATA_PORT};
 
+mod acpi;
 mod drivers;
 mod dump;
 mod error;
 mod fs;
 mod gdt;
-pub mod initcall;
-mod acpi;
+mod initcall;
 mod interrupts;
 mod ipc;
 mod locks;
 mod paging;
 mod panic;
+mod pipe;
 mod printk;
 mod sched;
 mod security;
-mod shell;
+mod serial;
 mod signals;
 mod smp;
 mod startup_config;
@@ -28,6 +29,7 @@ mod test;
 mod tty;
 mod utils;
 mod vga;
+mod waitqueue;
 mod x86;
 
 static mut BOOT_MULTIBOOT_MAGIC: u32 = 0;
@@ -65,24 +67,13 @@ unsafe fn load_account_records() {
 
 late_initcall!(load_account_records);
 
-#[unsafe(link_section = ".init.text")]
-fn prepare_serial_output() {
-    x86::outb(0x3F8 + 1, 0x00); // Disable all interrupts
-    x86::outb(0x3F8 + 3, 0x80); // Enable DLAB (set baud rate divisor)
-    x86::outb(0x3F8 + 0, 0x03); // Set divisor to 3 (lo byte) 38400 baud
-    x86::outb(0x3F8 + 1, 0x00); //                  (hi byte)
-    x86::outb(0x3F8 + 3, 0x03); // 8 bits, no parity, one stop bit
-    x86::outb(0x3F8 + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
-    x86::outb(0x3F8 + 4, 0x0B); // IRQs enabled, RTS/DSR set
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -> ! {
     BOOT_MULTIBOOT_MAGIC = multiboot_magic;
     BOOT_MULTIBOOT_INFO_ADDR = multiboot_info_addr;
 
     x86::disable_interrupts();
-    prepare_serial_output();
+    serial::init();
 
     gdt::load_gdt_bsp();
     interrupts::init_idt();
@@ -101,11 +92,6 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     };
     paging::init_paging(BOOT_MULTIBOOT_MAGIC, BOOT_MULTIBOOT_INFO_ADDR);
     sched::init_scheduler_for_cpu(0); // BSP = cpu_id 0
-    let cr = sched::current();
-    pr_info!(
-        "Current task struct for CPU 0: {:#X}\n",
-        cr.as_ref().map_or(0, |t| t as *const _ as u32)
-    );
 
     smp::ipi::init_ipi();
     smp::lapic::map_lapic(acpi_info.local_apic_addr);
@@ -136,9 +122,20 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     }
 
     initcall::do_initcalls();
+    if !fs::root_filesystem_ready() {
+        pr_err!("Required root filesystem initialization failed\n");
+        loop {
+            x86::hlt();
+        }
+    }
     initcall::free_init_memory();
 
-    shell::init_shell();
+    printk::handoff_to_userspace();
+
+    if let Err(e) = sched::spawn_init_shells() {
+        printk::set_direct_screen_output(true);
+        pr_err!("Failed to spawn user-space shells: {:?}\n", e);
+    }
 
     let idle_esp = sched::idle_stack_top(0);
     sched::switch_to_idle_stack(idle_esp);
