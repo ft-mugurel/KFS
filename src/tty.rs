@@ -71,7 +71,7 @@ pub fn push_char(c: char) {
                 }) == Some(tty);
 
                 if matches_tty {
-                    task.state = sched::ProcessState::Ready;
+                    sched::set_state(task, sched::ProcessState::Ready);
                 }
             }
         }
@@ -91,7 +91,7 @@ pub unsafe fn read(tty: usize, output: &mut [u8]) -> KResult<usize> {
 
     if read == 0 {
         if let Some(task) = sched::current().as_mut() {
-            task.state = sched::ProcessState::Waiting;
+            sched::set_state(task, sched::ProcessState::Waiting);
         }
         Err(KernelError::EAGAIN)
     } else {

@@ -2,7 +2,6 @@
 #![no_main]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::startup_config::pic::{MASK_ENABLE_TIMER_KEYBOARD, MASTER_DATA_PORT};
 
 mod acpi;
 mod drivers;
@@ -119,7 +118,7 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     smp::lapic::calibrate();
     x86::disable_interrupts();
     smp::lapic::start_periodic_timer(10);
-    x86::outb(MASTER_DATA_PORT, MASK_ENABLE_TIMER_KEYBOARD);
+    interrupts::timer::mask_pit();
     smp::trampoline::install_trampoline();
 
     let bsp_apic_id = smp::lapic::this_cpu_apic_id();

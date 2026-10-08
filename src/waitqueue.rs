@@ -23,7 +23,7 @@ impl WaitQueue {
         self.count += 1;
 
         let task = sched::current().as_mut().unwrap();
-        task.state = ProcessState::Waiting;
+        sched::set_state(task, ProcessState::Waiting);
         true
     }
 
@@ -41,7 +41,7 @@ impl WaitQueue {
         let mut table = PROCESS_TABLE.lock();
         if let Some(ref mut task) = table[pid] {
             if task.state == ProcessState::Waiting {
-                task.state = ProcessState::Ready;
+                sched::set_state(task, ProcessState::Ready);
             }
         }
     }
@@ -52,7 +52,7 @@ impl WaitQueue {
             let pid = self.waiters[i] as usize;
             if let Some(ref mut task) = table[pid] {
                 if task.state == ProcessState::Waiting {
-                    task.state = ProcessState::Ready;
+                    sched::set_state(task, ProcessState::Ready);
                 }
             }
         }

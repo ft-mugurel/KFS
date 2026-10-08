@@ -9,7 +9,8 @@ pub(super) unsafe fn syscall_nanosleep(regs: *mut ContextFrame) {
         let wakeup_tick = timer::get_ticks() as u64 + ticks_to_wait as u64;
         let task = sched::current().as_mut().unwrap();
         task.wakeup_time = wakeup_tick as u64;
-        task.state = ProcessState::Sleeping;
+        sched::note_wakeup_tick(wakeup_tick);
+        sched::set_state(task, ProcessState::Sleeping);
 
         while sched::current().as_ref().unwrap().state == ProcessState::Sleeping {
             core::arch::asm!("sti; hlt");

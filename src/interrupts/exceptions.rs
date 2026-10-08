@@ -236,7 +236,7 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
             sig_num
         );
 
-        task.state = ProcessState::Zombie;
+        sched::set_state(task, ProcessState::Zombie);
 
         x86::write_cr3(paging::bootstrap_directory_phys_addr());
         let next_esp = sched::schedule(0);

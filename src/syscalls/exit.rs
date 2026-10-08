@@ -8,7 +8,7 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
     let exit_code = (*regs).arg1();
     let task = sched::current().as_mut().unwrap();
 
-    task.state = ProcessState::Zombie;
+    sched::set_state(task, ProcessState::Zombie);
     task.exit_code = Some(exit_code);
 
     // VFS Cleanup
@@ -41,7 +41,7 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
     let parent_pid = task.family.parent_pid as usize;
     if let Some(ref mut parent) = table[parent_pid] {
         if parent.state == ProcessState::Waiting {
-            parent.state = ProcessState::Ready;
+            sched::set_state(parent, ProcessState::Ready);
         }
     }
     drop(table);
@@ -101,6 +101,6 @@ pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
         }
     }
 
-    parent_task.state = ProcessState::Waiting;
+    sched::set_state(parent_task, ProcessState::Waiting);
     (*regs).eip -= 2; // Re-execute the wait syscall after being woken up
 }
