@@ -95,7 +95,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     let mut child_task: sched::TaskStruct = core::mem::MaybeUninit::zeroed().assume_init();
     child_task.pid = child_pid as u32;
     child_task.credentials = parent_task.credentials;
-    child_task.state = sched::ProcessState::Ready;
+    child_task.state = sched::ProcessState::Terminated;
     child_task.exit_code = None;
 
     // Set the execution pointer to the forged stack
@@ -126,6 +126,10 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     let mut table = PROCESS_TABLE.lock();
     table[child_pid] = Some(child_task);
+    sched::set_state(
+        table[child_pid].as_mut().unwrap(),
+        sched::ProcessState::Ready,
+    );
     (*thread_info).task = table[child_pid].as_mut().unwrap() as *mut _;
     drop(table);
 

@@ -95,19 +95,21 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
     let current_pid = thread_info::current_pid() as usize;
     let current_ticks = timer::get_ticks() as u64;
 
-    for task in PROCESS_TABLE.lock().iter_mut() {
+    let mut table = PROCESS_TABLE.lock();
+    for task in table.iter_mut() {
         if let Some(task) = task {
             if task.state == ProcessState::Sleeping && current_ticks >= task.wakeup_time {
-                task.state = ProcessState::Ready;
+                super::set_state(task, ProcessState::Ready);
             }
         }
     }
+    super::refresh_wakeup_tick(&table);
 
-    if let Some(ref mut current_task) = PROCESS_TABLE.lock()[current_pid] {
+    if let Some(ref mut current_task) = table[current_pid] {
         match current_task.state {
             ProcessState::Running => {
                 current_task.context.esp = old_esp;
-                current_task.state = ProcessState::Ready;
+                super::set_state(current_task, ProcessState::Ready);
             }
             ProcessState::Sleeping | ProcessState::Waiting => {
                 current_task.context.esp = old_esp;
@@ -116,7 +118,6 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
         }
     }
 
-    let mut table = PROCESS_TABLE.lock();
     loop {
         let mut next_pid = current_pid;
         loop {
@@ -166,7 +167,7 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
                     next_pid,
                     sig_num
                 );
-                next_task.state = ProcessState::Zombie;
+                super::set_state(next_task, ProcessState::Zombie);
                 killed = true;
             }
         }
@@ -175,7 +176,7 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
             continue; // table stays locked, loop again
         }
 
-        next_task.state = ProcessState::Running;
+        super::set_state(next_task, ProcessState::Running);
         let next_esp = next_task.context.esp;
         let next_cr3 = next_task.context.cr3;
         let next_kstack_top = next_task.kernel_stack_top;

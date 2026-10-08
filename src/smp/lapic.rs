@@ -32,7 +32,7 @@ const TIMER_PERIODIC: u32 = 1 << 17;
 const TIMER_MASKED: u32 = 1 << 16;
 const DIVIDE_BY_16: u32 = 0b0011;
 
-pub const TIMER_VECTOR: u8 = 0x20; // same vector the PIT-relayed handler already uses
+pub const TIMER_VECTOR: u8 = 0x22;
 
 static LAPIC_BASE: AtomicU32 = AtomicU32::new(0);
 

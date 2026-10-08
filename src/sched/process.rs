@@ -231,7 +231,10 @@ pub unsafe fn create_user_process(
     }
 
     if parent_opt.is_some() {
-        locked_process_table[pid].as_mut().unwrap().state = ProcessState::Ready;
+        super::set_state(
+            locked_process_table[pid].as_mut().unwrap(),
+            ProcessState::Ready,
+        );
     }
     let credentials = locked_process_table[pid].as_ref().unwrap().credentials;
     drop(locked_process_table);
@@ -275,7 +278,7 @@ pub unsafe fn bind_process_to_tty(pid: usize, tty_dev: &str) -> KResult<()> {
     task.fd_tbl[0] = Some(global_fd);
     task.fd_tbl[1] = Some(global_fd);
     task.fd_tbl[2] = Some(global_fd);
-    task.state = ProcessState::Ready;
+    super::set_state(task, ProcessState::Ready);
 
     Ok(())
 }
@@ -286,7 +289,7 @@ pub unsafe fn start_process(pid: usize) -> KResult<()> {
         Some(t) => t,
         None => return Err(crate::error::KernelError::ESRCH),
     };
-    task.state = ProcessState::Ready;
+    super::set_state(task, ProcessState::Ready);
     Ok(())
 }
 

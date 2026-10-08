@@ -19,6 +19,7 @@ TARGET_DIR      = target/i686-kernel
 KERNEL_BIN      = $(BUILD_DIR)/kernel.bin
 KERNEL_REL_LIB  = $(TARGET_DIR)/release/libkernel.a
 KERNEL_DBG_LIB  = $(TARGET_DIR)/debug/libkernel.a
+KERNEL_SRCS     = $(shell find src -name '*.rs' -type f) Cargo.toml build.rs linker/linker.ld
 
 ISO_OUT         = $(BUILD_DIR)/kernel.iso
 ISO_FULL_OUT    = $(BUILD_DIR)/kernel-full.iso
@@ -49,7 +50,7 @@ FHS_STAGE       = $(BUILD_DIR)/fhs-root
 FHS_STAMP       = $(BUILD_DIR)/fhs-root.stamp
 
 # **************************************************************************** #
-# 
+# 📁 DIRECTORIES
 # **************************************************************************** #
 
 GRUB_MKRESCUE	=	$(shell which grub2-mkrescue 2>/dev/null || which grub-mkrescue 2>/dev/null)
@@ -122,7 +123,9 @@ $(FHS_STAMP): $(USER_SHELL_BIN) Makefile
 	@cp $(USER_SHELL_BIN) $(FHS_STAGE)/usr/bin/mysh
 	@chmod 0755 $(FHS_STAGE)/usr/bin/mysh
 	@chmod 0700 $(FHS_STAGE)/root
+	@printf 'root:x:0:0:root:/root:/usr/bin/mysh\n' > $(FHS_STAGE)/etc/passwd
 	@touch $(FHS_STAGE)/etc/shadow $(FHS_STAGE)/var/log/kernel.log
+	@chmod 0644 $(FHS_STAGE)/etc/passwd
 	@chmod 0600 $(FHS_STAGE)/etc/shadow
 	@chmod 0644 $(FHS_STAGE)/var/log/kernel.log
 	@chmod 01777 $(FHS_STAGE)/tmp $(FHS_STAGE)/var/tmp
@@ -151,21 +154,21 @@ $(USER_SHELL_BIN): $(USER_SHELL_SRCS)
 	@echo -e "$(GREEN)[✓] User shell binary built: $@$(RESET)"
 
 build: CARGO_ARGS = --no-default-features -Zjson-target-spec
-build: $(ASM_OBJS) $(TRAMPOLINE_BIN) $(USER_SHELL_BIN)
+build: $(ASM_OBJS) $(TRAMPOLINE_BIN) $(USER_SHELL_BIN) $(KERNEL_SRCS) $(LINKER)
 	@echo -e "$(BOLD)$(CYAN)[~] Building Release Kernel...$(RESET)"
 	@$(CARGO) build --release -Zjson-target-spec
 	$(call link_kernel, $(KERNEL_REL_LIB), --release)
 	@echo -e "$(BOLD)$(GREEN)[✓] RELEASE KERNEL BUILD DONE$(RESET)"
 
 build_debug: CARGO_ARGS = -Zjson-target-spec
-build_debug: $(ASM_OBJS) $(TRAMPOLINE_BIN) $(USER_SHELL_BIN)
+build_debug: $(ASM_OBJS) $(TRAMPOLINE_BIN) $(USER_SHELL_BIN) $(KERNEL_SRCS) $(LINKER)
 	@echo -e "$(BOLD)$(YELLOW)[~] Building Debug Kernel...$(RESET)"
 	@$(CARGO) build $(CARGO_ARGS)
 	$(call link_kernel, $(KERNEL_DBG_LIB), )
 	@echo -e "$(BOLD)$(GREEN)[✓] DEBUG KERNEL BUILD DONE$(RESET)"
 
 # Reusable ISO preparation step
-$(ISO_DIR)/boot/grub/grub.cfg:
+$(ISO_DIR)/boot/grub/grub.cfg: grub/grub.cfg
 	@mkdir -p $(ISO_DIR)/boot/grub
 	@cp grub/grub.cfg $(ISO_DIR)/boot/grub/
 
@@ -197,6 +200,7 @@ run-iso: iso $(ATA_DRIVE_IMGS)
 		-d cpu_reset,guest_errors -no-reboot -no-shutdown \
 		-serial stdio \
 		-smp 8 \
+		-accel kvm \
 		-boot order=d
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 

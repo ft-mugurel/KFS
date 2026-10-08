@@ -1,11 +1,14 @@
-use core::{fmt::Display, mem::MaybeUninit};
+use core::{
+    fmt::Display,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use crate::{fs::VfsNode, locks::Spinlock, x86};
 
 mod process;
 mod scheduler;
 mod thread_info;
-// mod task_queue;
 
 pub(crate) const THREAD_SIZE: usize = 16384;
 pub(crate) const MAX_PROCESSES: usize = 64;
@@ -219,6 +222,65 @@ pub(crate) static PROCESS_TABLE: Spinlock<[Option<TaskStruct>; MAX_PROCESSES]> =
     Spinlock::new([EMPTY; MAX_PROCESSES])
 };
 
+static RUNNABLE_TASKS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_WAKEUP_TICK: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub(crate) fn set_state(task: &mut TaskStruct, state: ProcessState) {
+    let old_state = task.state;
+    if old_state == state {
+        return;
+    }
+    task.state = state;
+    match (old_state, state) {
+        (ProcessState::Ready, _) => {
+            RUNNABLE_TASKS.fetch_sub(1, Ordering::SeqCst);
+        }
+        (_, ProcessState::Ready) => {
+            RUNNABLE_TASKS.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn runnable_task_count() -> usize {
+    RUNNABLE_TASKS.load(Ordering::SeqCst)
+}
+
+pub(crate) fn has_runnable_tasks() -> bool {
+    runnable_task_count() != 0
+}
+
+pub(crate) fn note_wakeup_tick(wakeup_tick: u64) {
+    let wakeup_tick = wakeup_tick as usize;
+    let mut current = NEXT_WAKEUP_TICK.load(Ordering::Relaxed);
+    while wakeup_tick < current {
+        match NEXT_WAKEUP_TICK.compare_exchange_weak(
+            current,
+            wakeup_tick,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+pub(crate) fn wakeup_may_be_due(current_tick: u64) -> bool {
+    (current_tick as usize) >= NEXT_WAKEUP_TICK.load(Ordering::SeqCst)
+}
+
+pub(crate) fn refresh_wakeup_tick(table: &[Option<TaskStruct>; MAX_PROCESSES]) {
+    let next = table
+        .iter()
+        .filter_map(|task| task.as_ref())
+        .filter(|task| task.state == ProcessState::Sleeping)
+        .map(|task| task.wakeup_time)
+        .min()
+        .unwrap_or(u64::MAX);
+    NEXT_WAKEUP_TICK.store(next as usize, Ordering::SeqCst);
+}
+
 pub(crate) fn reserve_process_slot() -> Option<usize> {
     let mut table = PROCESS_TABLE.lock();
     for index in crate::smp::MAX_CPUS..MAX_PROCESSES {
@@ -255,7 +317,6 @@ pub unsafe extern "C" fn idle_loop() -> ! {
     }
 }
 
-use core::sync::atomic::{AtomicBool, Ordering};
 static SCHEDULER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn is_scheduler_active() -> bool {
