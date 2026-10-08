@@ -69,6 +69,8 @@ pub(crate) struct ProcessMemory {
     pub heap_base: u32,
     pub heap_brk: u32,
     pub vmas: [Vma; MAX_VMAS],
+    pub env_start: u32,
+    pub env_end: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,6 +190,7 @@ pub(crate) struct TaskStruct {
     pub fd_tbl: [Option<usize>; MAX_FDS_PER_PROCESS],
 
     pub cwd: *mut VfsNode,
+    pub env_start: u32,
 
     pub kernel_stack_top: u32,
     pub kernel_stack_bottom: u32,

@@ -8,6 +8,8 @@ use sha2::Sha256;
 const PASSWORD_HASH_SIZE: usize = 32;
 const MAX_ACCOUNTS: usize = 16;
 const USERNAME_SIZE: usize = 32;
+const HOME_PATH_SIZE: usize = 64;
+const SHELL_PATH_SIZE: usize = 64;
 const DUMMY_PASSWORD_ROUNDS: u32 = 100_000;
 const MIN_ENTROPY_SAMPLES: u32 = 32;
 
@@ -57,8 +59,21 @@ pub(crate) struct AccountRecord {
     pub password: PasswordRecord,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PasswdRecord {
+    pub username: [u8; USERNAME_SIZE],
+    pub uid: u32,
+    pub gid: u32,
+    pub home: [u8; HOME_PATH_SIZE],
+    pub shell: [u8; SHELL_PATH_SIZE],
+}
+
 pub(crate) static ACCOUNT_TABLE: Spinlock<[Option<AccountRecord>; MAX_ACCOUNTS]> = {
     const EMPTY: Option<AccountRecord> = None;
+    Spinlock::new([EMPTY; MAX_ACCOUNTS])
+};
+pub(crate) static PASSWD_TABLE: Spinlock<[Option<PasswdRecord>; MAX_ACCOUNTS]> = {
+    const EMPTY: Option<PasswdRecord> = None;
     Spinlock::new([EMPTY; MAX_ACCOUNTS])
 };
 
@@ -82,6 +97,16 @@ pub(crate) fn get_account_uid(username: &[u8]) -> Option<u32> {
 }
 
 pub(crate) fn username_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
+    let passwd = PASSWD_TABLE.lock();
+    if let Some(record) = passwd.iter().flatten().find(|record| record.uid == uid) {
+        let name = username_bytes(&record.username);
+        if name.len() > output.len() {
+            return None;
+        }
+        output[..name.len()].copy_from_slice(name);
+        return Some(name.len());
+    }
+    drop(passwd);
     let accounts = ACCOUNT_TABLE.lock();
     if let Some(account) = accounts
         .iter()
@@ -103,6 +128,18 @@ pub(crate) fn username_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
         return Some(4);
     }
     None
+}
+
+pub(crate) fn home_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
+    let passwd = PASSWD_TABLE.lock();
+    let home = passwd.iter().flatten().find(|record| record.uid == uid)?;
+    copy_path(&home.home, output)
+}
+
+pub(crate) fn shell_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
+    let passwd = PASSWD_TABLE.lock();
+    let shell = passwd.iter().flatten().find(|record| record.uid == uid)?;
+    copy_path(&shell.shell, output)
 }
 
 pub(crate) fn credentials_for_user(username: &[u8]) -> Option<Credentials> {
@@ -127,8 +164,7 @@ pub(crate) fn credentials_for_user(username: &[u8]) -> Option<Credentials> {
         .copied()?;
     drop(accounts);
 
-    let uid = account.password.uid;
-    let gid = account.password.gid;
+    let (uid, gid) = passwd_ids(username).unwrap_or((account.password.uid, account.password.gid));
     Some(Credentials {
         uid,
         gid,
@@ -151,6 +187,16 @@ pub(crate) fn ensure_root_account() -> bool {
     install_or_update_account(account)
 }
 
+pub(crate) fn ensure_root_passwd() -> bool {
+    if passwd_for_username(b"root").is_some() {
+        return true;
+    }
+    let Some(record) = create_passwd_record(b"root", 0, 0, b"/root", b"/usr/bin/mysh") else {
+        return false;
+    };
+    install_or_update_passwd(record)
+}
+
 pub(crate) fn next_user_id() -> Option<u32> {
     let accounts = ACCOUNT_TABLE.lock();
     accounts
@@ -166,10 +212,17 @@ pub(crate) fn for_each_account<F>(mut f: F)
 where
     F: FnMut(&[u8], u32, u32),
 {
+    let passwd = PASSWD_TABLE.lock();
+    if !passwd.iter().all(Option::is_none) {
+        for account in passwd.iter().flatten() {
+            f(username_bytes(&account.username), account.uid, account.gid);
+        }
+        return;
+    }
+    drop(passwd);
     let accounts = ACCOUNT_TABLE.lock();
     for account in accounts.iter().flatten() {
-        let name = username_bytes(&account.username);
-        f(name, account.password.uid, account.password.gid);
+        f(username_bytes(&account.username), account.password.uid, account.password.gid);
     }
 }
 
@@ -214,8 +267,7 @@ pub(crate) fn authenticate(username: &[u8], password: &[u8]) -> Option<Credentia
         return None;
     }
 
-    let uid = password_record.uid;
-    let gid = password_record.gid;
+    let (uid, gid) = passwd_ids(username).unwrap_or((password_record.uid, password_record.gid));
     return Some(Credentials {
         uid,
         gid,
@@ -226,6 +278,127 @@ pub(crate) fn authenticate(username: &[u8], password: &[u8]) -> Option<Credentia
         groups: [0; 8],
         group_count: 0,
     });
+}
+
+pub(crate) fn passwd_for_username(username: &[u8]) -> Option<PasswdRecord> {
+    let passwd = PASSWD_TABLE.lock();
+    passwd
+        .iter()
+        .flatten()
+        .find(|record| constant_time_equal(username, username_bytes(&record.username)))
+        .copied()
+}
+
+fn passwd_ids(username: &[u8]) -> Option<(u32, u32)> {
+    let record = passwd_for_username(username)?;
+    Some((record.uid, record.gid))
+}
+
+pub(crate) fn create_passwd_record(
+    username: &[u8],
+    uid: u32,
+    gid: u32,
+    home: &[u8],
+    shell: &[u8],
+) -> Option<PasswdRecord> {
+    if username.is_empty()
+        || username.len() >= USERNAME_SIZE
+        || home.is_empty()
+        || home.len() >= HOME_PATH_SIZE
+        || shell.is_empty()
+        || shell.len() >= SHELL_PATH_SIZE
+    {
+        return None;
+    }
+    let mut record = PasswdRecord {
+        username: [0; USERNAME_SIZE],
+        uid,
+        gid,
+        home: [0; HOME_PATH_SIZE],
+        shell: [0; SHELL_PATH_SIZE],
+    };
+    record.username[..username.len()].copy_from_slice(username);
+    record.home[..home.len()].copy_from_slice(home);
+    record.shell[..shell.len()].copy_from_slice(shell);
+    Some(record)
+}
+
+pub(crate) fn install_or_update_passwd(record: PasswdRecord) -> bool {
+    let mut passwd = PASSWD_TABLE.lock();
+    if let Some(existing) = passwd.iter_mut().flatten().find(|existing| {
+        constant_time_equal(
+            username_bytes(&existing.username),
+            username_bytes(&record.username),
+        )
+    }) {
+        *existing = record;
+        return true;
+    }
+
+    if let Some(slot) = passwd.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(record);
+        return true;
+    }
+    false
+}
+
+pub(crate) fn ensure_passwd_user(username: &[u8], uid: u32, gid: u32) -> bool {
+    if passwd_for_username(username).is_some() {
+        return true;
+    }
+    let mut home = [0u8; HOME_PATH_SIZE];
+    if username.len() + 1 >= HOME_PATH_SIZE {
+        return false;
+    }
+    home[0] = b'/';
+    home[1..username.len() + 1].copy_from_slice(username);
+    let Some(record) =
+        create_passwd_record(username, uid, gid, &home[..username.len() + 1], b"/usr/bin/mysh")
+    else {
+        return false;
+    };
+    install_or_update_passwd(record)
+}
+
+pub(crate) fn remove_passwd(username: &[u8]) -> bool {
+    let mut passwd = PASSWD_TABLE.lock();
+    let Some(slot) = passwd.iter_mut().find(|slot| {
+        slot.as_ref()
+            .is_some_and(|record| constant_time_equal(username, username_bytes(&record.username)))
+    }) else {
+        return false;
+    };
+    *slot = None;
+    true
+}
+
+pub(crate) fn load_passwd(data: &[u8]) -> usize {
+    let mut loaded = 0;
+    for line in data.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        let mut fields = line.split(|&byte| byte == b':');
+        let (Some(username), Some(_password), Some(uid_field), Some(gid_field), Some(_gecos), Some(home), Some(shell)) =
+            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        let (Some(uid), Some(gid)) = (parse_decimal(uid_field), parse_decimal(gid_field)) else {
+            continue;
+        };
+        let Some(record) = create_passwd_record(username, uid, gid, home, shell) else {
+            continue;
+        };
+        if install_or_update_passwd(record) {
+            loaded += 1;
+        }
+    }
+    loaded
 }
 
 pub(crate) fn create_password_record(
@@ -525,6 +698,31 @@ pub(crate) fn serialize_accounts(output: &mut [u8]) -> Option<usize> {
     Some(written)
 }
 
+pub(crate) fn serialize_passwd(output: &mut [u8]) -> Option<usize> {
+    let passwd = PASSWD_TABLE.lock();
+    let mut written: usize = 0;
+    for record in passwd.iter().flatten() {
+        let mut line = [0u8; 256];
+        let mut length = 0;
+        length = append_bytes(&mut line, length, username_bytes(&record.username))?;
+        length = append_bytes(&mut line, length, b":x:")?;
+        length = append_decimal(&mut line, length, record.uid)?;
+        length = append_byte(&mut line, length, b':')?;
+        length = append_decimal(&mut line, length, record.gid)?;
+        length = append_bytes(&mut line, length, b"::")?;
+        length = append_bytes(&mut line, length, path_bytes(&record.home))?;
+        length = append_byte(&mut line, length, b':')?;
+        length = append_bytes(&mut line, length, path_bytes(&record.shell))?;
+        length = append_byte(&mut line, length, b'\n')?;
+        if written.checked_add(length)? > output.len() {
+            return None;
+        }
+        output[written..written + length].copy_from_slice(&line[..length]);
+        written += length;
+    }
+    Some(written)
+}
+
 pub(crate) unsafe fn persist_accounts() -> bool {
     let root = crate::fs::ROOT_NODE;
     let shadow = match crate::fs::resolve_path("/etc/shadow", root) {
@@ -534,6 +732,7 @@ pub(crate) unsafe fn persist_accounts() -> bool {
     if (*shadow).inode == 0 || (*shadow).node_type != crate::fs::VfsNodeType::File {
         return false;
     }
+
     if (*shadow).truncate().is_err() {
         return false;
     }
@@ -552,6 +751,30 @@ pub(crate) unsafe fn persist_accounts() -> bool {
     } else {
         false
     };
+    let _ = crate::paging::kfree(data_alloc);
+    result
+}
+
+pub(crate) unsafe fn persist_passwd() -> bool {
+    let passwd = match crate::fs::resolve_path("/etc/passwd", crate::fs::ROOT_NODE) {
+        Ok(node) => node,
+        Err(_) => return false,
+    };
+    if (*passwd).inode == 0 || (*passwd).node_type != crate::fs::VfsNodeType::File {
+        return false;
+    }
+    if (*passwd).truncate().is_err() {
+        return false;
+    }
+    let data_alloc = match crate::paging::kmalloc(4096) {
+        Ok(ptr) => ptr,
+        Err(_) => return false,
+    };
+    let data = &mut *(data_alloc as *mut [u8; 4096]);
+    data.fill(0);
+    let result = serialize_passwd(data)
+        .and_then(|length| (*passwd).write(&data[..length], 0).ok().map(|written| written == length))
+        .unwrap_or(false);
     let _ = crate::paging::kfree(data_alloc);
     result
 }
@@ -626,6 +849,20 @@ fn username_bytes(username: &[u8; USERNAME_SIZE]) -> &[u8] {
         .position(|&byte| byte == 0)
         .unwrap_or(USERNAME_SIZE);
     &username[..length]
+}
+
+fn path_bytes<const SIZE: usize>(path: &[u8; SIZE]) -> &[u8] {
+    let length = path.iter().position(|&byte| byte == 0).unwrap_or(SIZE);
+    &path[..length]
+}
+
+fn copy_path<const SIZE: usize>(path: &[u8; SIZE], output: &mut [u8]) -> Option<usize> {
+    let bytes = path_bytes(path);
+    if bytes.len() > output.len() {
+        return None;
+    }
+    output[..bytes.len()].copy_from_slice(bytes);
+    Some(bytes.len())
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {

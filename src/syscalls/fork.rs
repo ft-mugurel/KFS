@@ -1,6 +1,7 @@
 use crate::{
     error::KernelError,
     fs, paging, pr_info, pr_warn,
+    process_memory,
     sched::{self, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE, current_pid},
 };
 
@@ -107,6 +108,7 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
 
     child_task.cwd = parent_task.cwd;
     child_task.fd_tbl = parent_task.fd_tbl;
+    process_memory::inherit_environment(parent_task, &mut child_task);
 
     // Increment global reference counts for inherited files
     for i in 0..MAX_FDS_PER_PROCESS {
@@ -127,5 +129,12 @@ pub(super) unsafe fn syscall_fork(regs: *mut ContextFrame) {
     (*thread_info).task = table[child_pid].as_mut().unwrap() as *mut _;
     drop(table);
 
+    if let Err(error) = crate::fs::procfs::process_created(
+        child_pid as u32,
+        child_task.credentials.uid,
+        child_task.credentials.gid,
+    ) {
+        pr_warn!("Failed to create proc entry for child PID {}: {:?}\n", child_pid, error);
+    }
     (*regs).set_return_value(child_pid as u32);
 }

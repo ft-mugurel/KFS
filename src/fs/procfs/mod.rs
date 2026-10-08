@@ -11,6 +11,7 @@ pub mod process;
 pub mod system;
 
 pub use ops::PROCFS_BACKEND;
+pub use ops::{process_created, process_reaped};
 
 pub const PROCFS_ROOT_INODE: u32 = 1;
 pub const PROCFS_VERSION_INODE: u32 = 2;

@@ -48,6 +48,7 @@ pub static KERNEL_DIRECTORIES: &[DirEntrySpec] = &[
 /// Runtime mount points are image directories whose contents are kernel-owned.
 pub static RUNTIME_MOUNT_POINTS: &[&str] = &["/dev", "/proc", "/sys", "/run"];
 pub static PERSISTENT_FILES: &[FileEntrySpec] = &[
+    FileEntrySpec { path: "/etc/passwd", mode: 0o644 },
     FileEntrySpec { path: "/etc/shadow", mode: 0o600 },
     FileEntrySpec { path: "/var/log/kernel.log", mode: 0o644 },
 ];
