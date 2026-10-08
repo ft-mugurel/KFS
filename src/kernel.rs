@@ -17,6 +17,7 @@ mod locks;
 mod paging;
 mod panic;
 mod pipe;
+mod process_memory;
 mod printk;
 mod sched;
 mod security;
@@ -37,6 +38,24 @@ static mut BOOT_MULTIBOOT_INFO_ADDR: u32 = 0;
 
 #[unsafe(link_section = ".init.text")]
 unsafe fn load_account_records() {
+    if let Ok(passwd) = fs::resolve_path("/etc/passwd", fs::ROOT_NODE) {
+        let passwd_length = (*passwd).size.min(4096) as usize;
+        if let Ok(buf_ptr) = paging::kmalloc(4096) {
+            let buffer = &mut *(buf_ptr as *mut [u8; 4096]);
+            if let Ok(bytes_read) = (*passwd).read(&mut buffer[..passwd_length], 0) {
+                let loaded = security::load_passwd(&buffer[..bytes_read]);
+                pr_info!("Loaded {} passwd record(s)\n", loaded);
+            } else {
+                pr_warn!("Could not read /etc/passwd\n");
+            }
+            let _ = paging::kfree(buf_ptr);
+        }
+    }
+    if !security::ensure_root_passwd() {
+        pr_warn!("Could not initialize root passwd record\n");
+    }
+    let _ = security::persist_passwd();
+
     let Ok(shadow) = fs::resolve_path("/etc/shadow", fs::ROOT_NODE) else {
         security::ensure_root_account();
         let _ = security::persist_accounts();

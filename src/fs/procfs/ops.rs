@@ -251,37 +251,81 @@ pub unsafe fn populate_proc_root(target: *mut VfsNode, master: *mut VfsNode) -> 
 unsafe fn populate_active_pids(target: *mut VfsNode, master: *mut VfsNode) -> KResult<()> {
     let table = sched::PROCESS_TABLE.lock();
     for process in table.iter().flatten() {
-        let pid = process.pid;
-        let mut pid_buf = [0u8; 12];
-        let pid_str = format_u32(pid, &mut pid_buf);
-
-        // Check if child with this name already exists
-        let mut exists = false;
-        let mut child = (*target).children;
-        while !child.is_null() {
-            let name_len = (*child).name.iter().position(|&c| c == 0).unwrap_or(256);
-            let child_name = core::str::from_utf8(&(&(*child).name)[..name_len]).unwrap_or("");
-            if child_name == pid_str {
-                exists = true;
-                break;
-            }
-            child = (*child).next_of_kin;
-        }
-
-        if !exists {
-            create_proc_child(
-                target,
-                master,
-                pid_str,
-                super::PROC_PID_BASE + (pid * super::PROC_PID_STRIDE),
-                VfsNodeType::Directory,
-                0o555,
-                process.credentials.uid,
-                process.credentials.gid,
-            )?;
-        }
+        create_proc_pid_entry(
+            target,
+            master,
+            process.pid,
+            process.credentials.uid,
+            process.credentials.gid,
+        )?;
     }
     Ok(())
+}
+
+unsafe fn create_proc_pid_entry(
+    target: *mut VfsNode,
+    master: *mut VfsNode,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+) -> KResult<()> {
+    let mut pid_buf = [0u8; 12];
+    let pid_str = format_u32(pid, &mut pid_buf);
+    let mut child = (*target).children;
+    while !child.is_null() {
+        let name_len = (*child).name.iter().position(|&c| c == 0).unwrap_or(256);
+        let child_name = core::str::from_utf8(&(&(*child).name)[..name_len]).unwrap_or("");
+        if child_name == pid_str {
+            return Ok(());
+        }
+        child = (*child).next_of_kin;
+    }
+
+    create_proc_child(
+        target,
+        master,
+        pid_str,
+        super::PROC_PID_BASE + (pid * super::PROC_PID_STRIDE),
+        VfsNodeType::Directory,
+        0o555,
+        uid,
+        gid,
+    )?;
+    Ok(())
+}
+
+pub unsafe fn process_created(pid: u32, uid: u32, gid: u32) -> KResult<()> {
+    let proc_root = fs::resolve_path("/proc", fs::ROOT_NODE)?;
+    let master = (*proc_root).master;
+    create_proc_pid_entry(proc_root, master, pid, uid, gid)
+}
+
+pub unsafe fn process_reaped(pid: u32) {
+    let Ok(proc_root) = fs::resolve_path("/proc", fs::ROOT_NODE) else {
+        return;
+    };
+    let mut child = (*proc_root).children;
+    let inode = super::PROC_PID_BASE + (pid * super::PROC_PID_STRIDE);
+    while !child.is_null() {
+        let next = (*child).next_of_kin;
+        if (*child).inode == inode {
+            let mut previous = (*proc_root).children;
+            if previous == child {
+                (*proc_root).children = next;
+            } else {
+                while !previous.is_null() && (*previous).next_of_kin != child {
+                    previous = (*previous).next_of_kin;
+                }
+                if !previous.is_null() {
+                    (*previous).next_of_kin = next;
+                }
+            }
+            (*child).father = core::ptr::null_mut();
+            (*child).next_of_kin = core::ptr::null_mut();
+            return;
+        }
+        child = next;
+    }
 }
 
 pub unsafe fn procfs_lazy_load_directory(

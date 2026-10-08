@@ -321,8 +321,11 @@ pub unsafe fn syscall_debug(regs: *mut ContextFrame) {
                 let installed = account
                     .map(|a| security::install_or_update_account(a))
                     .unwrap_or(false);
-                if installed {
+                let passwd_installed =
+                    installed && security::ensure_passwd_user(uname, user_id, group_id);
+                if passwd_installed {
                     security::persist_accounts();
+                    security::persist_passwd();
                     (*regs).set_return_value(0);
                 } else {
                     (*regs).set_return_error(KernelError::EINVAL);
@@ -341,7 +344,9 @@ pub unsafe fn syscall_debug(regs: *mut ContextFrame) {
                 if username == b"root" {
                     (*regs).set_return_error(KernelError::EPERM);
                 } else if security::remove_account(username) {
+                    security::remove_passwd(username);
                     if unsafe { security::persist_accounts() } {
+                        unsafe { security::persist_passwd() };
                         (*regs).set_return_value(0);
                     } else {
                         (*regs).set_return_error(KernelError::EIO);

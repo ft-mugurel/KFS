@@ -5,6 +5,7 @@ use super::{
 use crate::error::KResult;
 use crate::gdt::{USER_CODE_SEL, USER_DATA_SEL};
 use crate::{paging, pr_err, x86};
+use crate::process_memory::{self, ENV_BASE, ENV_MAX_SIZE};
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
@@ -107,6 +108,25 @@ pub unsafe fn create_user_process(
         write_bytes((bss_start_vaddr + (i * 4096)) as *mut u8, 0, 4096);
     }
 
+    for i in 0..(ENV_MAX_SIZE / paging::PAGE_SIZE) {
+        let env_frame = match paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) {
+            Ok(frame) => frame,
+            Err(e) => return Err(fail_cleanup(None, e)),
+        };
+        if let Err(e) = paging::map_page(
+            ENV_BASE + (i as u32 * paging::PAGE_SIZE as u32),
+            env_frame,
+            user_flags,
+        ) {
+            return Err(fail_cleanup(Some(env_frame), e));
+        }
+        write_bytes(
+            (ENV_BASE + (i as u32 * paging::PAGE_SIZE as u32)) as *mut u8,
+            0,
+            paging::PAGE_SIZE,
+        );
+    }
+
     let code_ptr = USER_CODE_VADDR as *mut u8;
     copy_nonoverlapping(entry_point as *const u8, code_ptr, entry_size);
 
@@ -122,8 +142,6 @@ pub unsafe fn create_user_process(
 
     let stack_top_ptr = (USER_STACK_VADDR - 4) as *mut u32;
     stack_top_ptr.write(trampoline_vaddr);
-
-    x86::write_cr3(old_cr3);
 
     // Ring 3 Execution Frame
     let frame = &mut *frame_ptr;
@@ -165,6 +183,17 @@ pub unsafe fn create_user_process(
     new_task.memory.heap_base = 0x4000_0000;
     new_task.memory.heap_brk = 0x4000_0000;
     new_task.memory.vmas = [EMPTY_VMA; MAX_VMAS];
+    new_task.memory.vmas[0] = crate::sched::Vma {
+        base: ENV_BASE,
+        size: ENV_MAX_SIZE as u32,
+        flags: user_flags,
+        used: true,
+    };
+    if let Err(e) = process_memory::init_default_environment(&mut new_task) {
+        return Err(fail_cleanup(None, e));
+    }
+
+    x86::write_cr3(old_cr3);
 
     new_task.kernel_stack_top = k_stack_top;
     new_task.kernel_stack_bottom = k_stack_bottom;
@@ -204,9 +233,15 @@ pub unsafe fn create_user_process(
     if parent_opt.is_some() {
         locked_process_table[pid].as_mut().unwrap().state = ProcessState::Ready;
     }
+    let credentials = locked_process_table[pid].as_ref().unwrap().credentials;
     drop(locked_process_table);
 
     x86::enable_interrupts();
+    if let Err(error) =
+        crate::fs::procfs::process_created(pid as u32, credentials.uid, credentials.gid)
+    {
+        pr_err!("Failed to create proc entry for PID {}: {:?}\n", pid, error);
+    }
     Ok(pid)
 }
 

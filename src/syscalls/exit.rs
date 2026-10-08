@@ -1,8 +1,8 @@
-use crate::error::{KResultExt, KernelError};
-use crate::fs;
-use crate::sched::{ContextFrame, ProcessState, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE};
-use crate::sched;
-use crate::{paging, pr_info};
+use crate::{
+    error::{KResultExt, KernelError},
+    fs, paging, pr_info,
+    sched::{self, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE, ProcessState},
+};
 
 pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
     let exit_code = (*regs).arg1();
@@ -74,6 +74,7 @@ pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
                 let k_stack_bottom = child.kernel_stack_bottom;
 
                 table[child_pid] = None;
+                crate::fs::procfs::process_reaped(reaped_pid);
 
                 let last_idx = parent_task.family.child_count - 1;
                 parent_task.family.children[i] = parent_task.family.children[last_idx];
