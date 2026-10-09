@@ -212,6 +212,7 @@ pub(self) fn get_mount(index: usize) -> KResult<Mount> {
 pub mod buffer_cache;
 mod vfs;
 
+pub mod dev;
 pub mod ext2;
 pub mod hierarchy;
 pub mod proc;

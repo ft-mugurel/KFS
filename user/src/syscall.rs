@@ -9,16 +9,31 @@ pub const SYS_WRITE: u32 = 4;
 pub const SYS_OPEN: u32 = 5;
 pub const SYS_CLOSE: u32 = 6;
 pub const SYS_WAITPID: u32 = 7;
-pub const SYS_KILL: u32 = 37;
-pub const SYS_GETCWD: u32 = 183;
+pub const SYS_UNLINK: u32 = 10;
 pub const SYS_CHDIR: u32 = 12;
-pub const SYS_GETDENTS: u32 = 141;
 pub const SYS_MKNOD: u32 = 14;
+pub const SYS_GETPID: u32 = 20;
+pub const SYS_KILL: u32 = 37;
+pub const SYS_PIPE: u32 = 42;
+pub const SYS_SBRK: u32 = 45;
+pub const SYS_GETPPID: u32 = 64;
+pub const SYS_MMAP: u32 = 90;
+pub const SYS_MUNMAP: u32 = 91;
+pub const SYS_SOCKET: u32 = 97;
+pub const SYS_GETDENTS: u32 = 141;
+pub const SYS_NANOSLEEP: u32 = 162;
+pub const SYS_GETCWD: u32 = 183;
 pub const SYS_GETUID: u32 = 199;
 pub const SYS_LOGIN: u32 = 212;
 pub const SYS_GETUSERNAME: u32 = 213;
 pub const SYS_GETTTYNAME: u32 = 214;
 pub const SYS_DEBUG: u32 = 223;
+
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
+pub const O_CREAT: u32 = 0x40;
+pub const O_TRUNC: u32 = 0x200;
 
 #[repr(C, packed)]
 pub struct LinuxDirent {
@@ -234,3 +249,44 @@ pub fn sys_debug(op: DebugOp, a1: u32, a2: u32) -> isize {
 pub fn sys_debug4(op: DebugOp, a1: u32, a2: u32, a3: u32, a4: u32) -> isize {
     unsafe { syscall5(SYS_DEBUG, op as u32, a1, a2, a3, a4) as isize }
 }
+
+pub fn sys_getpid() -> usize {
+    unsafe { syscall0(SYS_GETPID) as usize }
+}
+
+pub fn sys_getppid() -> usize {
+    unsafe { syscall0(SYS_GETPPID) as usize }
+}
+
+pub fn sys_unlink(path: &[u8]) -> isize {
+    unsafe { syscall1(SYS_UNLINK, path.as_ptr() as u32) as isize }
+}
+
+pub fn sys_pipe(fds: &mut [i32; 2]) -> isize {
+    unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u32) as isize }
+}
+
+pub fn sys_sbrk(increment: i32) -> isize {
+    unsafe { syscall1(SYS_SBRK, increment as u32) as isize }
+}
+
+pub fn sys_mmap(addr: u32, length: usize) -> isize {
+    unsafe { syscall2(SYS_MMAP, addr, length as u32) as isize }
+}
+
+pub fn sys_munmap(addr: u32, length: usize) -> isize {
+    unsafe { syscall2(SYS_MUNMAP, addr, length as u32) as isize }
+}
+
+pub fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> isize {
+    unsafe { syscall3(SYS_SOCKET, domain, sock_type, protocol) as isize }
+}
+
+pub fn sys_nanosleep(ms: u32) -> isize {
+    unsafe { syscall1(SYS_NANOSLEEP, ms) as isize }
+}
+
+pub fn sys_raw(num: u32, a1: u32, a2: u32, a3: u32) -> isize {
+    unsafe { syscall3(num, a1, a2, a3) as isize }
+}
+

@@ -7,7 +7,8 @@ use crate::error::KResult;
 pub const SECTOR_SIZE: usize = 512;
 
 pub use block_device::{
-    device_at, read_sectors, write_sectors, BlockDevice, BlockDeviceId, MAX_BLOCK_DEVICES,
+    device_at, read_from_device, read_sectors, write_sectors, write_to_device, BlockDevice,
+    BlockDeviceId, MAX_BLOCK_DEVICES,
 };
 
 pub fn first_ext2_partition() -> Option<BlockDeviceId> {

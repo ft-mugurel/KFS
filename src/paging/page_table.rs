@@ -11,17 +11,20 @@ const ENTRIES_PER_TABLE: usize = 1024;
 const PAGE_SIZE_4K: u32 = 0x1000;
 const TABLE_FLAGS: u32 = PAGE_PRESENT | PAGE_WRITABLE;
 const PAGE_FRAME_MASK: u32 = 0xFFFF_F000;
-pub(crate) const PAGE_TABLE_ALLOC_LIMIT: u64 = 0x0040_0000;
+pub(crate) const DIRECT_MAP_TABLES: usize = 64;
+pub(crate) const PAGE_TABLE_ALLOC_LIMIT: u64 = (DIRECT_MAP_TABLES as u64) * 0x0040_0000;
 
 #[repr(C, align(4096))]
 struct PageDirectory([u32; ENTRIES_PER_TABLE]);
 
+#[derive(Copy, Clone)]
 #[repr(align(4096))]
 struct PageTable([u32; ENTRIES_PER_TABLE]);
 
 static mut BOOT_PAGE_DIRECTORY: PageDirectory = PageDirectory([0; ENTRIES_PER_TABLE]);
 static mut BOOT_LOW_TABLE: PageTable = PageTable([0; ENTRIES_PER_TABLE]);
-static mut BOOT_KERNEL_TABLE: PageTable = PageTable([0; ENTRIES_PER_TABLE]);
+static mut BOOT_KERNEL_TABLES: [PageTable; DIRECT_MAP_TABLES] =
+    [PageTable([0; ENTRIES_PER_TABLE]); DIRECT_MAP_TABLES];
 static mut PAGING_INITIALIZED: bool = false;
 
 #[inline]
@@ -103,11 +106,14 @@ fn fill_identity_low_table() {
 }
 
 #[unsafe(link_section = ".init.text")]
-fn fill_kernel_low_alias_table() {
-    let pt_ptr = (unsafe { &raw mut BOOT_KERNEL_TABLE.0 }) as *mut u32;
-    for i in 0usize..ENTRIES_PER_TABLE {
-        let phys = (i as u32) * PAGE_SIZE_4K;
-        unsafe { pt_ptr.add(i).write(phys | TABLE_FLAGS) };
+fn fill_kernel_low_alias_tables() {
+    for t in 0..DIRECT_MAP_TABLES {
+        let pt_ptr = (unsafe { &raw mut BOOT_KERNEL_TABLES[t].0 }) as *mut u32;
+        let base_phys = (t as u32) * (ENTRIES_PER_TABLE as u32) * PAGE_SIZE_4K;
+        for i in 0usize..ENTRIES_PER_TABLE {
+            let phys = base_phys + (i as u32) * PAGE_SIZE_4K;
+            unsafe { pt_ptr.add(i).write(phys | TABLE_FLAGS) };
+        }
     }
 }
 
@@ -206,22 +212,25 @@ fn lookup_page_entry_ptr(virt_addr: u32) -> Option<*mut u32> {
 unsafe fn install_boot_mappings() {
     let pd_ptr = (&raw mut BOOT_PAGE_DIRECTORY.0) as *mut u32;
     let low_table_phys = (&raw const BOOT_LOW_TABLE.0) as *const u32 as u32;
-    let kernel_table_phys = (&raw const BOOT_KERNEL_TABLE.0) as *const u32 as u32;
 
     // Identity map first 4 MiB so current execution continues after PG=1.
     pd_ptr.add(0).write(low_table_phys | TABLE_FLAGS);
 
-    // Map kernel higher-half base (3 GiB) to the same low 4 MiB for early transition.
-    pd_ptr
-        .add(kernel_pd_index())
-        .write(kernel_table_phys | TABLE_FLAGS)
+    // Map kernel higher-half base (3 GiB) to the direct map range.
+    let base_pde = kernel_pd_index();
+    for t in 0..DIRECT_MAP_TABLES {
+        let kernel_table_phys = (&raw const BOOT_KERNEL_TABLES[t].0) as *const u32 as u32;
+        pd_ptr
+            .add(base_pde + t)
+            .write(kernel_table_phys | TABLE_FLAGS);
+    }
 }
 
 #[unsafe(link_section = ".init.text")]
 pub unsafe fn enable_bootstrap_paging() {
     clear_page_directory();
     fill_identity_low_table();
-    fill_kernel_low_alias_table();
+    fill_kernel_low_alias_tables();
     install_boot_mappings();
 
     let pd_phys = (&raw const BOOT_PAGE_DIRECTORY.0) as *const u32 as u32;
@@ -257,7 +266,7 @@ pub fn map_page(virt_addr: u32, phys_addr: u32, flags: u32) -> KResult<()> {
 }
 
 pub fn map_zero_page(virt_addr: u32, flags: u32) -> KResult<()> {
-    let phys_frame = physical::alloc_physical_page()?;
+    let phys_frame = physical::alloc_physical_page_below(PAGE_TABLE_ALLOC_LIMIT)?;
     unsafe {
         core::ptr::write_bytes(phys_to_virt(phys_frame) as *mut u8, 0, 4096);
     }

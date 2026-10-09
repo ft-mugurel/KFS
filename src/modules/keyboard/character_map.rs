@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use super::{Glyph, KeyCode, KeyboardLayout, Modifiers};
+use super::types::{Glyph, KeyCode, KeyboardLayout, Modifiers};
 
 impl Glyph {
     const fn new_l2(base: char, lvl2: char, is_letter: bool) -> Self {

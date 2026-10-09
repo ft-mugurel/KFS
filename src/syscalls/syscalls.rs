@@ -110,6 +110,7 @@ static mut SYSCALL_ENTRIES: [Option<SyscallEntry>; MAX_SYSCALL_NUMBER] = {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_dispatcher(regs: *mut ContextFrame) -> u32 {
+    crate::modules::run_deferred_work();
     let task = sched::current().as_mut().unwrap();
     task.context.esp = regs as u32;
 

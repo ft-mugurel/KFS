@@ -1,7 +1,10 @@
 use super::SECTOR_SIZE;
 use crate::error::{KResult, KernelError};
+use crate::locks::Spinlock;
 use crate::pr_warn;
 use crate::x86::{inb, inw, outb, outw};
+
+static IDE_LOCK: Spinlock<()> = Spinlock::new(());
 
 const IDE_CONTROL_ALT_STATUS: u16 = 2;
 
@@ -99,6 +102,7 @@ pub fn read_sectors(
         return Err(KernelError::EINVAL);
     }
 
+    let _guard = IDE_LOCK.lock();
     let io_base = device.io_base;
     wait_busy(io_base)?;
 
@@ -141,6 +145,7 @@ pub fn write_sectors(
         return Err(KernelError::EINVAL);
     }
 
+    let _guard = IDE_LOCK.lock();
     let io_base = device.io_base;
     wait_busy(io_base)?;
 
@@ -172,15 +177,20 @@ pub fn write_sectors(
     }
 
     // Force drive cache flush
-    flush_cache(device)?;
+    flush_cache_locked(device)?;
 
     Ok(())
 }
 
-pub fn flush_cache(device: &super::BlockDevice) -> KResult<()> {
+fn flush_cache_locked(device: &super::BlockDevice) -> KResult<()> {
     wait_busy(device.io_base)?;
     outb(device.io_base + 6, device.drive);
     outb(device.io_base + 7, CMD_CACHE_FLUSH);
     wait_busy(device.io_base)?;
     Ok(())
+}
+
+pub fn flush_cache(device: &super::BlockDevice) -> KResult<()> {
+    let _guard = IDE_LOCK.lock();
+    flush_cache_locked(device)
 }

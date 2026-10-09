@@ -37,7 +37,7 @@ pub fn register_block_device(device: BlockDevice) -> KResult<BlockDeviceId> {
             *entry = Some(device);
             pr_info!(
                 "Registered block device: {} (sector size: {}) at index {}\n",
-                core::str::from_utf8(&device.name).unwrap_or("Invalid UTF-8"),
+                core::str::from_utf8(&device.name).map(|s| s.trim_end_matches('\0')).unwrap_or("Invalid UTF-8"),
                 device.sector_size,
                 index
             );
@@ -197,11 +197,11 @@ pub fn discover_mbr_partitions(device_id: BlockDeviceId) -> KResult<usize> {
     Ok(found)
 }
 
-/* pub unsafe fn read_from_device(device_id: u32, buffer: &mut [u8], offset: u32) -> KResult<usize> {
+pub unsafe fn read_from_device(device_id: u32, buffer: &mut [u8], offset: u32) -> KResult<usize> {
     let device = device_at(device_id as usize).ok_or(KernelError::ENODEV)?;
     let sector_size = device.sector_size;
 
-    if sector_size == 0 || sector_size > 4096 {
+    if sector_size == 0 || sector_size > 512 {
         return Err(KernelError::EINVAL);
     }
 
@@ -209,17 +209,23 @@ pub fn discover_mbr_partitions(device_id: BlockDeviceId) -> KResult<usize> {
         return Ok(0);
     }
 
-    let mut temp = [0u8; 4096];
+    let total_bytes = (device.sector_count as u64) * (sector_size as u64);
+    if (offset as u64) >= total_bytes {
+        return Ok(0);
+    }
+
+    let mut temp = [0u8; 512];
     let mut bytes_read = 0usize;
     let mut current_offset = offset as usize;
+    let max_read = core::cmp::min(buffer.len(), (total_bytes - offset as u64) as usize);
 
-    while bytes_read < buffer.len() {
+    while bytes_read < max_read {
         let sector_index = current_offset / sector_size;
         let offset_in_sector = current_offset % sector_size;
         let bytes_available =
-            core::cmp::min(sector_size - offset_in_sector, buffer.len() - bytes_read);
+            core::cmp::min(sector_size - offset_in_sector, max_read - bytes_read);
 
-        (device.read)(sector_index as u32, 1, &mut temp[..sector_size])?;
+        read_sectors(device_id as usize, sector_index as u32, 1, &mut temp[..sector_size])?;
 
         buffer[bytes_read..bytes_read + bytes_available]
             .copy_from_slice(&temp[offset_in_sector..offset_in_sector + bytes_available]);
@@ -235,7 +241,7 @@ pub unsafe fn write_to_device(device_id: u32, buffer: &[u8], offset: u32) -> KRe
     let device = device_at(device_id as usize).ok_or(KernelError::ENODEV)?;
     let sector_size = device.sector_size;
 
-    if sector_size == 0 || sector_size > 4096 {
+    if sector_size == 0 || sector_size > 512 {
         return Err(KernelError::EINVAL);
     }
 
@@ -243,25 +249,31 @@ pub unsafe fn write_to_device(device_id: u32, buffer: &[u8], offset: u32) -> KRe
         return Ok(0);
     }
 
-    let mut temp = [0u8; 4096];
+    let total_bytes = (device.sector_count as u64) * (sector_size as u64);
+    if (offset as u64) >= total_bytes {
+        return Err(KernelError::ENOSPC);
+    }
+
+    let mut temp = [0u8; 512];
     let mut bytes_written = 0usize;
     let mut current_offset = offset as usize;
+    let max_write = core::cmp::min(buffer.len(), (total_bytes - offset as u64) as usize);
 
-    while bytes_written < buffer.len() {
+    while bytes_written < max_write {
         let sector_index = current_offset / sector_size;
         let offset_in_sector = current_offset % sector_size;
         let bytes_available =
-            core::cmp::min(sector_size - offset_in_sector, buffer.len() - bytes_written);
+            core::cmp::min(sector_size - offset_in_sector, max_write - bytes_written);
         let sector_slice = &mut temp[..sector_size];
 
         if offset_in_sector != 0 || bytes_available != sector_size {
-            (device.read)(sector_index as u32, 1, sector_slice)?;
+            read_sectors(device_id as usize, sector_index as u32, 1, sector_slice)?;
         }
 
         sector_slice[offset_in_sector..offset_in_sector + bytes_available]
             .copy_from_slice(&buffer[bytes_written..bytes_written + bytes_available]);
 
-        (device.write)(sector_index as u32, 1, sector_slice)?;
+        write_sectors(device_id as usize, sector_index as u32, 1, sector_slice)?;
 
         bytes_written += bytes_available;
         current_offset += bytes_available;
@@ -269,4 +281,3 @@ pub unsafe fn write_to_device(device_id: u32, buffer: &[u8], offset: u32) -> KRe
 
     Ok(bytes_written)
 }
- */

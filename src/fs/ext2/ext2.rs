@@ -262,11 +262,13 @@ unsafe fn free_block_tree(mount: &Ext2Mount, block_num: u32, depth: u8) -> KResu
         return ext2_free_block(mount, block_num);
     }
 
-    let mut block_buf = HeapBuffer::new(4096)?;
+    let block_size = mount.sb.block_size() as usize;
+    let mut block_buf = HeapBuffer::new(block_size)?;
     read_block(mount, block_num, &mut block_buf)?;
 
+    let pointers_count = block_size / 4;
     let pointers =
-        core::slice::from_raw_parts(block_buf.as_ptr() as *const u32, block_buf.len() / 4);
+        core::slice::from_raw_parts(block_buf.as_ptr() as *const u32, pointers_count);
     for &child_block in pointers {
         if child_block != 0 {
             free_block_tree(mount, child_block, depth - 1)?;
@@ -284,12 +286,13 @@ unsafe fn get_alloc_indirect(
     inode: &mut Ext2Inode,
     sectors_per_block: u32,
 ) -> KResult<u32> {
-    let mut block_buf = HeapBuffer::new(4096)?;
+    let block_size = mount.sb.block_size() as usize;
+    let mut block_buf = HeapBuffer::new(block_size)?;
     read_block(mount, indirect_block_num, &mut block_buf)?;
 
     // Cast the byte buffer to a u32 slice to read the pointers
     let pointers = unsafe {
-        core::slice::from_raw_parts_mut(block_buf.as_mut_ptr() as *mut u32, block_buf.len() / 4)
+        core::slice::from_raw_parts_mut(block_buf.as_mut_ptr() as *mut u32, block_size / 4)
     };
 
     let mut target_phys_block = pointers[pointer_index as usize];
@@ -870,10 +873,11 @@ pub unsafe fn read_from_inode(
         if indirect_block == 0 {
             0
         } else {
-            let mut ptr_buf = HeapBuffer::new(4096)?;
+            let block_size = mount.sb.block_size() as usize;
+            let mut ptr_buf = HeapBuffer::new(block_size)?;
             read_block(&mount, indirect_block, &mut ptr_buf)?;
             let ptrs =
-                core::slice::from_raw_parts(ptr_buf.as_ptr() as *const u32, ptr_buf.len() / 4);
+                core::slice::from_raw_parts(ptr_buf.as_ptr() as *const u32, block_size / 4);
             ptrs[logical_block_idx - 12]
         }
     } else {

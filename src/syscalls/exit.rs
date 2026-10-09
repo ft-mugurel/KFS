@@ -1,6 +1,6 @@
 use crate::{
     error::{KResultExt, KernelError},
-    fs, paging, pr_info,
+    fs, paging,
     sched::{self, ContextFrame, MAX_CHILDREN, MAX_FDS_PER_PROCESS, PROCESS_TABLE, ProcessState},
 };
 
@@ -55,7 +55,6 @@ pub unsafe fn syscall_exit(regs: *mut ContextFrame) -> u32 {
 
 pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
     let parent_task = sched::current().as_mut().unwrap();
-    let parent_pid = parent_task.pid as usize;
 
     if parent_task.family.child_count == 0 {
         (*regs).set_return_error(KernelError::ECHILD);
@@ -88,12 +87,6 @@ pub(super) unsafe fn syscall_wait(regs: *mut ContextFrame) {
                 let frames_needed = sched::THREAD_SIZE / paging::PAGE_SIZE;
                 paging::free_contiguous_physical_pages(k_stack_phys, frames_needed)
                     .consume_err("Failed to free kernel stack for reaped child process");
-
-                pr_info!(
-                    "Parent PID {} reaped Zombie PID {}\n",
-                    parent_pid,
-                    reaped_pid
-                );
 
                 (*regs).set_return_value(reaped_pid);
                 return;

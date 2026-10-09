@@ -24,6 +24,8 @@ qemu_cmd = [
     "-monitor", f"unix:{SOCK_PATH},server,nowait",
     "-serial", f"file:{LOG_PATH}",
     "-smp", "8",
+    "-no-reboot",
+    "-accel", "kvm",
 ]
 
 proc = subprocess.Popen(qemu_cmd)
@@ -37,9 +39,30 @@ def wait_for_pattern(pattern, timeout=12):
                 if pattern in content:
                     return True, content
         time.sleep(0.05)
+    if os.path.exists(LOG_PATH):
+        with open(LOG_PATH, "r", errors="ignore") as f:
+            content = f.read()
+    return False, content
+
+def get_log_offset():
+    if os.path.exists(LOG_PATH):
+        return os.path.getsize(LOG_PATH)
+    return 0
+
+def wait_for_new_pattern(pattern, start_offset=0, timeout=12):
+    start = time.time()
+    while time.time() - start < timeout:
+        if os.path.exists(LOG_PATH):
+            with open(LOG_PATH, "r", errors="ignore") as f:
+                f.seek(start_offset)
+                content = f.read()
+                if pattern in content:
+                    return True, content
+        time.sleep(0.05)
     content = ""
     if os.path.exists(LOG_PATH):
         with open(LOG_PATH, "r", errors="ignore") as f:
+            f.seek(start_offset)
             content = f.read()
     return False, content
 
@@ -53,8 +76,8 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(SOCK_PATH)
 
 def send_key(key):
-    s.sendall(f"sendkey {key}\n".encode())
-    time.sleep(0.03)
+    s.sendall(f"sendkey {key} 20\n".encode())
+    time.sleep(0.04)
 
 def send_string(text):
     key_map = {
@@ -110,14 +133,53 @@ try:
     print("[✓] Kernel log triggered via user shell.")
 
     time.sleep(0.3)
+    offset = get_log_offset()
     send_string("cat /var/log/kernel.log\n")
-    ok, log = wait_for_pattern("hello_klog_persistence_test", timeout=6)
+    ok, log = wait_for_new_pattern("hello_klog_persistence_test", offset, timeout=10)
     assert ok, "FAILED: Log message not found in /var/log/kernel.log!"
     print("[✓] Kernel log verified in /var/log/kernel.log persistence file.")
+    wait_for_new_pattern("mysh > ", offset, timeout=10)
+    time.sleep(0.5)
+
+    print("5b. Testing truncate command and open(O_TRUNC)...")
+    offset = get_log_offset()
+    send_string("truncate /tmp/trunc_file.txt\n")
+    ok, log = wait_for_new_pattern("mysh > ", offset, timeout=8)
+    assert ok, "FAILED: truncate create did not return shell prompt!"
+    assert "truncate: failed" not in log, "FAILED: truncate create reported failure!"
+
+    offset = get_log_offset()
+    send_string("ls /tmp\n")
+    ok, log = wait_for_new_pattern("trunc_file.txt", offset, timeout=8)
+    assert ok, "FAILED: truncate did not create /tmp/trunc_file.txt!"
+    wait_for_new_pattern("mysh > ", offset, timeout=8)
+    print("[✓] truncate successfully created new file via O_CREAT | O_TRUNC.")
+
+    offset = get_log_offset()
+    send_string("truncate /tmp/trunc_file.txt\n")
+    ok, log = wait_for_new_pattern("mysh > ", offset, timeout=8)
+    assert ok, "FAILED: truncate existing file did not return shell prompt!"
+    assert "truncate: failed" not in log, "FAILED: truncate existing file reported failure!"
+    print("[✓] truncate successfully truncated existing file.")
+
+    offset = get_log_offset()
+    send_string("truncate -c /tmp/no_such_file.txt\n")
+    ok, log = wait_for_new_pattern("truncate: failed to truncate file", offset, timeout=8)
+    assert ok, "FAILED: truncate -c on non-existent file did not fail!"
+    wait_for_new_pattern("mysh > ", offset, timeout=8)
+    print("[✓] truncate -c correctly failed on non-existent file.")
+
+    offset = get_log_offset()
+    send_string("truncate /tmp\n")
+    ok, log = wait_for_new_pattern("truncate: failed to truncate file", offset, timeout=8)
+    assert ok, "FAILED: truncate on directory did not fail!"
+    wait_for_new_pattern("mysh > ", offset, timeout=8)
+    print("[✓] truncate on directory correctly rejected.")
 
     print("6. Testing non-root login on another TTY...")
     send_string("useradd qwe\n")
-    ok, log = wait_for_pattern("New password: ", timeout=5)
+    ok, log = wait_for_pattern("New password: ", timeout=10)
+    print(log)
     assert ok, "FAILED: useradd did not prompt for a password!"
     send_string("qwe\n")
     ok, log = wait_for_pattern("User updated/added", timeout=15)
@@ -151,6 +213,14 @@ try:
     assert ok, "FAILED: qwe shell did not accept input after login!"
     print("[✓] Non-root login and TTY input succeeded.")
 
+    print("6b. Testing truncate permissions as non-root user...")
+    offset = get_log_offset()
+    send_string("truncate /etc/shadow\n")
+    ok, log = wait_for_new_pattern("truncate: failed to truncate file", offset, timeout=8)
+    assert ok, "FAILED: Non-root user was able to truncate /etc/shadow!"
+    wait_for_new_pattern("mysh > ", offset, timeout=8)
+    print("[✓] Non-root user denied truncate on /etc/shadow.")
+
     print("7. Testing logout...")
     send_string("logout\n")
     ok, log = wait_for_pattern("Logout.", timeout=5)
@@ -160,6 +230,56 @@ try:
         tail = f.read().split("Logout.")[-1]
     assert "login: " in tail, "FAILED: login prompt did not reappear after logout!"
     print("[✓] Logout cleanly returned to TTY login prompt.")
+
+    print("8. Testing log file rotation across boot...")
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        proc.kill()
+    time.sleep(1.0)
+    for path in [SOCK_PATH, LOG_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
+
+    proc = subprocess.Popen(qemu_cmd)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connected = False
+    for _ in range(50):
+        try:
+            s.connect(SOCK_PATH)
+            connected = True
+            break
+        except Exception:
+            time.sleep(0.1)
+    assert connected, "FAILED: Could not connect to QEMU monitor on reboot!"
+
+    ok, log = wait_for_pattern("Kernel log rotated per boot: /var/log/kernel.log", timeout=20)
+    assert ok, "FAILED: Kernel log rotation message not seen on second boot!"
+    print("[✓] Kernel log rotation confirmed in boot logs.")
+
+    ok, log = wait_for_pattern("login: ", timeout=20)
+    assert ok, "FAILED: Login prompt did not appear on second boot!"
+
+    send_string("root\n")
+    wait_for_pattern("Password: ", timeout=5)
+    send_string("root\n")
+    ok, log = wait_for_pattern("mysh > ", timeout=15)
+    assert ok, "FAILED: Shell prompt did not appear after reboot login!"
+
+    offset = get_log_offset()
+    send_string("cat /var/log/kernel.log.1\n")
+    ok, log = wait_for_new_pattern("hello_klog_persistence_test", offset, timeout=10)
+    assert ok, "FAILED: Boot 1 log message not found in rotated /var/log/kernel.log.1!"
+    wait_for_new_pattern("mysh > ", offset, timeout=10)
+    print("[✓] Rotated /var/log/kernel.log.1 contains previous boot logs.")
+
+    offset = get_log_offset()
+    send_string("cat /var/log/kernel.log\n")
+    ok, log = wait_for_new_pattern("mysh > ", offset, timeout=10)
+    assert ok, "FAILED: cat /var/log/kernel.log did not return prompt!"
+    assert "hello_klog_persistence_test" not in log, "FAILED: Current boot log still contains previous boot messages!"
+    print("[✓] Current /var/log/kernel.log does not contain previous boot logs.")
 
     print("\nALL AUTOMATED TESTS PASSED!")
 

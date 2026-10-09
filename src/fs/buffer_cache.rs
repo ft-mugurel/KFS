@@ -4,7 +4,7 @@ use crate::{
     locks::Spinlock,
 };
 
-pub const CACHE_SIZE: usize = 64;
+pub const CACHE_SIZE: usize = 128;
 pub const BUFFER_SIZE: usize = 4096;
 
 #[derive(Clone, Copy)]
@@ -52,7 +52,7 @@ impl BufferCacheState {
 
 static BUFFER_CACHE: Spinlock<BufferCacheState> = Spinlock::new(BufferCacheState::new());
 
-const MAX_WAIT_CYCLES: usize = 1_000_000;
+const MAX_WAIT_CYCLES: usize = 50_000_000;
 
 pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<*mut BufferHead> {
     if block_size == 0 || (block_size as usize) > BUFFER_SIZE {

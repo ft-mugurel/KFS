@@ -96,7 +96,17 @@ pub(super) unsafe fn syscall_getttyname(regs: *mut ContextFrame) {
         return;
     }
 
-    let tty_idx = (*node).inode + 1;
+    let inode = (*node).inode;
+    let tty_idx = if inode < 6 {
+        inode + 1
+    } else if inode == crate::fs::dev::CHAR_DEV_TTY0 || inode == crate::fs::dev::CHAR_DEV_CONSOLE {
+        (crate::vga::text_mod::active_screen_index() as u32) + 1
+    } else if inode == crate::fs::dev::CHAR_DEV_TTY {
+        (crate::fs::dev::get_controlling_tty_index() as u32) + 1
+    } else {
+        (*regs).set_return_error(KernelError::ENOTTY);
+        return;
+    };
     let mut name_buf = [0u8; 16];
     let name_len = {
         name_buf[0] = b't';

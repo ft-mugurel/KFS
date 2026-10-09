@@ -324,9 +324,13 @@ pub unsafe fn syscall_debug(regs: *mut ContextFrame) {
                 let passwd_installed =
                     installed && security::ensure_passwd_user(uname, user_id, group_id);
                 if passwd_installed {
-                    security::persist_accounts();
-                    security::persist_passwd();
-                    (*regs).set_return_value(0);
+                    let acc_ok = unsafe { security::persist_accounts() };
+                    let pwd_ok = unsafe { security::persist_passwd() };
+                    if acc_ok && pwd_ok {
+                        (*regs).set_return_value(0);
+                    } else {
+                        (*regs).set_return_error(KernelError::EIO);
+                    }
                 } else {
                     (*regs).set_return_error(KernelError::EINVAL);
                 }
@@ -343,16 +347,20 @@ pub unsafe fn syscall_debug(regs: *mut ContextFrame) {
                 let username = core::slice::from_raw_parts(user_ptr, user_len);
                 if username == b"root" {
                     (*regs).set_return_error(KernelError::EPERM);
-                } else if security::remove_account(username) {
-                    security::remove_passwd(username);
-                    if unsafe { security::persist_accounts() } {
-                        unsafe { security::persist_passwd() };
-                        (*regs).set_return_value(0);
-                    } else {
-                        (*regs).set_return_error(KernelError::EIO);
-                    }
                 } else {
-                    (*regs).set_return_error(KernelError::ENOENT);
+                    let removed_account = security::remove_account(username);
+                    let removed_passwd = security::remove_passwd(username);
+                    if removed_account || removed_passwd {
+                        let acc_ok = unsafe { security::persist_accounts() };
+                        let pwd_ok = unsafe { security::persist_passwd() };
+                        if acc_ok && pwd_ok {
+                            (*regs).set_return_value(0);
+                        } else {
+                            (*regs).set_return_error(KernelError::EIO);
+                        }
+                    } else {
+                        (*regs).set_return_error(KernelError::ENOENT);
+                    }
                 }
             }
         }

@@ -71,9 +71,15 @@ pub(crate) unsafe fn syscall_pipe(regs: *mut ContextFrame) {
 
     (*read_node).node_type = VfsNodeType::Fifo;
     (*read_node).inode = (pipe_id as u32) << 1 | 0; // direction 0 = read
+    (*read_node).owner_uid = task.credentials.uid;
+    (*read_node).owner_gid = task.credentials.gid;
+    (*read_node).rights = 0o600;
 
     (*write_node).node_type = VfsNodeType::Fifo;
     (*write_node).inode = (pipe_id as u32) << 1 | 1; // direction 1 = write
+    (*write_node).owner_uid = task.credentials.uid;
+    (*write_node).owner_gid = task.credentials.gid;
+    (*write_node).rights = 0o600;
 
     let global_fd0 = match alloc_open_file(read_node, 1) {
         Ok(gfd) => gfd,

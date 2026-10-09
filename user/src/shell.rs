@@ -6,7 +6,7 @@ use crate::io::{parse_dec, parse_hex, print_dec, print_str, read_line_raw};
 use crate::syscall::{
     sys_chdir, sys_close, sys_debug, sys_debug4, sys_fork, sys_getcwd, sys_getdents, sys_getuid,
     sys_getusername, sys_kill, sys_login, sys_mknod, sys_open, sys_read, sys_wait, sys_write,
-    DebugOp, LinuxDirent,
+    DebugOp, LinuxDirent, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
 
 pub const MAX_INPUT_LEN: usize = 256;
@@ -14,6 +14,7 @@ pub const MAX_INPUT_LEN: usize = 256;
 pub const COMMANDS: &[&str] = &[
     "cat",
     "cd",
+    "chaos",
     "clear",
     "color",
     "crash",
@@ -46,6 +47,7 @@ pub const COMMANDS: &[&str] = &[
     "su",
     "sysinfo",
     "touch",
+    "truncate",
     "useradd",
     "userdel",
     "users",
@@ -163,9 +165,9 @@ fn dump_file(path: &str) {
 
 fn print_help() {
     print_str("Available commands:\n");
-    print_str("  help, clear, echo, pwd, cd, ls, cat, touch, mkdir, whoami\n");
+    print_str("  help, clear, echo, pwd, cd, ls, cat, touch, truncate, mkdir, whoami\n");
     print_str("  login, logout, su, useradd, userdel, passwd, users\n");
-    print_str("  ps, spawn, wait, kill <pid>\n");
+    print_str("  ps, spawn, wait, kill <pid>, chaos [procs] [rounds]\n");
     print_str("  memstat, memdebug, initcalls, sysinfo, dmesg [-c], klog [msg|console on/off/status]\n");
     print_str("  memdump <hex_addr>, pte <hex_addr>, memtest, stack [words]\n");
     print_str("  layout, crash, loglevel <0-7>, color <0-15>, screen <1-6>\n");
@@ -324,6 +326,54 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                 }
             }
         }
+        "truncate" => {
+            let mut no_create = false;
+            let mut target_path = "";
+            let mut iter = trimmed.strip_prefix("truncate").unwrap_or("").split_whitespace();
+            let mut size_unsupported = false;
+
+            while let Some(tok) = iter.next() {
+                if tok == "-c" || tok == "--no-create" {
+                    no_create = true;
+                } else if tok == "-s" {
+                    if let Some(s) = iter.next() {
+                        if s != "0" {
+                            size_unsupported = true;
+                        }
+                    } else {
+                        target_path = "";
+                        break;
+                    }
+                } else if !tok.starts_with('-') {
+                    target_path = tok;
+                }
+            }
+
+            if size_unsupported {
+                print_str("truncate: only size 0 is supported\n");
+            } else if target_path.is_empty() {
+                print_str("Usage: truncate [-c] [-s 0] <path>\n");
+            } else {
+                let mut null_path = [0u8; 128];
+                if target_path.len() >= null_path.len() {
+                    print_str("truncate: path too long\n");
+                } else {
+                    null_path[..target_path.len()].copy_from_slice(target_path.as_bytes());
+                    null_path[target_path.len()] = 0;
+                    let flags = if no_create {
+                        O_WRONLY | O_TRUNC
+                    } else {
+                        O_WRONLY | O_CREAT | O_TRUNC
+                    };
+                    let fd = sys_open(&null_path[..=target_path.len()], flags, 0o644);
+                    if fd >= 0 {
+                        sys_close(fd as usize);
+                    } else {
+                        print_str("truncate: failed to truncate file\n");
+                    }
+                }
+            }
+        }
         "mkdir" => {
             if arg.is_empty() {
                 print_str("Usage: mkdir <path>\n");
@@ -478,6 +528,10 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
             } else {
                 print_str("No child processes to wait for\n");
             }
+        }
+        "chaos" => {
+            let rest = trimmed.strip_prefix("chaos").unwrap_or("").trim_start();
+            crate::chaos::run_chaos_test(rest);
         }
         "kill" => {
             if let Some(pid) = parse_dec(arg) {

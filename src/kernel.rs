@@ -13,6 +13,7 @@ mod initcall;
 mod interrupts;
 mod ipc;
 mod locks;
+mod modules;
 mod paging;
 mod panic;
 mod pipe;
@@ -99,7 +100,6 @@ pub unsafe extern "C" fn kmain(multiboot_magic: u32, multiboot_info_addr: u32) -
     interrupts::init_pic();
 
     vga::text_mod::init_virtual_screens();
-    interrupts::init_keyboard();
     interrupts::init_timer();
     // --- SMP bring-up ---
     let Some(acpi_info) = acpi::init() else {
