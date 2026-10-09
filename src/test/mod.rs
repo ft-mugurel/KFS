@@ -1,4 +1,4 @@
-use crate::fs::{self, VfsNodeType};
+use crate::fs;
 use crate::paging;
 use crate::pr_info;
 
@@ -464,3 +464,212 @@ pub(crate) unsafe fn most_syscalls_we_have_probably() {
         core::arch::asm!("int 0x80", in("eax") 1, in("ebx") 1, options(noreturn));
     }
 }
+
+#[unsafe(link_section = ".init.text")]
+pub(crate) fn fs_truncation_boot_probe() {
+    unsafe {
+        let root = fs::ROOT_NODE;
+        if root.is_null() {
+            pr_info!("fs_truncation_boot_probe: root not ready\n");
+            return;
+        }
+
+        let tmp_dir = match fs::resolve_path("/tmp", root) {
+            Ok(dir) => dir,
+            Err(e) => {
+                pr_info!("fs_truncation_boot_probe: /tmp unavailable: {:?}\n", e);
+                return;
+            }
+        };
+
+        let file_node = match fs::create_child_node(tmp_dir, "trunc_probe.txt", fs::VfsNodeType::File, 0o644) {
+            Ok(node) => node,
+            Err(e) => {
+                pr_info!("fs_truncation_boot_probe: create file failed: {:?}\n", e);
+                return;
+            }
+        };
+
+        let test_data = b"Hello, world! This is a test file for truncation in KFS.";
+        let written = match (*file_node).write(test_data, 0) {
+            Ok(w) => w,
+            Err(e) => {
+                pr_info!("fs_truncation_boot_probe: write failed: {:?}\n", e);
+                return;
+            }
+        };
+
+        if written != test_data.len() || (*file_node).size != test_data.len() as u32 {
+            pr_info!("fs_truncation_boot_probe: size mismatch after write\n");
+            return;
+        }
+
+        if let Err(e) = (*file_node).truncate() {
+            pr_info!("fs_truncation_boot_probe: truncate failed: {:?}\n", e);
+            return;
+        }
+
+        if (*file_node).size != 0 {
+            pr_info!("fs_truncation_boot_probe: size not zero after truncate\n");
+            return;
+        }
+
+        let mut read_buf = [0u8; 64];
+        let read_bytes = match (*file_node).read(&mut read_buf, 0) {
+            Ok(r) => r,
+            Err(e) => {
+                pr_info!("fs_truncation_boot_probe: read after truncate failed: {:?}\n", e);
+                return;
+            }
+        };
+
+        if read_bytes != 0 {
+            pr_info!("fs_truncation_boot_probe: expected 0 bytes after truncate\n");
+            return;
+        }
+
+        let new_data = b"Truncation works!";
+        let written_new = match (*file_node).write(new_data, 0) {
+            Ok(w) => w,
+            Err(e) => {
+                pr_info!("fs_truncation_boot_probe: write after truncate failed: {:?}\n", e);
+                return;
+            }
+        };
+
+        if written_new != new_data.len() || (*file_node).size != new_data.len() as u32 {
+            pr_info!("fs_truncation_boot_probe: size mismatch after re-write\n");
+            return;
+        }
+
+        let mut verify_buf = [0u8; 32];
+        let read_verify = match (*file_node).read(&mut verify_buf, 0) {
+            Ok(r) => r,
+            Err(e) => {
+                pr_info!("fs_truncation_boot_probe: read verify failed: {:?}\n", e);
+                return;
+            }
+        };
+
+        if read_verify != new_data.len() || &verify_buf[..read_verify] != new_data {
+            pr_info!("fs_truncation_boot_probe: content mismatch after re-write\n");
+            return;
+        }
+
+        if (*tmp_dir).truncate().is_ok() {
+            pr_info!("fs_truncation_boot_probe: directory truncation should fail\n");
+            return;
+        }
+
+        pr_info!("fs_truncation_boot_probe: file truncation and re-write validated\n");
+    }
+}
+
+crate::late_initcall!(fs_truncation_boot_probe);
+
+#[unsafe(link_section = ".init.text")]
+pub(crate) fn log_rotation_boot_probe() {
+    unsafe {
+        let root = fs::ROOT_NODE;
+        if root.is_null() {
+            pr_info!("log_rotation_boot_probe: root not ready\n");
+            return;
+        }
+
+        let kernel_log = match fs::resolve_path("/var/log/kernel.log", root) {
+            Ok(node) => node,
+            Err(e) => {
+                pr_info!("log_rotation_boot_probe: /var/log/kernel.log missing: {:?}\n", e);
+                return;
+            }
+        };
+
+        if (*kernel_log).node_type != fs::VfsNodeType::File {
+            pr_info!("log_rotation_boot_probe: /var/log/kernel.log not a file\n");
+            return;
+        }
+
+        pr_info!("log_rotation_boot_probe: /var/log/kernel.log validated (size={})\n", (*kernel_log).size);
+    }
+}
+
+crate::late_initcall!(log_rotation_boot_probe);
+
+#[unsafe(link_section = ".init.text")]
+pub(crate) fn passwd_boot_probe() {
+    unsafe {
+        let root = fs::ROOT_NODE;
+        if root.is_null() {
+            pr_info!("passwd_boot_probe: root not ready\n");
+            return;
+        }
+
+        let passwd_node = match fs::resolve_path("/etc/passwd", root) {
+            Ok(node) => node,
+            Err(e) => {
+                pr_info!("passwd_boot_probe: /etc/passwd missing: {:?}\n", e);
+                return;
+            }
+        };
+
+        if (*passwd_node).node_type != fs::VfsNodeType::File {
+            pr_info!("passwd_boot_probe: /etc/passwd not a regular file\n");
+            return;
+        }
+
+        // Verify root passwd record exists
+        let root_record = match crate::security::passwd_for_username(b"root") {
+            Some(r) => r,
+            None => {
+                pr_info!("passwd_boot_probe: root passwd record missing\n");
+                return;
+            }
+        };
+
+        if root_record.uid != 0 || root_record.gid != 0 {
+            pr_info!("passwd_boot_probe: root uid/gid mismatch\n");
+            return;
+        }
+
+        let root_home_len = root_record.home.iter().position(|&b| b == 0).unwrap_or(root_record.home.len());
+        if &root_record.home[..root_home_len] != b"/root" {
+            pr_info!("passwd_boot_probe: root home dir is not /root\n");
+            return;
+        }
+
+        // Verify newly added user gets /home/<username> and empty shell
+        if crate::security::ensure_passwd_user(b"testprobe", 2000, 2000) {
+            let probe_record = match crate::security::passwd_for_username(b"testprobe") {
+                Some(r) => r,
+                None => {
+                    pr_info!("passwd_boot_probe: testprobe record missing after ensure\n");
+                    return;
+                }
+            };
+
+            let home_len = probe_record.home.iter().position(|&b| b == 0).unwrap_or(probe_record.home.len());
+            if &probe_record.home[..home_len] != b"/home/testprobe" {
+                pr_info!("passwd_boot_probe: testprobe home mismatch: expected /home/testprobe\n");
+                crate::security::remove_passwd(b"testprobe");
+                return;
+            }
+
+            let shell_len = probe_record.shell.iter().position(|&b| b == 0).unwrap_or(probe_record.shell.len());
+            if shell_len != 0 {
+                pr_info!("passwd_boot_probe: testprobe shell not empty\n");
+                crate::security::remove_passwd(b"testprobe");
+                return;
+            }
+
+            crate::security::remove_passwd(b"testprobe");
+        } else {
+            pr_info!("passwd_boot_probe: ensure_passwd_user failed\n");
+            return;
+        }
+
+        pr_info!("passwd_boot_probe: /etc/passwd and user records validated\n");
+    }
+}
+
+crate::late_initcall!(passwd_boot_probe);
+

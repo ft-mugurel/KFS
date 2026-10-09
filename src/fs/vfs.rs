@@ -21,13 +21,16 @@ impl VfsNode {
             return crate::fs::proc::proc_read(self.inode, buffer, offset);
         }
         if self.node_type == VfsNodeType::CharDevice {
-            return crate::tty::read(self.inode as usize, buffer);
+            return crate::fs::dev::read_char_device(self.inode, buffer);
+        }
+        if self.node_type == VfsNodeType::BlockDevice {
+            return crate::drivers::read_from_device(self.inode, buffer, offset);
         }
         if self.node_type == VfsNodeType::Fifo {
             let pipe_id = (self.inode >> 1) as usize;
             return crate::pipe::pipe_read(pipe_id, buffer);
         }
-        if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
+        if !matches!(self.node_type, VfsNodeType::File) {
             pr_warn!("VFS: Attempted to read from a non-file node\n");
             return Err(KernelError::EINVAL);
         }
@@ -40,13 +43,16 @@ impl VfsNode {
 
     pub unsafe fn write(&mut self, buffer: &[u8], offset: u32) -> KResult<usize> {
         if self.node_type == VfsNodeType::CharDevice {
-            return crate::tty::write(self.inode as usize, buffer);
+            return crate::fs::dev::write_char_device(self.inode, buffer);
+        }
+        if self.node_type == VfsNodeType::BlockDevice {
+            return crate::drivers::write_to_device(self.inode, buffer, offset);
         }
         if self.node_type == VfsNodeType::Fifo {
             let pipe_id = (self.inode >> 1) as usize;
             return crate::pipe::pipe_write(pipe_id, buffer);
         }
-        if !matches!(self.node_type, VfsNodeType::File | VfsNodeType::BlockDevice) {
+        if !matches!(self.node_type, VfsNodeType::File) {
             pr_warn!("VFS: Attempted to write to a non-file node\n");
             return Err(KernelError::EINVAL);
         }
@@ -165,7 +171,7 @@ pub unsafe fn create_child_node(
             credentials.uid,
             credentials.gid,
         )?
-    } else if matches!(node_type, VfsNodeType::CharDevice | VfsNodeType::Socket) {
+    } else if matches!(node_type, VfsNodeType::CharDevice | VfsNodeType::BlockDevice | VfsNodeType::Socket) {
         0
     } else {
         return Err(KernelError::EOPNOTSUPP);

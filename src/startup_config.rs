@@ -58,5 +58,5 @@ pub mod power {
     pub const PCI_RESET_PORT: u16 = 0xCF9;
     pub const PCI_RESET_VALUE: u8 = 0x06;
 
-    pub const CONFIG_HZ: u32 = 100;
+    pub const CONFIG_HZ: u32 = 1000;
 }

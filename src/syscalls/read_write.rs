@@ -80,7 +80,10 @@ pub unsafe fn syscall_read(regs: *mut ContextFrame) {
     let node = open_file.node;
     let credentials = &sched::current().as_ref().unwrap().credentials;
     match (*node).node_type {
-        VfsNodeType::File | VfsNodeType::BlockDevice | VfsNodeType::CharDevice => {
+        VfsNodeType::File
+        | VfsNodeType::BlockDevice
+        | VfsNodeType::CharDevice
+        | VfsNodeType::Fifo => {
             if security::check(
                 credentials,
                 &security::object_for_node(node),
@@ -101,7 +104,7 @@ pub unsafe fn syscall_read(regs: *mut ContextFrame) {
                 }
                 Err(e) => {
                     pr_warn!("sys_read: error reading from file: {:?}\n", e);
-                    (*regs).set_return_error(KernelError::EIO);
+                    (*regs).set_return_error(e);
                 }
             }
         }
@@ -169,7 +172,10 @@ pub unsafe fn syscall_write(regs: *mut ContextFrame) {
     let credentials = &sched::current().as_ref().unwrap().credentials;
 
     match (*node).node_type {
-        VfsNodeType::File | VfsNodeType::BlockDevice | VfsNodeType::CharDevice => {
+        VfsNodeType::File
+        | VfsNodeType::BlockDevice
+        | VfsNodeType::CharDevice
+        | VfsNodeType::Fifo => {
             if security::check(
                 credentials,
                 &security::object_for_node(node),
@@ -184,9 +190,13 @@ pub unsafe fn syscall_write(regs: *mut ContextFrame) {
                     fs::update_open_file_offset(global_fd, written as u32);
                     (*regs).set_return_value(written as u32);
                 }
+                Err(KernelError::EAGAIN) => {
+                    // Waiting for buffer space: rewind EIP so int 0x80 retries upon wakeup
+                    (*regs).eip -= 2;
+                }
                 Err(e) => {
                     pr_warn!("sys_write: error writing to file: {:?}\n", e);
-                    (*regs).set_return_error(KernelError::EIO);
+                    (*regs).set_return_error(e);
                 }
             }
         }

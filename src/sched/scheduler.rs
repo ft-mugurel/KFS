@@ -1,5 +1,6 @@
 use super::{
-    ContextFrame, Credentials, MAX_PROCESSES, PROCESS_TABLE, ProcessState, THREAD_SIZE, TaskStruct,
+    ContextFrame, Credentials, MAX_CHILDREN, MAX_FDS_PER_PROCESS, MAX_PROCESSES, PROCESS_TABLE,
+    ProcessState, THREAD_SIZE, TaskStruct,
 };
 use crate::gdt;
 use crate::interrupts::timer;
@@ -144,38 +145,81 @@ pub unsafe extern "C" fn schedule(old_esp: u32) -> u32 {
             }
         }
 
-        let next_task = table[next_pid].as_mut().unwrap();
-        let mut killed = false;
+        let kill_info = {
+            let next_task = table[next_pid].as_mut().unwrap();
+            if let Some(sig_num) = next_task.signals.pop() {
+                let handler_addr = next_task.signals.get_handler(sig_num as usize);
 
-        if let Some(sig_num) = next_task.signals.pop() {
-            let handler_addr = next_task.signals.get_handler(sig_num as usize);
-
-            if handler_addr != 0 {
-                let frame = &mut *(next_task.context.esp as *mut ContextFrame);
-                if (frame.cs & 0x03) == 3 {
-                    let next_cr3 = next_task.context.cr3;
-                    if next_cr3 != x86::read_cr3() {
-                        x86::write_cr3(next_cr3);
+                if handler_addr != 0 {
+                    let frame = &mut *(next_task.context.esp as *mut ContextFrame);
+                    if (frame.cs & 0x03) == 3 {
+                        let next_cr3 = next_task.context.cr3;
+                        if next_cr3 != x86::read_cr3() {
+                            x86::write_cr3(next_cr3);
+                        }
+                        frame.user_esp -= 4;
+                        *(frame.user_esp as *mut u32) = frame.eip;
+                        frame.eip = handler_addr;
                     }
-                    frame.user_esp -= 4;
-                    *(frame.user_esp as *mut u32) = frame.eip;
-                    frame.eip = handler_addr;
+                    None
+                } else {
+                    pr_info!(
+                        "PID {} terminated by unhandled signal {}\n",
+                        next_pid,
+                        sig_num
+                    );
+                    super::set_state(next_task, ProcessState::Zombie);
+                    next_task.exit_code = Some(128 + sig_num as u32);
+                    let fds_to_close = next_task.fd_tbl;
+                    next_task.fd_tbl = [None; MAX_FDS_PER_PROCESS];
+
+                    let parent_pid = next_task.family.parent_pid as usize;
+                    let child_count = next_task.family.child_count;
+                    let mut children = [0u32; MAX_CHILDREN];
+                    children[..child_count].copy_from_slice(&next_task.family.children[..child_count]);
+                    next_task.family.child_count = 0;
+
+                    Some((parent_pid, children, child_count, fds_to_close))
                 }
             } else {
-                pr_info!(
-                    "PID {} terminated by unhandled signal {}\n",
-                    next_pid,
-                    sig_num
-                );
-                super::set_state(next_task, ProcessState::Zombie);
-                killed = true;
+                None
             }
+        };
+
+        if let Some((parent_pid, children, child_count, fds_to_close)) = kill_info {
+            // Reparent orphans to PID 0 (idle process)
+            for &orphan_pid in &children[..child_count] {
+                if let Some(ref mut orphan) = table[orphan_pid as usize] {
+                    orphan.family.parent_pid = 0;
+                }
+                if let Some(ref mut init_task) = table[0] {
+                    if init_task.family.child_count < MAX_CHILDREN {
+                        init_task.family.children[init_task.family.child_count] = orphan_pid;
+                        init_task.family.child_count += 1;
+                    }
+                }
+            }
+
+            // Wake the parent if waiting
+            if let Some(ref mut parent) = table[parent_pid] {
+                if parent.state == ProcessState::Waiting {
+                    super::set_state(parent, ProcessState::Ready);
+                }
+            }
+
+            drop(table);
+            for opt_fd in fds_to_close.iter() {
+                if let Some(global_fd) = *opt_fd {
+                    unsafe {
+                        crate::fs::close_open_file(global_fd);
+                    }
+                }
+            }
+            table = PROCESS_TABLE.lock();
+            continue; // loop again to pick next ready task
         }
 
-        if killed {
-            continue; // table stays locked, loop again
-        }
-
+        let next_task = table[next_pid].as_mut().unwrap();
         super::set_state(next_task, ProcessState::Running);
         let next_esp = next_task.context.esp;
         let next_cr3 = next_task.context.cr3;

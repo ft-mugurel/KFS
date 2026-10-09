@@ -1,4 +1,4 @@
-use super::InputMode;
+use super::types::InputMode;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 

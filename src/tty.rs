@@ -17,7 +17,7 @@ struct TtyBuffer {
 const EMPTY_BUFFER: TtyBuffer = TtyBuffer { data: [0; BUFFER_SIZE], head: 0, tail: 0 };
 static TTY_BUFFERS: Spinlock<[TtyBuffer; TTY_COUNT]> = Spinlock::new([EMPTY_BUFFER; TTY_COUNT]);
 
-fn tty_node_name(index: usize) -> ([u8; 8], usize) {
+pub(crate) fn tty_node_name(index: usize) -> ([u8; 8], usize) {
     let mut name = [0; 8];
     name[0] = b't';
     name[1] = b't';
@@ -63,12 +63,22 @@ pub fn push_char(c: char) {
                 let matches_tty = task.fd_tbl[0].and_then(|gfd| {
                     fs::get_open_file(gfd).and_then(|f| {
                         if unsafe { (*f.node).node_type == VfsNodeType::CharDevice } {
-                            Some(unsafe { (*f.node).inode as usize })
+                            let inode = unsafe { (*f.node).inode };
+                            if (inode as usize) < TTY_COUNT {
+                                Some(inode as usize == tty)
+                            } else if inode == crate::fs::dev::CHAR_DEV_TTY0
+                                || inode == crate::fs::dev::CHAR_DEV_CONSOLE
+                                || inode == crate::fs::dev::CHAR_DEV_TTY
+                            {
+                                Some(true)
+                            } else {
+                                Some(false)
+                            }
                         } else {
                             None
                         }
                     })
-                }) == Some(tty);
+                }) == Some(true);
 
                 if matches_tty {
                     sched::set_state(task, sched::ProcessState::Ready);
@@ -108,18 +118,7 @@ pub unsafe fn write(tty: usize, input: &[u8]) -> KResult<usize> {
 
 #[unsafe(link_section = ".init.text")]
 pub unsafe fn init() -> KResult<()> {
-    let root = fs::ROOT_NODE;
-    let dev = fs::resolve_path("/dev", root)?;
-
-    for index in 0..TTY_COUNT {
-        let (name, name_len) = tty_node_name(index);
-        let name = core::str::from_utf8(&name[..name_len]).unwrap();
-        let node = fs::create_child_node(dev, name, VfsNodeType::CharDevice, 0o666)?;
-        (*node).inode = index as u32;
-    }
-
-    fs::mark_dev_ready();
-    Ok(())
+    crate::fs::dev::init()
 }
 
 crate::device_initcall!(init);

@@ -23,6 +23,7 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_interrupt_handler(old_esp: u32) -> u32 {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::modules::dispatch_cpu_tick();
 
     outb(pic::MASTER_COMMAND_PORT, pic::EOI);
     smp::lapic::send_eoi();
@@ -34,6 +35,7 @@ pub unsafe extern "C" fn lapic_timer_interrupt_handler(old_esp: u32) -> u32 {
     if PIT_MASKED.load(Ordering::Relaxed) && unsafe { sched::current_cpu() == 0 } {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
+    crate::modules::dispatch_cpu_tick();
     smp::lapic::send_eoi();
     schedule_timer_interrupt(old_esp)
 }

@@ -1,8 +1,3 @@
-mod api;
-mod character_map;
-mod init;
-mod keycode;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyEvent {
     pub key: KeyCode,
@@ -10,7 +5,7 @@ pub(crate) struct KeyEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Modifiers(u16);
+pub(crate) struct Modifiers(pub(crate) u16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyCode {
@@ -109,9 +104,9 @@ pub(crate) enum KeyboardLayout {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Glyph {
-    base: char,
-    lvl2: char,
-    is_letter: bool,
+    pub(crate) base: char,
+    pub(crate) lvl2: char,
+    pub(crate) is_letter: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,8 +114,3 @@ pub(crate) enum InputMode {
     EventDriven = 0,
     Blocking = 1,
 }
-
-pub(crate) use api::push_char;
-pub(crate) use character_map::{keycode_to_char, toggle_layout};
-pub(crate) use init::init_keyboard;
-pub(crate) use keycode::decode_set1_scancode;

@@ -123,7 +123,7 @@ $(FHS_STAMP): $(USER_SHELL_BIN) Makefile
 	@cp $(USER_SHELL_BIN) $(FHS_STAGE)/usr/bin/mysh
 	@chmod 0755 $(FHS_STAGE)/usr/bin/mysh
 	@chmod 0700 $(FHS_STAGE)/root
-	@printf 'root:x:0:0:root:/root:/usr/bin/mysh\n' > $(FHS_STAGE)/etc/passwd
+	@printf 'root:x:0:0:root:/root:\n' > $(FHS_STAGE)/etc/passwd
 	@touch $(FHS_STAGE)/etc/shadow $(FHS_STAGE)/var/log/kernel.log
 	@chmod 0644 $(FHS_STAGE)/etc/passwd
 	@chmod 0600 $(FHS_STAGE)/etc/shadow
@@ -220,6 +220,9 @@ run-iso-term: iso $(ATA_DRIVE_IMGS)
 		-boot order=d -nographic
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
+test-chaos: iso
+	@python3 tests/test_chaos.py
+
 clean:
 	@rm -rf $(BUILD_DIR)/
 	@echo -e "$(BOLD)$(RED)[♻︎] DELETED BUILD ARTIFACTS$(RESET)"
@@ -230,4 +233,4 @@ fclean: clean
 
 re: clean all
 
-.PHONY: all build build_debug iso iso-full run debug run-iso run-iso-full run-iso-term clean fclean re
+.PHONY: all build build_debug iso iso-full run debug run-iso run-iso-full run-iso-term test-chaos clean fclean re

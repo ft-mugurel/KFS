@@ -220,7 +220,7 @@ fn validate_ioremap_flags(flags: u32) -> KResult<()> {
 #[unsafe(link_section = ".init.text")]
 pub fn init_vmem() {
     let mut state = VMEM_STATE.lock();
-    let address_space_start = KERNEL_SPACE_START as u32 + 0x0040_0000;
+    let address_space_start = KERNEL_SPACE_START as u32 + 0x1000_0000;
     let address_space_end = super::kernel_heap::virtual_start();
     let address_space_pages = (address_space_end - address_space_start) as usize / PAGE_SIZE;
     let normal_pages = address_space_pages / 2;

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::{KeyCode, KeyEvent, Modifiers};
+use super::types::{KeyCode, KeyEvent, Modifiers};
 
 impl Modifiers {
     const SHIFT: u16 = 1 << 0;

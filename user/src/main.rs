@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod chaos;
 mod io;
 mod login;
 mod shell;

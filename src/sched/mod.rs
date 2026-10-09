@@ -281,7 +281,64 @@ pub(crate) fn refresh_wakeup_tick(table: &[Option<TaskStruct>; MAX_PROCESSES]) {
     NEXT_WAKEUP_TICK.store(next as usize, Ordering::SeqCst);
 }
 
+pub(crate) unsafe fn reap_zombies() {
+    let mut to_reap = [None; MAX_PROCESSES];
+    let mut count = 0;
+    {
+        let mut table = PROCESS_TABLE.lock();
+        for pid in crate::smp::MAX_CPUS..MAX_PROCESSES {
+            if let Some(ref task) = table[pid] {
+                if task.state == ProcessState::Zombie
+                    && (task.family.parent_pid as usize) < crate::smp::MAX_CPUS
+                {
+                    to_reap[count] = Some((pid, task.pid, task.context.cr3, task.kernel_stack_bottom));
+                    count += 1;
+                    table[pid] = None;
+                }
+            }
+        }
+        if count > 0 {
+            if let Some(ref mut init_task) = table[0] {
+                let mut new_children = [0u32; MAX_CHILDREN];
+                let mut new_count = 0;
+                for i in 0..init_task.family.child_count {
+                    let cpid = init_task.family.children[i];
+                    let mut reaped = false;
+                    for item in to_reap.iter().take(count) {
+                        if let Some((_, rpid, _, _)) = item {
+                            if *rpid == cpid {
+                                reaped = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !reaped && new_count < MAX_CHILDREN {
+                        new_children[new_count] = cpid;
+                        new_count += 1;
+                    }
+                }
+                init_task.family.children = new_children;
+                init_task.family.child_count = new_count;
+            }
+        }
+    }
+
+    for item in to_reap.iter().take(count) {
+        if let Some((_, rpid, old_cr3, k_stack_bottom)) = *item {
+            crate::fs::procfs::process_reaped(rpid);
+            crate::paging::free_user_address_space(old_cr3);
+            if let Some(k_stack_phys) = crate::paging::virt_to_phys(k_stack_bottom) {
+                let frames_needed = THREAD_SIZE / crate::paging::PAGE_SIZE;
+                let _ = crate::paging::free_contiguous_physical_pages(k_stack_phys, frames_needed);
+            }
+        }
+    }
+}
+
 pub(crate) fn reserve_process_slot() -> Option<usize> {
+    unsafe {
+        reap_zombies();
+    }
     let mut table = PROCESS_TABLE.lock();
     for index in crate::smp::MAX_CPUS..MAX_PROCESSES {
         if table[index].is_none() {
@@ -313,6 +370,8 @@ pub unsafe extern "C" fn idle_loop() -> ! {
     }
     x86::enable_interrupts();
     loop {
+        crate::modules::run_deferred_work();
+        reap_zombies();
         x86::hlt();
     }
 }

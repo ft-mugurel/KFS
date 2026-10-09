@@ -35,7 +35,9 @@ pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
             for i in 0..pages_to_allocate {
                 let vaddr = old_page_end + (i * 4096);
 
-                if let Ok(phys_frame) = paging::alloc_physical_page() {
+                if let Ok(phys_frame) =
+                    paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT)
+                {
                     let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
                     paging::map_page(vaddr, phys_frame, flags).unwrap();

@@ -32,6 +32,12 @@ pub(super) unsafe fn syscall_kill(regs: *mut ContextFrame) {
             return;
         }
 
+        if sig_num == 0 {
+            // POSIX: signal 0 is a null signal used for error checking (existence and permissions).
+            (*regs).set_return_value(0);
+            return;
+        }
+
         let target_task = table[target_pid].as_mut().unwrap();
         if target_task.signals.push(sig_num) {
             (*regs).set_return_value(0);

@@ -191,7 +191,7 @@ pub(crate) fn ensure_root_passwd() -> bool {
     if passwd_for_username(b"root").is_some() {
         return true;
     }
-    let Some(record) = create_passwd_record(b"root", 0, 0, b"/root", b"/usr/bin/mysh") else {
+    let Some(record) = create_passwd_record(b"root", 0, 0, b"/root", b"") else {
         return false;
     };
     install_or_update_passwd(record)
@@ -305,7 +305,6 @@ pub(crate) fn create_passwd_record(
         || username.len() >= USERNAME_SIZE
         || home.is_empty()
         || home.len() >= HOME_PATH_SIZE
-        || shell.is_empty()
         || shell.len() >= SHELL_PATH_SIZE
     {
         return None;
@@ -319,7 +318,9 @@ pub(crate) fn create_passwd_record(
     };
     record.username[..username.len()].copy_from_slice(username);
     record.home[..home.len()].copy_from_slice(home);
-    record.shell[..shell.len()].copy_from_slice(shell);
+    if !shell.is_empty() {
+        record.shell[..shell.len()].copy_from_slice(shell);
+    }
     Some(record)
 }
 
@@ -347,13 +348,21 @@ pub(crate) fn ensure_passwd_user(username: &[u8], uid: u32, gid: u32) -> bool {
         return true;
     }
     let mut home = [0u8; HOME_PATH_SIZE];
-    if username.len() + 1 >= HOME_PATH_SIZE {
-        return false;
-    }
-    home[0] = b'/';
-    home[1..username.len() + 1].copy_from_slice(username);
+    let home_len = if username == b"root" {
+        let root_home = b"/root";
+        home[..root_home.len()].copy_from_slice(root_home);
+        root_home.len()
+    } else {
+        let prefix = b"/home/";
+        if prefix.len() + username.len() >= HOME_PATH_SIZE {
+            return false;
+        }
+        home[..prefix.len()].copy_from_slice(prefix);
+        home[prefix.len()..prefix.len() + username.len()].copy_from_slice(username);
+        prefix.len() + username.len()
+    };
     let Some(record) =
-        create_passwd_record(username, uid, gid, &home[..username.len() + 1], b"/usr/bin/mysh")
+        create_passwd_record(username, uid, gid, &home[..home_len], b"")
     else {
         return false;
     };
@@ -380,11 +389,12 @@ pub(crate) fn load_passwd(data: &[u8]) -> usize {
             continue;
         }
         let mut fields = line.split(|&byte| byte == b':');
-        let (Some(username), Some(_password), Some(uid_field), Some(gid_field), Some(_gecos), Some(home), Some(shell)) =
-            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+        let (Some(username), Some(_password), Some(uid_field), Some(gid_field), Some(_gecos), Some(home)) =
+            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
+        let shell = fields.next().unwrap_or(b"");
         if fields.next().is_some() {
             continue;
         }

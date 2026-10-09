@@ -141,7 +141,9 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
                 if let Some(phys) = paging::virt_to_phys(aligned_vaddr) {
                     let refcount = paging::frame_ref_count(phys);
                     if refcount > 1 {
-                        if let Ok(new_phys) = paging::alloc_physical_page() {
+                        if let Ok(new_phys) =
+                            paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT)
+                        {
                             let src = paging::phys_to_virt(phys) as *const u8;
                             let dst = paging::phys_to_virt(new_phys) as *mut u8;
                             core::ptr::copy_nonoverlapping(src, dst, 4096);
