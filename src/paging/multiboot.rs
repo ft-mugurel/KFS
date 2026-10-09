@@ -62,15 +62,6 @@ pub fn set_boot_multiboot_info_addr(addr: u32) {
     }
 }
 
-pub fn boot_multiboot_info() -> Option<&'static MultibootInfo> {
-    let addr = unsafe { BOOT_MULTIBOOT_INFO_ADDR };
-    if addr == 0 {
-        None
-    } else {
-        Some(multiboot_info_from_addr(addr))
-    }
-}
-
 pub struct MemoryMapIter {
     current: usize,
     end: usize,

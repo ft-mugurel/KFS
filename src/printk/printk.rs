@@ -1,10 +1,10 @@
 use core::fmt;
-use core::sync::atomic::{AtomicU8, Ordering};
-
-use crate::startup_config;
-use crate::vga::text_mod::out;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use crate::locks::Spinlock;
+use crate::vga::text_mod;
 
 pub static LOG_LEVEL: AtomicU8 = AtomicU8::new(KernelLogLevel::Info as u8);
+pub static DIRECT_SCREEN_OUTPUT: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -19,33 +19,16 @@ pub enum KernelLogLevel {
     Debug = 7,
 }
 
-#[allow(non_camel_case_types)]
-pub type KERNEL_LOG_LEVEL = KernelLogLevel;
-
-fn level_from_u8(level: u8) -> KernelLogLevel {
+const fn level_tag(level: KernelLogLevel) -> &'static str {
     match level {
-        0 => KernelLogLevel::Emerg,
-        1 => KernelLogLevel::Alert,
-        2 => KernelLogLevel::Crit,
-        3 => KernelLogLevel::Err,
-        4 => KernelLogLevel::Warning,
-        5 => KernelLogLevel::Notice,
-        6 => KernelLogLevel::Info,
-        7 => KernelLogLevel::Debug,
-        _ => KernelLogLevel::Info,
-    }
-}
-
-fn level_tag(level: KernelLogLevel) -> &'static str {
-    match level {
-        KernelLogLevel::Emerg => "[\x1B\x0F;\x14mEMERG\x1Bm] ",
-        KernelLogLevel::Alert => "[\x1B\x0F;\x16mALERT\x1Bm] ",
-        KernelLogLevel::Crit => "[\x1B\x0F;\x1CmCRIT\x1Bm] ",
+        KernelLogLevel::Emerg => "[\x1B\x0F;\x14mEMG\x1Bm] ",
+        KernelLogLevel::Alert => "[\x1B\x0F;\x16mALR\x1Bm] ",
+        KernelLogLevel::Crit => "[\x1B\x0F;\x1CmCRT\x1Bm] ",
         KernelLogLevel::Err => "[\x1B\x04mERR\x1Bm] ",
-        KernelLogLevel::Warning => "[\x1B\x0EmWARN\x1Bm] ",
-        KernelLogLevel::Notice => "[\x1B\x09mNOTICE\x1Bm] ",
-        KernelLogLevel::Info => "[\x1B\x07mINFO\x1Bm] ",
-        KernelLogLevel::Debug => "[\x1B\x08mDEBUG\x1Bm] ",
+        KernelLogLevel::Warning => "[\x1B\x0EmWRN\x1Bm] ",
+        KernelLogLevel::Notice => "[\x1B\x09mNTC\x1Bm] ",
+        KernelLogLevel::Info => "[\x1B\x07mINF\x1Bm] ",
+        KernelLogLevel::Debug => "[\x1B\x08mDBG\x1Bm] ",
     }
 }
 
@@ -53,52 +36,91 @@ pub fn set_log_level(level: KernelLogLevel) {
     LOG_LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
-pub fn log_level() -> KernelLogLevel {
-    level_from_u8(LOG_LEVEL.load(Ordering::Relaxed))
-}
-
 fn is_enabled(level: KernelLogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(Ordering::Relaxed)
 }
 
-pub fn printk_level_to_screen(
+#[allow(dead_code)]
+pub fn is_direct_screen_output_enabled() -> bool {
+    DIRECT_SCREEN_OUTPUT.load(Ordering::Acquire)
+}
+
+#[allow(dead_code)]
+pub fn set_direct_screen_output(enabled: bool) {
+    DIRECT_SCREEN_OUTPUT.store(enabled, Ordering::Release);
+}
+
+pub fn handoff_to_userspace() {
+    DIRECT_SCREEN_OUTPUT.store(false, Ordering::Release);
+}
+
+static LOCKS: [Spinlock<()>; 8] = [
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+    Spinlock::new(()),
+];
+
+pub fn printk_emit(
     screen_index: usize,
     level: KernelLogLevel,
-    args: fmt::Arguments<'_>,
+    args: &fmt::Arguments<'_>,
+    force_screen: bool,
 ) {
     if !is_enabled(level) {
         return;
     }
-    out::print_on(screen_index, level_tag(level));
-    out::write_fmt_on(screen_index, args);
-}
 
-pub fn printk_level_to_default(level: KernelLogLevel, args: fmt::Arguments<'_>) {
-    if !is_enabled(level) {
-        return;
-    }
+    let pid = unsafe { crate::sched::current_pid() };
+    let ticks = crate::interrupts::timer::get_ticks();
+    super::klog::record_log(level, pid, ticks, args);
 
-    out::print_on(
-        startup_config::logging::DEFAULT_LOG_SCREEN,
-        level_tag(level),
-    );
-    out::write_fmt_on(startup_config::logging::DEFAULT_LOG_SCREEN, args);
-}
+    let to_screen =
+        force_screen || is_direct_screen_output_enabled() || level == KernelLogLevel::Emerg;
 
-pub fn printk_to_screen(screen_index: usize, args: fmt::Arguments<'_>) {
-    printk_level_to_screen(screen_index, KernelLogLevel::Info, args);
-}
-
-pub fn printk_to_default(args: fmt::Arguments<'_>) {
-    printk_level_to_default(KernelLogLevel::Info, args);
-}
-
-pub fn printk_to_debug(args: fmt::Arguments<'_>) {
-    let screen_index = if is_enabled(KernelLogLevel::Debug) {
-        startup_config::logging::DEFAULT_LOG_SCREEN
+    if to_screen {
+        let lock = &LOCKS[screen_index % LOCKS.len()];
+        let _guard = lock.lock();
+        text_mod::print_str_on(screen_index, level_tag(level));
+        text_mod::print_fmt_on(
+            screen_index,
+            &format_args!("({}) ", pid),
+        );
+        text_mod::print_fmt_on(screen_index, args);
     } else {
-        startup_config::logging::DEFAULT_DEBUG_LOG_SCREEN
+        crate::serial::write_printk_to_serial(level_tag(level), pid, args);
+    }
+}
+
+pub fn printk_level_to_default(level: KernelLogLevel, args: &fmt::Arguments<'_>) {
+    let screen = if level == KernelLogLevel::Emerg {
+        text_mod::active_screen_index()
+    } else {
+        0
     };
-    out::print_on(screen_index, level_tag(KernelLogLevel::Debug));
-    out::write_fmt_on(screen_index, args);
+    printk_emit(screen, level, args, false);
+}
+
+#[allow(dead_code)]
+pub fn printk_level_to_screen(
+    screen_index: usize,
+    level: KernelLogLevel,
+    args: &fmt::Arguments<'_>,
+) {
+    printk_emit(screen_index, level, args, false);
+}
+
+#[allow(dead_code)]
+pub fn printk_to_screen(screen_index: usize, args: &fmt::Arguments<'_>) {
+    printk_emit(screen_index, KernelLogLevel::Info, args, false);
+}
+
+pub fn printk_to_debug(args: &fmt::Arguments<'_>) {
+    if is_enabled(KernelLogLevel::Debug) {
+        printk_emit(0, KernelLogLevel::Debug, args, false);
+    }
 }

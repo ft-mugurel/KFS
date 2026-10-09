@@ -1,0 +1,165 @@
+use crate::error::KernelError;
+use crate::paging::{self, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
+use crate::sched::{self, ContextFrame, ProcessMemory, Vma, MAX_VMAS};
+use crate::{pr_warn, x86};
+
+unsafe fn current_pmem() -> *mut ProcessMemory {
+    &mut (*sched::current().as_mut().unwrap()).memory
+}
+
+pub(super) unsafe fn syscall_sbrk(regs: *mut ContextFrame) {
+    unsafe {
+        let increment = (*regs).arg1() as i32;
+        let mem = current_pmem();
+
+        let old_brk = (*mem).heap_brk;
+
+        if increment == 0 {
+            (*regs).set_return_value(old_brk);
+            return;
+        }
+
+        if increment < 0 {
+            pr_warn!("Shrinking the heap is not yet supported.\n");
+            (*regs).set_return_error(KernelError::EINVAL);
+            return;
+        }
+
+        let new_brk = old_brk + increment as u32;
+        let old_page_end = (old_brk + 4095) & !4095;
+
+        if new_brk > old_page_end {
+            let bytes_to_allocate = new_brk - old_page_end;
+            let pages_to_allocate = (bytes_to_allocate + 4095) / 4096;
+
+            for i in 0..pages_to_allocate {
+                let vaddr = old_page_end + (i * 4096);
+
+                if let Ok(phys_frame) =
+                    paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT)
+                {
+                    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+                    paging::map_page(vaddr, phys_frame, flags).unwrap();
+                } else {
+                    pr_warn!("Out of physical memory for sbrk!\n");
+                    (*regs).set_return_error(KernelError::ENOMEM);
+                    return;
+                }
+            }
+        }
+
+        (*mem).heap_brk = new_brk;
+        (*regs).set_return_value(old_brk);
+    }
+}
+
+pub(super) unsafe fn syscall_mmap(regs: *mut ContextFrame) {
+    let length = (*regs).arg2() as usize;
+
+    if length == 0 {
+        (*regs).set_return_error(KernelError::EINVAL);
+        return;
+    }
+
+    // Align length to the 4KB boundary
+    let aligned_length = (length + 4095) & !4095;
+
+    let mem = current_pmem();
+
+    let mut vma_idx = None;
+    for i in 0..MAX_VMAS {
+        if !(*mem).vmas[i].used {
+            vma_idx = Some(i);
+            break;
+        }
+    }
+
+    let vma_idx = match vma_idx {
+        Some(idx) => idx,
+        None => {
+            (*regs).set_return_error(KernelError::ENOMEM);
+            return;
+        }
+    };
+
+    let mmap_base = 0x5000_0000 + (vma_idx as u32 * 0x100_000);
+    /*
+     *  Demand Paging:
+     *      If a process requests a page but does not use it immediately or not even at all,
+     *      we can delay the allocation until an access occurs.
+     */
+
+    (*mem).vmas[vma_idx] = Vma {
+        base: mmap_base,
+        size: aligned_length as u32,
+        flags: 3, // PROT_READ | PROT_WRITE
+        used: true,
+    };
+
+    (*regs).set_return_value(mmap_base);
+}
+
+pub(super) unsafe fn syscall_munmap(regs: *mut ContextFrame) {
+    let addr = (*regs).arg1();
+    let length = (*regs).arg2();
+
+    if addr % 4096 != 0 || length == 0 {
+        (*regs).set_return_error(KernelError::EINVAL);
+        return;
+    }
+
+    let aligned_length = (length + 4095) & !4095;
+    let task = sched::current().as_mut().unwrap();
+
+    let mut target_vma_idx = None;
+    for i in 0..MAX_VMAS {
+        let vma = &task.memory.vmas[i];
+        if vma.used && addr >= vma.base && (addr + aligned_length) <= (vma.base + vma.size) {
+            target_vma_idx = Some(i);
+            break;
+        }
+    }
+
+    let vma_idx = match target_vma_idx {
+        Some(idx) => idx,
+        None => {
+            (*regs).set_return_error(KernelError::EINVAL);
+            return;
+        }
+    };
+
+    x86::disable_interrupts();
+    let old_cr3 = x86::read_cr3();
+    x86::write_cr3(task.context.cr3);
+
+    let num_pages = aligned_length / 4096;
+    for i in 0..num_pages {
+        let vaddr = addr + (i * 4096);
+        if let Some(phys_frame) = paging::virt_to_phys(vaddr) {
+            if let Err(e) = paging::free_physical_page(phys_frame) {
+                pr_warn!("Failed to free physical page: {:?}\n", e);
+                (*regs).set_return_error(e);
+            }
+            if let Err(e) = paging::unmap_page(vaddr) {
+                pr_warn!("Failed to unmap page at {:#x}: {:?}\n", vaddr, e);
+                (*regs).set_return_error(e);
+            }
+        }
+    }
+
+    x86::write_cr3(old_cr3);
+    x86::enable_interrupts();
+
+    let vma = &mut task.memory.vmas[vma_idx];
+    if addr == vma.base && aligned_length == vma.size {
+        vma.used = false;
+    } else if addr == vma.base {
+        vma.base += aligned_length;
+        vma.size -= aligned_length;
+    } else {
+        vma.size -= aligned_length;
+    }
+
+    (*regs).set_return_value(0);
+}
