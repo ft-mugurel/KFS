@@ -1,5 +1,13 @@
-pub mod keyboard;
-pub mod exceptions;
-pub mod idt;
-pub mod pic;
-pub mod utils;
+mod exceptions;
+mod idt;
+mod pic;
+mod pit;
+mod utils;
+
+pub(crate) mod timer;
+
+pub(crate) use exceptions::init_exceptions;
+pub(crate) use idt::{init_idt, register_interrupt_handler, register_user_interrupt_handler};
+pub(crate) use pic::init_pic;
+pub(crate) use timer::init_timer;
+pub(crate) use utils::request_reboot;

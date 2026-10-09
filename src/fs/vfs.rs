@@ -1,0 +1,336 @@
+use crate::{
+    error::{KResult, KernelError},
+    locks::Spinlock,
+    pr_warn, utils,
+    vga::text_mod::{print_fmt_on, print_str_on},
+};
+
+use super::{VfsNode, VfsNodeType};
+
+pub const MAX_VFS_NODES: usize = 1024;
+pub static mut ROOT_NODE: *mut VfsNode = core::ptr::null_mut();
+
+static VFS_NODE_LOCK: Spinlock<()> = Spinlock::new(());
+// static pool
+static mut VFS_NODE_POOL: [VfsNode; MAX_VFS_NODES] = unsafe { core::mem::zeroed() };
+static mut VFS_NODE_COUNT: usize = 0;
+
+impl VfsNode {
+    pub unsafe fn read(&self, buffer: &mut [u8], offset: u32) -> KResult<usize> {
+        if self.inode >= 0xF000_0000 {
+            return crate::fs::proc::proc_read(self.inode, buffer, offset);
+        }
+        if self.node_type == VfsNodeType::CharDevice {
+            return crate::fs::dev::read_char_device(self.inode, buffer);
+        }
+        if self.node_type == VfsNodeType::BlockDevice {
+            return crate::drivers::read_from_device(self.inode, buffer, offset);
+        }
+        if self.node_type == VfsNodeType::Fifo {
+            let pipe_id = (self.inode >> 1) as usize;
+            return crate::pipe::pipe_read(pipe_id, buffer);
+        }
+        if !matches!(self.node_type, VfsNodeType::File) {
+            pr_warn!("VFS: Attempted to read from a non-file node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        let mount = (*self.master).mount;
+        let fn_read = (*mount).backend.read;
+
+        fn_read(mount, self.inode, buffer, offset)
+    }
+
+    pub unsafe fn write(&mut self, buffer: &[u8], offset: u32) -> KResult<usize> {
+        if self.node_type == VfsNodeType::CharDevice {
+            return crate::fs::dev::write_char_device(self.inode, buffer);
+        }
+        if self.node_type == VfsNodeType::BlockDevice {
+            return crate::drivers::write_to_device(self.inode, buffer, offset);
+        }
+        if self.node_type == VfsNodeType::Fifo {
+            let pipe_id = (self.inode >> 1) as usize;
+            return crate::pipe::pipe_write(pipe_id, buffer);
+        }
+        if !matches!(self.node_type, VfsNodeType::File) {
+            pr_warn!("VFS: Attempted to write to a non-file node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        let mount = (*self.master).mount;
+        let fn_write = (*mount).backend.write;
+
+        let bytes_written = fn_write(mount, self.inode, buffer, offset)?;
+
+        // Update the VFS node if the file was appended to
+        if self.node_type == VfsNodeType::File && offset + (bytes_written as u32) > self.size {
+            self.size = offset + (bytes_written as u32);
+        }
+
+        Ok(bytes_written)
+    }
+
+    pub unsafe fn truncate(&mut self) -> KResult<()> {
+        if !matches!(self.node_type, VfsNodeType::File) {
+            pr_warn!("VFS: Attempted to truncate a non-file node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        let mount = (*self.master).mount;
+        let fn_truncate = (*mount).backend.truncate;
+
+        fn_truncate(mount, self.inode)?;
+        self.size = 0;
+        Ok(())
+    }
+
+    pub unsafe fn lazy_load_directory(&self) -> KResult<()> {
+        if self.node_type != VfsNodeType::Directory {
+            pr_warn!("VFS: Attempted to lazy load a non-directory node\n");
+            return Err(KernelError::EINVAL);
+        }
+
+        if !self.children.is_null() || self.inode == 0 {
+            return Ok(()); // Already loaded or virtual in-memory directory
+        }
+
+        let mount = (*self.master).mount;
+        if mount.is_null() {
+            return Ok(());
+        }
+        let fn_load_dir = (*mount).backend.lazy_load_directory;
+        let inode = self.inode;
+
+        fn_load_dir(mount, self as *const VfsNode as *mut VfsNode, inode)
+    }
+}
+
+pub unsafe fn alloc_vfs_node() -> KResult<*mut VfsNode> {
+    let _guard = VFS_NODE_LOCK.lock();
+    if VFS_NODE_COUNT >= MAX_VFS_NODES {
+        return Err(KernelError::ENFILE);
+    }
+    let node_ptr = &mut VFS_NODE_POOL[VFS_NODE_COUNT] as *mut VfsNode;
+    (*node_ptr).ref_count = 0;
+    VFS_NODE_COUNT += 1;
+    Ok(node_ptr)
+}
+
+pub unsafe fn append_child(parent: *mut VfsNode, child: *mut VfsNode) {
+    (*child).father = parent;
+
+    if (*parent).children.is_null() {
+        (*parent).children = child;
+        return;
+    }
+
+    let mut sibling = (*parent).children;
+    while !(*sibling).next_of_kin.is_null() {
+        sibling = (*sibling).next_of_kin;
+    }
+
+    (*sibling).next_of_kin = child;
+}
+
+pub unsafe fn create_child_node(
+    parent: *mut VfsNode,
+    name: &str,
+    node_type: VfsNodeType,
+    rights: u16,
+) -> KResult<*mut VfsNode> {
+    let node = alloc_vfs_node()?;
+
+    core::ptr::write_bytes((*node).name.as_mut_ptr(), 0, (*node).name.len());
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() >= (*node).name.len() {
+        return Err(KernelError::ENAMETOOLONG);
+    }
+    core::ptr::copy_nonoverlapping(
+        name_bytes.as_ptr(),
+        (*node).name.as_mut_ptr(),
+        name_bytes.len(),
+    );
+
+    (*node).size = 0;
+    (*node).node_type = node_type;
+    let credentials = crate::sched::current_cred()
+        .as_ref()
+        .copied()
+        .unwrap_or_else(crate::sched::Credentials::root);
+    let mount = (*parent).master;
+    let inode = if matches!(node_type, VfsNodeType::File | VfsNodeType::Directory)
+        && !mount.is_null()
+        && !(*mount).mount.is_null()
+    {
+        ((*(*mount).mount).backend.create)(
+            (*mount).mount,
+            (*parent).inode,
+            name,
+            node_type,
+            rights,
+            credentials.uid,
+            credentials.gid,
+        )?
+    } else if matches!(node_type, VfsNodeType::CharDevice | VfsNodeType::BlockDevice | VfsNodeType::Socket) {
+        0
+    } else {
+        return Err(KernelError::EOPNOTSUPP);
+    };
+    (*node).inode = inode;
+    (*node).links = 1;
+    (*node).master = (*parent).master;
+    (*node).father = parent;
+    (*node).children = core::ptr::null_mut();
+    (*node).next_of_kin = core::ptr::null_mut();
+    (*node).owner_uid = credentials.uid;
+    (*node).owner_gid = credentials.gid;
+    (*node).rights = rights;
+
+    append_child(parent, node);
+    vfs_ref_get(parent);
+    Ok(node)
+}
+
+pub unsafe fn mount_node(target: *mut VfsNode, mounted_root: *mut VfsNode) -> KResult<()> {
+    if target.is_null() || mounted_root.is_null() {
+        return Err(KernelError::EINVAL);
+    }
+
+    if (*target).node_type != VfsNodeType::Directory {
+        return Err(KernelError::ENOTDIR);
+    }
+
+    (*target).master = mounted_root;
+    vfs_ref_get(target);
+    Ok(())
+}
+
+pub unsafe fn umount_node(target: *mut VfsNode) -> KResult<()> {
+    if target.is_null() {
+        return Err(KernelError::EINVAL);
+    }
+
+    if (*target).node_type != VfsNodeType::Directory {
+        return Err(KernelError::ENOTDIR);
+    }
+
+    (*target).master = target;
+    vfs_ref_put(target);
+    Ok(())
+}
+
+pub unsafe fn print_vfs_tree(mut node: *mut VfsNode, depth: usize) {
+    while !node.is_null() {
+        for _ in 0..depth {
+            print_str_on(1, " |  ");
+        }
+
+        let name_str = utils::c_str_to_rust((*node).name.as_ptr());
+
+        print_fmt_on(
+            1,
+            &format_args!(
+                " |-- {} (Inode: {}, Type: {:?}, Size: {})\n",
+                name_str,
+                (*node).inode,
+                (*node).node_type,
+                (*node).size
+            ),
+        );
+
+        if (*node).node_type == VfsNodeType::Directory
+            && (*node).children.is_null()
+            && (*node).inode != 0
+        {
+            let _ = (*node).lazy_load_directory();
+        }
+
+        if !(*node).children.is_null() {
+            print_vfs_tree((*node).children, depth + 1);
+        }
+
+        node = (*node).next_of_kin;
+    }
+}
+
+pub unsafe fn resolve_path(path: &str, cwd: *mut VfsNode) -> KResult<*mut VfsNode> {
+    if path.is_empty() {
+        return Err(KernelError::EINVAL);
+    }
+
+    let mut current = if path.starts_with('/') {
+        ROOT_NODE
+    } else {
+        cwd
+    };
+
+    if current.is_null() {
+        return Err(KernelError::EINVAL);
+    }
+
+    let credentials = crate::sched::current_cred()
+        .as_ref()
+        .copied()
+        .unwrap_or_else(crate::sched::Credentials::root);
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+
+        if segment == ".." {
+            if !(*current).father.is_null() {
+                current = (*current).father;
+            }
+            continue;
+        }
+
+        if (*current).node_type == VfsNodeType::Directory {
+            (*current).lazy_load_directory()?;
+            let object = crate::security::SecurityObject::File {
+                owner_uid: (*current).owner_uid,
+                owner_gid: (*current).owner_gid,
+                mode: (*current).rights,
+            };
+            if crate::security::check(&credentials, &object, crate::security::Operation::Traverse)
+                == crate::security::Decision::Deny
+            {
+                return Err(KernelError::EACCES);
+            }
+        }
+
+        let mut child = (*current).children;
+        let mut found = false;
+
+        while !child.is_null() {
+            let name_len = (*child).name.iter().position(|&c| c == 0).unwrap_or(256);
+            let child_name = core::str::from_utf8(&(&(*child).name)[..name_len]).unwrap_or("");
+
+            if child_name == segment {
+                current = child;
+                found = true;
+                break;
+            }
+            child = (*child).next_of_kin;
+        }
+
+        if !found {
+            return Err(KernelError::ENOENT);
+        }
+    }
+
+    Ok(current)
+}
+
+pub(crate) unsafe fn vfs_ref_get(node: *mut VfsNode) {
+    if !node.is_null() {
+        (*node).ref_count += 1;
+    }
+}
+
+pub(crate) unsafe fn vfs_ref_put(node: *mut VfsNode) {
+    if !node.is_null() {
+        if (*node).ref_count > 0 {
+            (*node).ref_count -= 1;
+        }
+    }
+}
