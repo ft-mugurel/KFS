@@ -19,7 +19,8 @@ TARGET_DIR      = target/i686-kernel
 KERNEL_BIN      = $(BUILD_DIR)/kernel.bin
 KERNEL_REL_LIB  = $(TARGET_DIR)/release/libkernel.a
 KERNEL_DBG_LIB  = $(TARGET_DIR)/debug/libkernel.a
-KERNEL_SRCS     = $(shell find src -name '*.rs' -type f) Cargo.toml build.rs linker/linker.ld
+ABI_SRCS        = $(shell find abi/src -name '*.rs' -type f) abi/Cargo.toml
+KERNEL_SRCS     = $(shell find src -name '*.rs' -type f) $(ABI_SRCS) Cargo.toml build.rs linker/linker.ld
 
 ISO_OUT         = $(BUILD_DIR)/kernel.iso
 ISO_FULL_OUT    = $(BUILD_DIR)/kernel-full.iso
@@ -43,7 +44,7 @@ TRAMPOLINE_SRC = src/smp/trampoline.asm
 TRAMPOLINE_BIN = $(BUILD_DIR)/trampoline.bin
 
 USER_SHELL_DIR  = user
-USER_SHELL_SRCS = $(shell find $(USER_SHELL_DIR)/src -name '*.rs') $(USER_SHELL_DIR)/Cargo.toml $(USER_SHELL_DIR)/linker.ld
+USER_SHELL_SRCS = $(shell find $(USER_SHELL_DIR)/src -name '*.rs') $(USER_SHELL_DIR)/Cargo.toml $(USER_SHELL_DIR)/linker.ld $(ABI_SRCS)
 USER_SHELL_BIN  = $(BUILD_DIR)/sh.bin
 USER_SHELL_ELF  = $(BUILD_DIR)/user_target/i686-kernel/release/sh
 FHS_STAGE       = $(BUILD_DIR)/fhs-root
@@ -139,6 +140,9 @@ $(ATA_DRIVE_IMGS): Makefile $(FHS_STAMP)
 	@printf 'label: dos\nunit: sectors\n\nstart=$(ATA_PARTITION_START), size=$(ATA_PARTITION_SECTORS), type=83\n' | sfdisk --quiet $@
 	@echo -e "$(YELLOW)[~] Formatting ATA partition with ext2 filesystem...$(RESET)"
 	@mkfs.ext2 -q -d $(FHS_STAGE) -E offset=$$(($(ATA_PARTITION_START) * 512)) $@
+# mkfs -d copies the host user's uid/gid; the image tree must be root:root.
+	@cd $(FHS_STAGE) && find . -mindepth 1 -printf 'sif "/%P" uid 0\nsif "/%P" gid 0\n' \
+		| debugfs -w -f - "$(CURDIR)/$@?offset=$$(($(ATA_PARTITION_START) * 512))" >/dev/null 2>&1
 	@echo -e "$(GREEN)[✓] ATA drive image created: $@$(RESET)"
 
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
@@ -199,7 +203,7 @@ run-iso: iso $(ATA_DRIVE_IMGS)
 		-drive format=raw,file=$(ISO_OUT),media=cdrom \
 		-d cpu_reset,guest_errors -no-reboot -no-shutdown \
 		-serial stdio \
-		-smp 8 \
+		-smp 16 \
 		-accel kvm \
 		-boot order=d
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
@@ -220,6 +224,13 @@ run-iso-term: iso $(ATA_DRIVE_IMGS)
 		-boot order=d -nographic
 	@echo -e "\n$(BOLD)$(CYAN)[✓] QEMU EXIT DONE$(RESET)"
 
+clippy:
+	@echo -e "$(BOLD)$(CYAN)[~] Running Clippy on kernel...$(RESET)"
+	@$(CARGO) clippy --release -Zjson-target-spec -- $(CLIPPY_FLAGS)
+	@echo -e "$(BOLD)$(CYAN)[~] Running Clippy on user space...$(RESET)"
+	@$(CARGO) clippy --release --manifest-path $(USER_SHELL_DIR)/Cargo.toml -Zjson-target-spec --target $(abspath i686-kernel.json) --target-dir $(BUILD_DIR)/user_target -- $(CLIPPY_FLAGS)
+	@echo -e "$(BOLD)$(GREEN)[✓] CLIPPY DONE$(RESET)"
+
 test-chaos: iso
 	@python3 tests/test_chaos.py
 
@@ -233,4 +244,4 @@ fclean: clean
 
 re: clean all
 
-.PHONY: all build build_debug iso iso-full run debug run-iso run-iso-full run-iso-term test-chaos clean fclean re
+.PHONY: all build build_debug iso iso-full run debug run-iso run-iso-full run-iso-term clippy test-chaos clean fclean re

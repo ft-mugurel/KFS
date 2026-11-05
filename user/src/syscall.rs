@@ -1,68 +1,4 @@
-pub const SYS_EXIT: u32 = 1;
-pub const SYS_FORK: u32 = 2;
-pub const SYS_READ: u32 = 3;
-pub const SYS_WRITE: u32 = 4;
-pub const SYS_OPEN: u32 = 5;
-pub const SYS_CLOSE: u32 = 6;
-pub const SYS_WAITPID: u32 = 7;
-pub const SYS_UNLINK: u32 = 10;
-pub const SYS_CHDIR: u32 = 12;
-pub const SYS_MKNOD: u32 = 14;
-pub const SYS_GETPID: u32 = 20;
-pub const SYS_KILL: u32 = 37;
-pub const SYS_PIPE: u32 = 42;
-pub const SYS_SBRK: u32 = 45;
-pub const SYS_GETPPID: u32 = 64;
-pub const SYS_MMAP: u32 = 90;
-pub const SYS_MUNMAP: u32 = 91;
-pub const SYS_SOCKET: u32 = 97;
-pub const SYS_GETDENTS: u32 = 141;
-pub const SYS_NANOSLEEP: u32 = 162;
-pub const SYS_GETCWD: u32 = 183;
-pub const SYS_GETUID: u32 = 199;
-pub const SYS_LOGIN: u32 = 212;
-pub const SYS_GETUSERNAME: u32 = 213;
-pub const SYS_GETTTYNAME: u32 = 214;
-pub const SYS_DEBUG: u32 = 223;
-
-pub const O_RDONLY: u32 = 0;
-pub const O_WRONLY: u32 = 1;
-pub const O_RDWR: u32 = 2;
-pub const O_CREAT: u32 = 0x40;
-pub const O_TRUNC: u32 = 0x200;
-
-#[repr(C, packed)]
-pub struct LinuxDirent {
-    pub d_ino: u32,
-    pub d_off: u32,
-    pub d_reclen: u16,
-}
-
-#[allow(dead_code)]
-#[repr(u32)]
-pub enum DebugOp {
-    Memdump = 0,
-    Pte = 1,
-    Memtest = 2,
-    Stack = 3,
-    Layout = 4,
-    Crash = 5,
-    Loglevel = 6,
-    Color = 7,
-    Screen = 8,
-    Reboot = 9,
-    Shutdown = 10,
-    Initcalls = 11,
-    Clear = 12,
-    Users = 13,
-    UserAdd = 14,
-    Su = 15,
-    Ps = 16,
-    Dmesg = 17,
-    Klog = 18,
-    ConsoleScreen = 19,
-    UserDel = 20,
-}
+pub use kfs_abi::*;
 
 #[inline(always)]
 pub unsafe fn syscall0(num: u32) -> i32 {
@@ -175,7 +111,14 @@ pub fn sys_fork() -> isize {
 }
 
 pub fn sys_read(fd: usize, buf: &mut [u8]) -> isize {
-    unsafe { syscall3(SYS_READ, fd as u32, buf.as_mut_ptr() as u32, buf.len() as u32) as isize }
+    unsafe {
+        syscall3(
+            SYS_READ,
+            fd as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        ) as isize
+    }
 }
 
 pub fn sys_write(fd: usize, buf: &[u8]) -> isize {
@@ -198,6 +141,21 @@ pub fn sys_kill(pid: usize, sig: u32) -> isize {
     unsafe { syscall2(SYS_KILL, pid as u32, sig) as isize }
 }
 
+pub fn sys_readlink(path: &[u8], buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall3(
+            SYS_READLINK,
+            path.as_ptr() as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        ) as isize
+    }
+}
+
+pub fn sys_lstat(path: &[u8], stat: &mut Stat) -> isize {
+    unsafe { syscall2(SYS_LSTAT, path.as_ptr() as u32, stat as *mut Stat as u32) as isize }
+}
+
 pub fn sys_getcwd(buf: &mut [u8]) -> isize {
     unsafe { syscall2(SYS_GETCWD, buf.as_mut_ptr() as u32, buf.len() as u32) as isize }
 }
@@ -207,7 +165,14 @@ pub fn sys_chdir(path: &[u8]) -> isize {
 }
 
 pub fn sys_getdents(fd: usize, buf: &mut [u8]) -> isize {
-    unsafe { syscall3(SYS_GETDENTS, fd as u32, buf.as_mut_ptr() as u32, buf.len() as u32) as isize }
+    unsafe {
+        syscall3(
+            SYS_GETDENTS,
+            fd as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        ) as isize
+    }
 }
 
 pub fn sys_mknod(path: &[u8], mode: u32) -> isize {
@@ -235,7 +200,14 @@ pub fn sys_getusername(buf: &mut [u8]) -> isize {
 }
 
 pub fn sys_getttyname(fd: usize, buf: &mut [u8]) -> isize {
-    unsafe { syscall3(SYS_GETTTYNAME, fd as u32, buf.as_mut_ptr() as u32, buf.len() as u32) as isize }
+    unsafe {
+        syscall3(
+            SYS_GETTTYNAME,
+            fd as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        ) as isize
+    }
 }
 
 pub fn sys_debug(op: DebugOp, a1: u32, a2: u32) -> isize {
@@ -285,4 +257,3 @@ pub fn sys_nanosleep(ms: u32) -> isize {
 pub fn sys_raw(num: u32, a1: u32, a2: u32, a3: u32) -> isize {
     unsafe { syscall3(num, a1, a2, a3) as isize }
 }
-

@@ -1,10 +1,12 @@
 use super::SECTOR_SIZE;
+use super::block_device::DiskKind;
 use crate::error::{KResult, KernelError};
-use crate::locks::Spinlock;
+use crate::locks::{Spinlock, SpinlockGuard};
 use crate::pr_warn;
 use crate::x86::{inb, inw, outb, outw};
 
-static IDE_LOCK: Spinlock<()> = Spinlock::new(());
+struct IdeChannels;
+static IDE_LOCK: Spinlock<IdeChannels> = Spinlock::new(IdeChannels);
 
 const IDE_CONTROL_ALT_STATUS: u16 = 2;
 
@@ -22,73 +24,81 @@ const CMD_IDENTIFY: u8 = 0xEC;
 
 const MAX_POLL_RETRIES: u32 = 1_000_000;
 
-fn wait_busy(io_base: u16) -> KResult<()> {
+unsafe fn wait_busy(io_base: u16) -> KResult<()> {
+    // The four reads give the drive ~400ns to settle after a command.
     for _ in 0..4 {
-        inb(io_base + 7);
+        unsafe { inb(io_base + 7) };
     }
 
     // Poll until BSY clears with timeout
     for _ in 0..MAX_POLL_RETRIES {
-        let status = inb(io_base + 7);
+        let status = unsafe { inb(io_base + 7) };
         if (status & STATUS_BSY) == 0 {
             if (status & STATUS_ERR) != 0 || (status & STATUS_DF) != 0 {
-                return Err(KernelError::EIO); // I/O Error
+                return Err(KernelError::IO); // I/O Error
             }
             return Ok(());
         }
     }
     pr_warn!("IDE wait_busy timed out on port {:#x}", io_base);
-    Err(KernelError::ETIMEDOUT)
+    Err(KernelError::TimedOut)
 }
 
-pub fn identify(io_base: u16, control_base: u16, drive: u8) -> Option<u32> {
-    outb(io_base + 6, drive);
-    for _ in 0..4 {
-        inb(control_base + IDE_CONTROL_ALT_STATUS);
-    }
-    let status = inb(io_base + 7);
-    if status == 0 || status == 0xFF {
-        return None;
-    }
-
-    outb(io_base + 2, 0);
-    outb(io_base + 3, 0);
-    outb(io_base + 4, 0);
-    outb(io_base + 5, 0);
-    outb(io_base + 7, CMD_IDENTIFY);
-
-    let status = inb(io_base + 7);
-    if status == 0 || status == 0xFF {
-        return None;
-    }
-    wait_busy(io_base).ok()?;
-    wait_drq(io_base).ok()?;
-
-    let mut identify_data = [0u16; 256];
-    for word in &mut identify_data {
-        *word = inw(io_base);
-    }
-
-    let sector_count = (identify_data[61] as u32) << 16 | identify_data[60] as u32;
-    if sector_count == 0 {
-        None
-    } else {
-        Some(sector_count)
-    }
-}
-
-fn wait_drq(io_base: u16) -> KResult<()> {
+unsafe fn wait_drq(io_base: u16) -> KResult<()> {
     for _ in 0..MAX_POLL_RETRIES {
-        let status = inb(io_base + 7);
+        let status = unsafe { inb(io_base + 7) };
         if (status & STATUS_ERR) != 0 || (status & STATUS_DF) != 0 {
-            return Err(KernelError::EIO);
+            return Err(KernelError::IO);
         }
         if (status & STATUS_DRQ) != 0 {
             return Ok(());
         }
     }
     pr_warn!("IDE wait_drq timed out on port {:#x}", io_base);
-    Err(KernelError::ETIMEDOUT)
+    Err(KernelError::TimedOut)
+}
+
+pub unsafe fn identify(io_base: u16, control_base: u16, drive: u8) -> Option<(u32, DiskKind)> {
+    let mut identify_data = [0u16; 256];
+    unsafe {
+        outb(io_base + 6, drive);
+        for _ in 0..4 {
+            inb(control_base + IDE_CONTROL_ALT_STATUS);
+        }
+        let status = inb(io_base + 7);
+        if status == 0 || status == 0xFF {
+            return None;
+        }
+
+        outb(io_base + 2, 0);
+        outb(io_base + 3, 0);
+        outb(io_base + 4, 0);
+        outb(io_base + 5, 0);
+        outb(io_base + 7, CMD_IDENTIFY);
+
+        let status = inb(io_base + 7);
+        if status == 0 || status == 0xFF {
+            return None;
+        }
+        wait_busy(io_base).ok()?;
+        wait_drq(io_base).ok()?;
+
+        for word in &mut identify_data {
+            *word = inw(io_base);
+        }
+    }
+
+    let sector_count = (identify_data[61] as u32) << 16 | identify_data[60] as u32;
+    if sector_count == 0 {
+        return None;
+    }
+
+    // Word 76 is the SATA capabilities word; parallel ATA drives leave it 0 or 0xFFFF.
+    let kind = match identify_data[76] {
+        0 | 0xFFFF => DiskKind::Ide,
+        _ => DiskKind::Scsi,
+    };
+    Some((sector_count, kind))
 }
 
 pub fn read_sectors(
@@ -98,35 +108,42 @@ pub fn read_sectors(
     buffer: &mut [u8],
 ) -> KResult<()> {
     if buffer.len() < (sector_count as usize * SECTOR_SIZE) {
-        pr_warn!("Buffer size is smaller than the requested sector count. Buffer size: {}, Requested size: {}", buffer.len(), sector_count as usize * SECTOR_SIZE);
-        return Err(KernelError::EINVAL);
+        pr_warn!(
+            "Buffer size is smaller than the requested sector count. Buffer size: {}, Requested size: {}",
+            buffer.len(),
+            sector_count as usize * SECTOR_SIZE
+        );
+        return Err(KernelError::Inval);
     }
 
     let _guard = IDE_LOCK.lock();
     let io_base = device.io_base;
-    wait_busy(io_base)?;
 
-    outb(
-        io_base + 6,
-        device.drive | 0x40 | ((lba >> 24) & 0x0F) as u8,
-    );
-    outb(io_base + 2, sector_count);
-    outb(io_base + 3, lba as u8);
-    outb(io_base + 4, (lba >> 8) as u8);
-    outb(io_base + 5, (lba >> 16) as u8);
+    unsafe {
+        wait_busy(io_base)?;
 
-    outb(io_base + 7, CMD_READ_PIO);
+        outb(
+            io_base + 6,
+            device.drive | 0x40 | ((lba >> 24) & 0x0F) as u8,
+        );
+        outb(io_base + 2, sector_count);
+        outb(io_base + 3, lba as u8);
+        outb(io_base + 4, (lba >> 8) as u8);
+        outb(io_base + 5, (lba >> 16) as u8);
 
-    let buffer_ptr = buffer.as_mut_ptr() as *mut u16;
+        outb(io_base + 7, CMD_READ_PIO);
+    }
 
     for i in 0..(sector_count as usize) {
-        wait_busy(io_base)?;
-        wait_drq(io_base)?;
+        unsafe {
+            wait_busy(io_base)?;
+            wait_drq(io_base)?;
 
-        for j in 0..256 {
-            let word = inw(io_base);
-            unsafe {
-                buffer_ptr.add((i * 256) + j).write(word);
+            for chunk in buffer[(i * SECTOR_SIZE)..((i + 1) * SECTOR_SIZE)]
+                .as_chunks_mut::<2>()
+                .0
+            {
+                chunk.copy_from_slice(&inw(io_base).to_le_bytes());
             }
         }
     }
@@ -134,7 +151,6 @@ pub fn read_sectors(
     Ok(())
 }
 
-/// Writes a specific number of sectors starting at LBA from the provided buffer.
 pub fn write_sectors(
     device: &super::BlockDevice,
     lba: u32,
@@ -142,55 +158,57 @@ pub fn write_sectors(
     buffer: &[u8],
 ) -> KResult<()> {
     if buffer.len() < (sector_count as usize * SECTOR_SIZE) {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
-    let _guard = IDE_LOCK.lock();
+    let guard = IDE_LOCK.lock();
     let io_base = device.io_base;
-    wait_busy(io_base)?;
 
-    outb(
-        io_base + 6,
-        device.drive | 0x40 | ((lba >> 24) & 0x0F) as u8,
-    );
-    outb(io_base + 2, sector_count);
-    outb(io_base + 3, lba as u8);
-    outb(io_base + 4, (lba >> 8) as u8);
-    outb(io_base + 5, (lba >> 16) as u8);
+    unsafe {
+        wait_busy(io_base)?;
 
-    // Issue Write Command
-    outb(io_base + 7, CMD_WRITE_PIO);
+        outb(
+            io_base + 6,
+            device.drive | 0x40 | ((lba >> 24) & 0x0F) as u8,
+        );
+        outb(io_base + 2, sector_count);
+        outb(io_base + 3, lba as u8);
+        outb(io_base + 4, (lba >> 8) as u8);
+        outb(io_base + 5, (lba >> 16) as u8);
 
-    let buffer_ptr = buffer.as_ptr() as *const u16;
+        // Issue Write Command
+        outb(io_base + 7, CMD_WRITE_PIO);
+    }
 
     for i in 0..(sector_count as usize) {
-        wait_busy(io_base)?;
-        wait_drq(io_base)?;
+        unsafe {
+            wait_busy(io_base)?;
+            wait_drq(io_base)?;
 
-        // Write 256 words (512 bytes) for this sector
-        for j in 0..256 {
-            unsafe {
-                let word = buffer_ptr.add((i * 256) + j).read();
-                outw(io_base, word);
+            for chunk in buffer[(i * SECTOR_SIZE)..((i + 1) * SECTOR_SIZE)]
+                .as_chunks::<2>()
+                .0
+            {
+                outw(io_base, u16::from_le_bytes([chunk[0], chunk[1]]));
             }
         }
     }
 
     // Force drive cache flush
-    flush_cache_locked(device)?;
+    flush_cache_locked(guard, device)?;
 
     Ok(())
 }
 
-fn flush_cache_locked(device: &super::BlockDevice) -> KResult<()> {
-    wait_busy(device.io_base)?;
-    outb(device.io_base + 6, device.drive);
-    outb(device.io_base + 7, CMD_CACHE_FLUSH);
-    wait_busy(device.io_base)?;
+fn flush_cache_locked(
+    _held: SpinlockGuard<'_, IdeChannels>,
+    device: &super::BlockDevice,
+) -> KResult<()> {
+    unsafe {
+        wait_busy(device.io_base)?;
+        outb(device.io_base + 6, device.drive);
+        outb(device.io_base + 7, CMD_CACHE_FLUSH);
+        wait_busy(device.io_base)?;
+    }
     Ok(())
-}
-
-pub fn flush_cache(device: &super::BlockDevice) -> KResult<()> {
-    let _guard = IDE_LOCK.lock();
-    flush_cache_locked(device)
 }

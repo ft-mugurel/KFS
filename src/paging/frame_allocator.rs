@@ -1,7 +1,7 @@
-use super::multiboot::{
-    MemoryMapIter, MultibootInfo, MULTIBOOT_INFO_HAS_BASIC_MEMORY, MULTIBOOT_MEMORY_AVAILABLE,
-};
 use super::PAGE_SIZE;
+use super::multiboot::{
+    MULTIBOOT_INFO_HAS_BASIC_MEMORY, MULTIBOOT_MEMORY_AVAILABLE, MemoryMapIter, MultibootInfo,
+};
 use crate::error::{KResult, KernelError};
 use crate::locks::Spinlock;
 use crate::pr_warn;
@@ -110,10 +110,7 @@ struct CowFrameEntry {
 
 impl CowFrameEntry {
     const fn empty() -> Self {
-        Self {
-            frame_idx: u32::MAX,
-            count: 0,
-        }
+        Self { frame_idx: u32::MAX, count: 0 }
     }
 }
 
@@ -136,7 +133,7 @@ pub fn frame_ref_inc(phys_addr: u32) {
             return;
         }
     }
-    pr_warn!("COW_TABLE full, cannot track frame {:#x}\n", phys_addr);
+    pr_warn!("COW_TABLE full, cannot track frame {:#x}", phys_addr);
 }
 
 pub fn frame_ref_dec(phys_addr: u32) -> u8 {
@@ -171,8 +168,8 @@ pub fn frame_ref_count(phys_addr: u32) -> u8 {
 pub(super) fn init_from_multiboot(info: &MultibootInfo) {
     let mut state = ALLOCATOR_STATE.lock();
     // Start with every frame reserved, then free only bootloader-reported usable ranges.
-    for i in 0usize..BITMAP_WORDS {
-        state.bitmap[i] = u32::MAX;
+    for word in state.bitmap.iter_mut() {
+        *word = u32::MAX;
     }
     state.total_frames = MAX_FRAMES;
     state.free_frames = 0;
@@ -215,7 +212,7 @@ pub(super) fn init_from_multiboot(info: &MultibootInfo) {
                 has_usable_memory = true;
             }
             pr_warn!(
-                "mmap yielded no free pages; using mem_upper fallback range [{:#x}, {:#x})\n",
+                "mmap yielded no free pages; using mem_upper fallback range [{:#x}, {:#x})",
                 fallback_start as usize,
                 fallback_end as usize
             );
@@ -229,7 +226,7 @@ pub(super) fn init_from_multiboot(info: &MultibootInfo) {
 
     if !has_usable_memory || state.free_frames == 0 {
         pr_warn!(
-            "no usable physical frames discovered (flags={:#x}, mem_upper={} KiB)\n",
+            "no usable physical frames discovered (flags={:#x}, mem_upper={} KiB)",
             info.flags,
             info.mem_upper
         );
@@ -252,8 +249,8 @@ pub(super) fn alloc_frame() -> KResult<u32> {
         }
     }
 
-    pr_warn!("alloc_frame failed: no free physical frame\n");
-    Err(KernelError::ENOMEM)
+    pr_warn!("alloc_frame failed: no free physical frame");
+    Err(KernelError::NoMem)
 }
 
 #[inline(never)]
@@ -272,10 +269,10 @@ pub(super) fn alloc_frame_below(limit_addr: u64) -> KResult<u32> {
 
     if frame_idx >= limit_frame {
         pr_warn!(
-            "alloc_frame_below({:#x}) failed: no free frame below limit\n",
+            "alloc_frame_below({:#x}) failed: no free frame below limit",
             limit_addr
         );
-        return Err(KernelError::ENOMEM);
+        return Err(KernelError::NoMem);
     }
 
     state.mark_used(frame_idx);
@@ -297,7 +294,7 @@ pub(super) fn alloc_contiguous_frames_below(
     limit_addr: u64,
 ) -> KResult<u32> {
     if count == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     let mut state = ALLOCATOR_STATE.lock();
     let limit_frame = (limit_addr as usize / PAGE_SIZE).min(MAX_FRAMES);
@@ -331,20 +328,23 @@ pub(super) fn alloc_contiguous_frames_below(
     }
 
     pr_warn!(
-        "alloc_contiguous_frames_below({}, {}, {:#x}) failed: no contiguous free frames\n",
+        "alloc_contiguous_frames_below({}, {}, {:#x}) failed: no contiguous free frames",
         count,
         align,
         limit_addr
     );
-    Err(KernelError::ENOMEM)
+    Err(KernelError::NoMem)
 }
 
 #[inline(never)]
 pub(super) fn free_contiguous_frames(phys_addr: u32, count: usize) -> KResult<()> {
     let start_frame = frame_index(phys_addr);
-    if start_frame + count > MAX_FRAMES || (phys_addr as usize % PAGE_SIZE) != 0 {
-        pr_warn!("free_contiguous_frames rejected invalid addr={:#x}\n", phys_addr);
-        return Err(KernelError::EINVAL);
+    if start_frame + count > MAX_FRAMES || !(phys_addr as usize).is_multiple_of(PAGE_SIZE) {
+        pr_warn!(
+            "free_contiguous_frames rejected invalid addr={:#x}",
+            phys_addr
+        );
+        return Err(KernelError::Inval);
     }
 
     let mut state = ALLOCATOR_STATE.lock();
@@ -358,9 +358,9 @@ pub(super) fn free_contiguous_frames(phys_addr: u32, count: usize) -> KResult<()
 #[inline(never)]
 pub(super) fn free_frame(phys_addr: u32) -> KResult<()> {
     let frame_idx = frame_index(phys_addr);
-    if frame_idx >= MAX_FRAMES || (phys_addr as usize % PAGE_SIZE) != 0 {
-        pr_warn!("free_frame rejected invalid addr={:#x}\n", phys_addr);
-        return Err(KernelError::EINVAL);
+    if frame_idx >= MAX_FRAMES || !(phys_addr as usize).is_multiple_of(PAGE_SIZE) {
+        pr_warn!("free_frame rejected invalid addr={:#x}", phys_addr);
+        return Err(KernelError::Inval);
     }
 
     if frame_ref_dec(phys_addr) == 0 {

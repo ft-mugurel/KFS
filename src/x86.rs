@@ -1,90 +1,146 @@
 use core::arch::asm;
 
-/// Write 8 bits to port
-///
+// Port I/O blocks keep the default memory clobber, so the compiler cannot
+// move buffer reads/writes across a device command.
+
 /// # Safety
 /// Needs IO privileges.
 #[inline(always)]
-pub fn outb(port: u16, val: u8) {
+pub unsafe fn outb(port: u16, val: u8) {
     unsafe {
-        asm!("outb %al, %dx", in("al") val, in("dx") port, options(att_syntax));
+        asm!("outb %al, %dx", in("al") val, in("dx") port, options(att_syntax, nostack, preserves_flags));
     }
 }
 
-/// Read 8 bits from port
-///
 /// # Safety
 /// Needs IO privileges.
 #[inline(always)]
-pub fn inb(port: u16) -> u8 {
+pub unsafe fn inb(port: u16) -> u8 {
     let ret: u8;
     unsafe {
-        asm!("inb %dx, %al", in("dx") port, out("al") ret, options(att_syntax));
+        asm!("inb %dx, %al", in("dx") port, out("al") ret, options(att_syntax, nostack, preserves_flags));
     }
     ret
 }
 
-/// Write 16 bits to port
-///
 /// # Safety
 /// Needs IO privileges.
 #[inline(always)]
-pub fn outw(port: u16, val: u16) {
+pub unsafe fn outw(port: u16, val: u16) {
     unsafe {
-        asm!("outw %ax, %dx", in("ax") val, in("dx") port, options(att_syntax));
+        asm!("outw %ax, %dx", in("ax") val, in("dx") port, options(att_syntax, nostack, preserves_flags));
     }
 }
 
-/// Read 16 bits from port
-///
 /// # Safety
 /// Needs IO privileges.
 #[inline(always)]
-#[allow(dead_code)]
-pub fn inw(port: u16) -> u16 {
+pub unsafe fn inw(port: u16) -> u16 {
     let ret: u16;
     unsafe {
-        asm!("inw %dx, %ax", in("dx") port, out("ax") ret, options(att_syntax));
+        asm!("inw %dx, %ax", in("dx") port, out("ax") ret, options(att_syntax, nostack, preserves_flags));
     }
     ret
 }
 
-/// Write 32 bits to port
-///
 /// # Safety
 /// Needs IO privileges.
 #[inline(always)]
-#[allow(dead_code)]
-pub fn outl(port: u16, val: u32) {
+pub unsafe fn outl(port: u16, val: u32) {
     unsafe {
-        asm!("outl %eax, %dx", in("eax") val, in("dx") port, options(att_syntax));
+        asm!("outl %eax, %dx", in("eax") val, in("dx") port, options(att_syntax, nostack, preserves_flags));
     }
 }
 
-/// Read 32 bits from port
-///
 /// # Safety
 /// Needs IO privileges.
 #[inline(always)]
-#[allow(dead_code)]
-pub fn inl(port: u16) -> u32 {
+pub unsafe fn inl(port: u16) -> u32 {
     let ret: u32;
     unsafe {
-        asm!("inl %dx, %eax", out("eax") ret, in("dx") port, options(att_syntax));
+        asm!("inl %dx, %eax", out("eax") ret, in("dx") port, options(att_syntax, nostack, preserves_flags));
     }
     ret
 }
 
 #[inline(always)]
-pub(crate) fn disable_interrupts() {
-    unsafe {
-        asm!("cli", options(nomem, nostack, preserves_flags));
+pub fn io_wait() {
+    unsafe { outb(0x80, 0) };
+}
+
+/// Busy-waits for about `microseconds` µs (one port 0x80 write each).
+/// Only accurate enough for early boot, before the APIC timer is calibrated.
+pub fn busy_wait_us(microseconds: u32) {
+    for _ in 0..microseconds {
+        io_wait();
     }
 }
 
-pub(crate) fn enable_interrupts() {
+// cli/sti/hlt keep the default memory clobber (no `nomem`): they act as
+// compiler barriers, so memory accesses stay inside the interrupts-off
+// section and are re-read after a wakeup, as Linux does with "memory".
+
+#[inline(always)]
+pub fn disable_interrupts() {
     unsafe {
-        asm!("sti", options(nostack, preserves_flags)); // Enable interrupts
+        asm!("cli", options(nostack, preserves_flags));
+    }
+}
+
+/// Enables maskable interrupts on this CPU.
+///
+/// # Safety
+/// The caller must not be inside a section that relies on interrupts being
+/// off, such as while holding a `Spinlock` or
+/// touching per-CPU state an interrupt handler also uses
+pub unsafe fn enable_interrupts() {
+    unsafe {
+        asm!("sti", options(nostack, preserves_flags));
+    }
+}
+
+#[inline(always)]
+pub fn read_eflags() -> u32 {
+    let eflags: u32;
+    unsafe {
+        asm!("pushfd", "pop {}", out(reg) eflags, options(nomem, preserves_flags));
+    }
+    eflags
+}
+
+#[inline(always)]
+pub unsafe fn restore_eflags(flags: u32) {
+    if (flags & (1 << 9)) != 0 {
+        unsafe {
+            asm!("sti", options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[inline(always)]
+pub fn hlt() {
+    unsafe {
+        asm!("hlt", options(nostack, preserves_flags));
+    }
+}
+
+#[inline(always)]
+pub fn clean_registers_and_halt() -> ! {
+    unsafe {
+        asm!(
+            "xor eax, eax",
+            "xor ebx, ebx",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor ebp, ebp",
+            "cli",
+            "2:",
+            "hlt",
+            "jmp 2b",
+            options(noreturn, nostack)
+        );
     }
 }
 
@@ -93,22 +149,6 @@ pub fn read_cr0() -> u32 {
     let value: u32;
     unsafe {
         asm!("mov {0:e}, cr0", out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
-
-#[inline(always)]
-pub fn write_cr0(value: u32) {
-    unsafe {
-        asm!("mov cr0, {0:e}", in(reg) value, options(nomem, nostack, preserves_flags));
-    }
-}
-
-#[inline(always)]
-pub fn read_cr3() -> u32 {
-    let value: u32;
-    unsafe {
-        asm!("mov {0:e}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
 }
@@ -123,10 +163,12 @@ pub fn read_cr2() -> u32 {
 }
 
 #[inline(always)]
-pub fn write_cr3(value: u32) {
+pub fn read_cr3() -> u32 {
+    let value: u32;
     unsafe {
-        asm!("mov cr3, {0:e}", in(reg) value, options(nomem, nostack, preserves_flags));
+        asm!("mov {0:e}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
     }
+    value
 }
 
 #[inline(always)]
@@ -147,74 +189,50 @@ pub fn read_ebp() -> u32 {
     value
 }
 
+// Control-register writes change what addresses mean, so they are unsafe
+// and keep the memory clobber: no load or store may move across them.
+
+/// # Safety
+/// Must not clear PE or PG while the kernel depends on protected mode and
+/// paging, and may only set PG when CR3 holds a page directory that maps the
+/// code and stack currently in use.
+#[inline(always)]
+pub unsafe fn write_cr0(value: u32) {
+    unsafe {
+        asm!("mov cr0, {0:e}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
+/// # Safety
+/// `value` must be the physical address of a valid page directory that maps
+/// the code and stack currently in use and every kernel address the caller
+/// touches afterwards.
+#[inline(always)]
+pub unsafe fn write_cr3(value: u32) {
+    unsafe {
+        asm!("mov cr3, {0:e}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
 #[unsafe(no_mangle)]
-pub fn enable_paging() {
+pub unsafe fn enable_paging() {
     const CR0_PG: u32 = 1 << 31;
     let cr0 = read_cr0();
-    write_cr0(cr0 | CR0_PG);
+    unsafe { write_cr0(cr0 | CR0_PG) };
 }
 
+/// Drops this CPU's cached translation for one page. At worst, it costs
+/// a TLB refill. It keeps the memory clobber so it stays after the PTE write
+/// it follows
 #[inline(always)]
-pub unsafe fn invalidate_page(virt_addr: u32) {
-    core::arch::asm!("invlpg [{}]", in(reg) virt_addr, options(nostack, preserves_flags));
-}
-
-#[inline(always)]
-pub unsafe fn read_eflags() -> u32 {
-    let eflags: u32;
-    // pushfd pushes EFLAGS onto the stack, pop retrieves it
-    asm!("pushfd", "pop {}", out(reg) eflags, options(nomem, preserves_flags));
-    eflags
-}
-
-#[inline(always)]
-pub unsafe fn restore_eflags(flags: u32) {
-    // The IF (Interrupt Enable Flag) is bit 9 in the EFLAGS register
-    if (flags & (1 << 9)) != 0 {
-        asm!("sti", options(nomem, nostack));
-    }
-}
-
-#[inline(always)]
-pub fn hlt() {
+pub fn invalidate_page(virt_addr: u32) {
     unsafe {
-        asm!("hlt", options(nomem, nostack));
+        asm!("invlpg [{}]", in(reg) virt_addr, options(nostack, preserves_flags));
     }
 }
 
 #[inline(always)]
-pub unsafe fn clean_registers_and_halt() -> ! {
-    asm!(
-        "xor eax, eax",
-        "xor ebx, ebx",
-        "xor ecx, ecx",
-        "xor edx, edx",
-        "xor esi, esi",
-        "xor edi, edi",
-        "xor ebp, ebp",
-        "cli",
-        "2:",
-        "hlt",
-        "jmp 2b",
-        options(noreturn, nostack)
-    );
-}
-
-#[inline(always)]
-pub fn io_wait() {
-    outb(0x80, 0);
-}
-
-/// Only to be used in early boot code, before the APIC is initialized.
-/// This is a busy wait that takes approximately 1 microsecond.
-pub fn busy_wait_us(microseconds: u32) {
-    for _ in 0..microseconds {
-        io_wait();
-    }
-}
-
-#[inline(always)]
-pub fn rdmsr(msr: u32) -> u64 {
+pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
     unsafe {
         asm!(
@@ -229,7 +247,7 @@ pub fn rdmsr(msr: u32) -> u64 {
 }
 
 #[inline(always)]
-pub fn wrmsr(msr: u32, value: u64) {
+pub unsafe fn wrmsr(msr: u32, value: u64) {
     let low = value as u32;
     let high = (value >> 32) as u32;
     unsafe {
@@ -238,7 +256,7 @@ pub fn wrmsr(msr: u32, value: u64) {
             in("ecx") msr,
             in("eax") low,
             in("edx") high,
-            options(nomem, nostack, preserves_flags)
+            options(nostack, preserves_flags)
         );
     }
 }

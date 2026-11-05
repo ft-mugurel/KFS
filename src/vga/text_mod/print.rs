@@ -1,5 +1,5 @@
 use super::{
-    screen, Color, ColorCode, ScreenFormatter, VirtualScreen, SCROLLBACK_LINES, VGA_WIDTH,
+    Color, ColorCode, SCROLLBACK_LINES, ScreenFormatter, VGA_WIDTH, VirtualScreen, screen,
 };
 use core::fmt::{self, Arguments, Display, Write};
 
@@ -235,7 +235,7 @@ pub fn write_str_on(screen: &mut VirtualScreen, text: &str) {
                 }
             }
             EscState::Csi { mut buf, mut len } => {
-                if (byte >= b'0' && byte <= b'9') || byte == b';' || byte == b'?' {
+                if byte.is_ascii_digit() || byte == b';' || byte == b'?' {
                     if len < buf.len() {
                         buf[len] = byte;
                         len += 1;
@@ -251,10 +251,8 @@ pub fn write_str_on(screen: &mut VirtualScreen, text: &str) {
                             // \x1b[H, \x1b[1;1H: cursor position to home
                             screen::set_cursor_home(screen);
                         }
-                        b'm' => {
-                            if len == 0 || (len == 1 && buf[0] == b'0') {
-                                screen.clear_esc_seq_color();
-                            }
+                        b'm' if (len == 0 || (len == 1 && buf[0] == b'0')) => {
+                            screen.clear_esc_seq_color();
                         }
                         _ => {}
                     }

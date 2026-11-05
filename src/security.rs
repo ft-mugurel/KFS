@@ -1,4 +1,5 @@
 use crate::fs::VfsNode;
+use crate::interrupts::timer::read_tsc;
 use crate::locks::Spinlock;
 use crate::sched::Credentials;
 use pbkdf2::pbkdf2_hmac;
@@ -33,7 +34,7 @@ static ENTROPY_POOL: Spinlock<EntropyPool> = Spinlock::new(EntropyPool {
 });
 
 pub(crate) fn mix_entropy() {
-    let timestamp = unsafe { read_tsc() };
+    let timestamp = read_tsc();
     let mut pool = ENTROPY_POOL.lock();
     let sample = timestamp as u32 ^ (timestamp >> 32) as u32;
     let index = (pool.samples as usize) % pool.state.len();
@@ -130,14 +131,16 @@ pub(crate) fn username_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
     None
 }
 
+#[expect(dead_code, reason = "for login $HOME/shell setup")]
 pub(crate) fn home_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
     let passwd = PASSWD_TABLE.lock();
     let home = passwd.iter().flatten().find(|record| record.uid == uid)?;
     copy_path(&home.home, output)
 }
 
+#[expect(dead_code, reason = "for login $HOME/shell setup")]
 pub(crate) fn shell_for_uid(uid: u32, output: &mut [u8]) -> Option<usize> {
-    let passwd = PASSWD_TABLE.lock();
+    let passwd: crate::locks::SpinlockGuard<'_, [Option<PasswdRecord>; _]> = PASSWD_TABLE.lock();
     let shell = passwd.iter().flatten().find(|record| record.uid == uid)?;
     copy_path(&shell.shell, output)
 }
@@ -222,7 +225,11 @@ where
     drop(passwd);
     let accounts = ACCOUNT_TABLE.lock();
     for account in accounts.iter().flatten() {
-        f(username_bytes(&account.username), account.password.uid, account.password.gid);
+        f(
+            username_bytes(&account.username),
+            account.password.uid,
+            account.password.gid,
+        );
     }
 }
 
@@ -257,7 +264,7 @@ pub(crate) fn authenticate(username: &[u8], password: &[u8]) -> Option<Credentia
     let verified = verify_password(&password_record, password);
     let uname_str = core::str::from_utf8(username).unwrap_or("<utf8 err>");
     crate::pr_info!(
-        "[AUTH] Authenticate user '{}' (len={}): found={}, verified={}\n",
+        "[AUTH] Authenticate user '{}' (len={}): found={}, verified={}",
         uname_str,
         username.len(),
         account.is_some(),
@@ -268,7 +275,7 @@ pub(crate) fn authenticate(username: &[u8], password: &[u8]) -> Option<Credentia
     }
 
     let (uid, gid) = passwd_ids(username).unwrap_or((password_record.uid, password_record.gid));
-    return Some(Credentials {
+    Some(Credentials {
         uid,
         gid,
         euid: uid,
@@ -277,7 +284,7 @@ pub(crate) fn authenticate(username: &[u8], password: &[u8]) -> Option<Credentia
         fsgid: gid,
         groups: [0; 8],
         group_count: 0,
-    });
+    })
 }
 
 pub(crate) fn passwd_for_username(username: &[u8]) -> Option<PasswdRecord> {
@@ -361,9 +368,7 @@ pub(crate) fn ensure_passwd_user(username: &[u8], uid: u32, gid: u32) -> bool {
         home[prefix.len()..prefix.len() + username.len()].copy_from_slice(username);
         prefix.len() + username.len()
     };
-    let Some(record) =
-        create_passwd_record(username, uid, gid, &home[..home_len], b"")
-    else {
+    let Some(record) = create_passwd_record(username, uid, gid, &home[..home_len], b"") else {
         return false;
     };
     install_or_update_passwd(record)
@@ -389,8 +394,21 @@ pub(crate) fn load_passwd(data: &[u8]) -> usize {
             continue;
         }
         let mut fields = line.split(|&byte| byte == b':');
-        let (Some(username), Some(_password), Some(uid_field), Some(gid_field), Some(_gecos), Some(home)) =
-            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+        let (
+            Some(username),
+            Some(_password),
+            Some(uid_field),
+            Some(gid_field),
+            Some(_gecos),
+            Some(home),
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
         else {
             continue;
         };
@@ -535,7 +553,7 @@ fn parse_hex<const SIZE: usize>(value: &[u8]) -> Option<[u8; SIZE]> {
     }
 
     let mut result = [0u8; SIZE];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_chunks::<2>().0.iter().enumerate() {
         result[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
     }
     Some(result)
@@ -551,15 +569,15 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 fn fill_random(output: &mut [u8]) -> Option<()> {
-    if rdrand_supported() {
-        if let Some(()) = fill_rdrand(output) {
-            return Some(());
-        }
+    if rdrand_supported()
+        && let Some(()) = fill_rdrand(output)
+    {
+        return Some(());
     }
 
     let mut pool = ENTROPY_POOL.lock();
     while pool.samples < MIN_ENTROPY_SAMPLES {
-        let timestamp = unsafe { read_tsc() };
+        let timestamp = read_tsc();
         let sample = timestamp as u32 ^ (timestamp >> 32) as u32;
         let index = (pool.samples as usize) % pool.state.len();
         pool.state[index] =
@@ -611,18 +629,6 @@ fn fill_rdrand(output: &mut [u8]) -> Option<()> {
         chunk.copy_from_slice(&bytes[..length]);
     }
     Some(())
-}
-
-unsafe fn read_tsc() -> u64 {
-    let low: u32;
-    let high: u32;
-    core::arch::asm!(
-        "rdtsc",
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack, preserves_flags),
-    );
-    ((high as u64) << 32) | low as u64
 }
 
 fn rdrand_supported() -> bool {
@@ -733,60 +739,43 @@ pub(crate) fn serialize_passwd(output: &mut [u8]) -> Option<usize> {
     Some(written)
 }
 
-pub(crate) unsafe fn persist_accounts() -> bool {
-    let root = crate::fs::ROOT_NODE;
-    let shadow = match crate::fs::resolve_path("/etc/shadow", root) {
-        Ok(node) => node,
-        Err(_) => return false,
+unsafe fn persist_file(path: &str, serialize: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
+    const SIZE: usize = 4096;
+
+    let _pin = crate::fs::pin_nodes();
+    let Ok(node) = (unsafe { crate::fs::resolve_path(path, crate::fs::ROOT_NODE) }) else {
+        return false;
     };
-    if (*shadow).inode == 0 || (*shadow).node_type != crate::fs::VfsNodeType::File {
+    let node = unsafe { &mut *node };
+    if node.inode == 0 || node.node_type != crate::fs::VfsNodeType::File {
+        return false;
+    }
+    if unsafe { node.truncate() }.is_err() {
         return false;
     }
 
-    if (*shadow).truncate().is_err() {
+    let Ok(data_alloc) = crate::paging::kmalloc(SIZE) else {
         return false;
-    }
-    let data_alloc = match crate::paging::kmalloc(4096) {
-        Ok(ptr) => ptr,
-        Err(_) => return false,
     };
-    let data = &mut *(data_alloc as *mut [u8; 4096]);
+    let data = unsafe { core::slice::from_raw_parts_mut(data_alloc, SIZE) };
     data.fill(0);
-    let length_opt = serialize_accounts(data);
-    let result = if let Some(length) = length_opt {
-        (*shadow)
-            .write(&data[..length], 0)
-            .map(|written| written == length)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let result = serialize(data)
+        .and_then(|length| {
+            unsafe { node.write(&data[..length], 0) }
+                .ok()
+                .map(|written| written == length)
+        })
+        .unwrap_or(false);
     let _ = crate::paging::kfree(data_alloc);
     result
 }
 
+pub(crate) unsafe fn persist_accounts() -> bool {
+    unsafe { persist_file("/etc/shadow", serialize_accounts) }
+}
+
 pub(crate) unsafe fn persist_passwd() -> bool {
-    let passwd = match crate::fs::resolve_path("/etc/passwd", crate::fs::ROOT_NODE) {
-        Ok(node) => node,
-        Err(_) => return false,
-    };
-    if (*passwd).inode == 0 || (*passwd).node_type != crate::fs::VfsNodeType::File {
-        return false;
-    }
-    if (*passwd).truncate().is_err() {
-        return false;
-    }
-    let data_alloc = match crate::paging::kmalloc(4096) {
-        Ok(ptr) => ptr,
-        Err(_) => return false,
-    };
-    let data = &mut *(data_alloc as *mut [u8; 4096]);
-    data.fill(0);
-    let result = serialize_passwd(data)
-        .and_then(|length| (*passwd).write(&data[..length], 0).ok().map(|written| written == length))
-        .unwrap_or(false);
-    let _ = crate::paging::kfree(data_alloc);
-    result
+    unsafe { persist_file("/etc/passwd", serialize_passwd) }
 }
 
 fn append_bytes(output: &mut [u8], offset: usize, value: &[u8]) -> Option<usize> {
@@ -833,8 +822,7 @@ fn append_hex<const SIZE: usize>(
 }
 
 pub(crate) unsafe fn set_current_credentials(credentials: Credentials) {
-    let task = crate::sched::current();
-    if let Some(t) = task.as_mut() {
+    if let Some(t) = unsafe { crate::sched::current().as_mut() } {
         t.credentials = credentials;
     } else {
         let mut table = crate::sched::PROCESS_TABLE.lock();
@@ -849,7 +837,7 @@ pub(crate) unsafe fn login_current(username: &[u8], password: &[u8]) -> bool {
         return false;
     };
 
-    set_current_credentials(credentials);
+    unsafe { set_current_credentials(credentials) };
     true
 }
 
@@ -866,6 +854,7 @@ fn path_bytes<const SIZE: usize>(path: &[u8; SIZE]) -> &[u8] {
     &path[..length]
 }
 
+#[expect(dead_code, reason = "for login $HOME/shell setup")]
 fn copy_path<const SIZE: usize>(path: &[u8; SIZE], output: &mut [u8]) -> Option<usize> {
     let bytes = path_bytes(path);
     if bytes.len() > output.len() {
@@ -897,6 +886,7 @@ pub(crate) enum Operation {
     Truncate,
     Mount,
     Unmount,
+    #[expect(dead_code, reason = "for useradd/passwd permission checks")]
     AccountAdmin,
     Signal,
     Inspect,
@@ -922,10 +912,11 @@ pub(crate) enum Decision {
 }
 
 pub(crate) unsafe fn object_for_node(node: *const VfsNode) -> SecurityObject {
+    let node = unsafe { &*node };
     SecurityObject::File {
-        owner_uid: (*node).owner_uid,
-        owner_gid: (*node).owner_gid,
-        mode: (*node).rights,
+        owner_uid: node.owner_uid,
+        owner_gid: node.owner_gid,
+        mode: node.rights,
     }
 }
 
@@ -963,9 +954,7 @@ pub(crate) fn check(
         _ => false,
     };
 
-    if dac_allowed {
-        Decision::Allow
-    } else if credentials.is_root() {
+    if dac_allowed || credentials.is_root() {
         Decision::Allow
     } else {
         Decision::Deny

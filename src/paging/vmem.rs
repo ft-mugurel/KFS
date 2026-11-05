@@ -37,7 +37,6 @@ pub struct VmemAlloc {
     pub page_count: usize,
     pub total_pages: usize,
     pub kind: AllocKind,
-    pub flags: u32,
     arena: ArenaKind,
 }
 
@@ -48,6 +47,7 @@ pub struct VmemStats {
     pub total_bytes: u32,
     pub free_bytes: u32,
     pub free_ranges: usize,
+    pub arenas: usize,
     pub alloc_count: usize,
     pub alloc_bytes: usize,
 }
@@ -176,10 +176,10 @@ impl VmemState {
     pub fn find_slot_by_ptr(&self, ptr: u32) -> Option<usize> {
         let page_aligned = ptr & !(PAGE_SIZE as u32 - 1);
         for (i, alloc_opt) in self.allocs.iter().enumerate() {
-            if let Some(alloc) = alloc_opt {
-                if alloc.base == ptr || alloc.base == page_aligned {
-                    return Some(i);
-                }
+            if let Some(alloc) = alloc_opt
+                && (alloc.base == ptr || alloc.base == page_aligned)
+            {
+                return Some(i);
             }
         }
         None
@@ -200,19 +200,19 @@ static VMEM_STATE: Spinlock<VmemState> = Spinlock::new(VmemState::new());
 fn page_count_for(size: usize) -> KResult<usize> {
     size.checked_add(PAGE_SIZE - 1)
         .map(|aligned_size| aligned_size / PAGE_SIZE)
-        .ok_or(KernelError::EOVERFLOW)
+        .ok_or(KernelError::Overflow)
 }
 
 fn validate_vmalloc_flags(flags: u32) -> KResult<()> {
     if (flags & !(PAGE_WRITABLE | PAGE_PCD)) != 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     Ok(())
 }
 
 fn validate_ioremap_flags(flags: u32) -> KResult<()> {
     if (flags & !(PAGE_WRITABLE | PAGE_PCD)) != 0 || (flags & PAGE_PCD) == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     Ok(())
 }
@@ -240,7 +240,7 @@ pub fn init_vmem() {
     state.alloc_count = 0;
     state.total_allocated_bytes = 0;
     pr_debug!(
-        "vmem initialized: range=[{:#x}, {:#x}) total_pages={} max_allocs={}\n",
+        "vmem initialized: range=[{:#x}, {:#x}) total_pages={} max_allocs={}",
         address_space_start,
         address_space_end,
         address_space_pages,
@@ -256,7 +256,7 @@ pub fn vmalloc(size: usize) -> KResult<*mut u8> {
 #[inline(never)]
 pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
     if size == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     validate_vmalloc_flags(flags)?;
     let mut state = VMEM_STATE.lock();
@@ -264,18 +264,18 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
     let page_count = match page_count_for(size) {
         Ok(count) => count,
         Err(error) => {
-            pr_warn!("vmalloc size overflow size={}\n", size);
+            pr_warn!("vmalloc size overflow size={}", size);
             return Err(error);
         }
     };
     if page_count == 0 || page_count >= state.arena_page_count(ArenaKind::Vmalloc) {
         pr_warn!(
-            "vmalloc request too large size={} pages={} max_pages={}\n",
+            "vmalloc request too large size={} pages={} max_pages={}",
             size,
             page_count,
             state.arena_page_count(ArenaKind::Vmalloc) - 1
         );
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     // Redzone Guard Page: reserve 1 extra trailing page that remains unmapped.
@@ -283,19 +283,19 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
         Some(v) if v <= state.arena_page_count(ArenaKind::Vmalloc) => v,
         _ => {
             pr_warn!(
-                "vmalloc page count overflow size={} pages={}\n",
+                "vmalloc page count overflow size={} pages={}",
                 size,
                 page_count
             );
-            return Err(KernelError::EOVERFLOW);
+            return Err(KernelError::Overflow);
         }
     };
 
     let slot = match state.find_free_slot() {
         Some(v) => v,
         None => {
-            pr_warn!("vmalloc allocation table full\n");
-            return Err(KernelError::ENOMEM);
+            pr_warn!("vmalloc allocation table full");
+            return Err(KernelError::NoMem);
         }
     };
 
@@ -303,12 +303,12 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
         Some(v) => v,
         None => {
             pr_warn!(
-                "vmalloc out of virtual space size={} pages={} total_pages={}\n",
+                "vmalloc out of virtual space size={} pages={} total_pages={}",
                 size,
                 page_count,
                 total_pages
             );
-            return Err(KernelError::ENOMEM);
+            return Err(KernelError::NoMem);
         }
     };
 
@@ -321,7 +321,7 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
             Ok(f) => f,
             Err(e) => {
                 pr_warn!(
-                    "vmalloc ran out of physical pages at mapped_pages={}\n",
+                    "vmalloc ran out of physical pages at mapped_pages={}",
                     mapped_pages
                 );
                 for j in 0..mapped_pages {
@@ -349,7 +349,7 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
                 }
             }
             state.release_pages(ArenaKind::Vmalloc, start_page, total_pages);
-            return Err(KernelError::ENOMEM);
+            return Err(KernelError::NoMem);
         }
     }
 
@@ -359,14 +359,13 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
         page_count,
         total_pages,
         kind: AllocKind::RamBacked,
-        flags,
         arena: ArenaKind::Vmalloc,
     });
     state.alloc_count += 1;
     state.total_allocated_bytes += size;
 
     pr_debug!(
-        "vmalloc size={} pages={} total_pages={} base={:#x} end={:#x}\n",
+        "vmalloc size={} pages={} total_pages={} base={:#x} end={:#x}",
         size,
         page_count,
         total_pages,
@@ -381,28 +380,28 @@ pub fn vmalloc_with_flags(size: usize, flags: u32) -> KResult<*mut u8> {
 pub fn vfree(ptr: *mut u8) -> KResult<()> {
     let addr = ptr as u32;
     if addr == 0 {
-        pr_warn!("vfree rejected null pointer\n");
-        return Err(KernelError::EINVAL);
+        pr_warn!("vfree rejected null pointer");
+        return Err(KernelError::Inval);
     }
     let mut state = VMEM_STATE.lock();
     let address_start = state.arena_start(ArenaKind::Vmalloc);
     let address_end = state.arena_start(ArenaKind::Ioremap)
         + (state.arena_page_count(ArenaKind::Ioremap) * PAGE_SIZE) as u32;
     if addr < address_start || addr >= address_end {
-        pr_warn!("vfree pointer outside vmem range ptr={:#x}\n", addr);
-        return Err(KernelError::EFAULT);
+        pr_warn!("vfree pointer outside vmem range ptr={:#x}", addr);
+        return Err(KernelError::Fault);
     }
     let slot = match state.find_slot_by_ptr(addr) {
         Some(v) => v,
         None => {
-            pr_warn!("vfree unknown pointer={:#x}\n", addr);
-            return Err(KernelError::EFAULT);
+            pr_warn!("vfree unknown pointer={:#x}", addr);
+            return Err(KernelError::Fault);
         }
     };
 
     let alloc = match state.allocs[slot] {
         Some(a) => a,
-        None => return Err(KernelError::EFAULT),
+        None => return Err(KernelError::Fault),
     };
 
     match alloc.kind {
@@ -434,7 +433,7 @@ pub fn vfree(ptr: *mut u8) -> KResult<()> {
     state.allocs[slot] = None;
 
     pr_debug!(
-        "vfree ptr={:#x} size={} pages={}\n",
+        "vfree ptr={:#x} size={} pages={}",
         alloc.base,
         alloc.requested_size,
         alloc.page_count
@@ -447,22 +446,22 @@ pub fn vfree(ptr: *mut u8) -> KResult<()> {
 pub fn vsize(ptr: *const u8) -> KResult<usize> {
     let addr = ptr as u32;
     if addr == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     let state = VMEM_STATE.lock();
     let address_start = state.arena_start(ArenaKind::Vmalloc);
     let address_end = state.arena_start(ArenaKind::Ioremap)
         + (state.arena_page_count(ArenaKind::Ioremap) * PAGE_SIZE) as u32;
     if addr < address_start || addr >= address_end {
-        return Err(KernelError::EFAULT);
+        return Err(KernelError::Fault);
     }
-    if let Some(slot) = state.find_slot_by_ptr(addr) {
-        if let Some(alloc) = state.allocs[slot] {
-            return Ok(alloc.requested_size);
-        }
+    if let Some(slot) = state.find_slot_by_ptr(addr)
+        && let Some(alloc) = state.allocs[slot]
+    {
+        return Ok(alloc.requested_size);
     }
 
-    Err(KernelError::EFAULT)
+    Err(KernelError::Fault)
 }
 
 #[inline(never)]
@@ -473,19 +472,19 @@ pub fn ioremap(phys_addr: u32, size: usize) -> KResult<*mut u8> {
 #[inline(never)]
 pub fn ioremap_with_flags(phys_addr: u32, size: usize, flags: u32) -> KResult<*mut u8> {
     if size == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     validate_ioremap_flags(flags)?;
     let mut state = VMEM_STATE.lock();
 
     let offset = (phys_addr as usize) & (PAGE_SIZE - 1);
     let aligned_phys = phys_addr & !(PAGE_SIZE as u32 - 1);
-    let aligned_size = size.checked_add(offset).ok_or(KernelError::EOVERFLOW)?;
+    let aligned_size = size.checked_add(offset).ok_or(KernelError::Overflow)?;
     let page_count = match page_count_for(aligned_size) {
         Ok(count) => count,
         Err(error) => {
             pr_warn!(
-                "ioremap aligned size overflow phys={:#x} size={}\n",
+                "ioremap aligned size overflow phys={:#x} size={}",
                 phys_addr,
                 size
             );
@@ -494,27 +493,27 @@ pub fn ioremap_with_flags(phys_addr: u32, size: usize, flags: u32) -> KResult<*m
     };
 
     if page_count == 0 || page_count >= state.arena_page_count(ArenaKind::Ioremap) {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
-    let total_pages = page_count.checked_add(1).ok_or(KernelError::EOVERFLOW)?;
+    let total_pages = page_count.checked_add(1).ok_or(KernelError::Overflow)?;
     if total_pages > state.arena_page_count(ArenaKind::Ioremap) {
-        return Err(KernelError::ENOMEM);
+        return Err(KernelError::NoMem);
     }
 
     let slot = match state.find_free_slot() {
         Some(v) => v,
         None => {
-            pr_warn!("ioremap allocation table full\n");
-            return Err(KernelError::ENOMEM);
+            pr_warn!("ioremap allocation table full");
+            return Err(KernelError::NoMem);
         }
     };
 
     let start_page = match state.reserve_pages(ArenaKind::Ioremap, total_pages) {
         Some(v) => v,
         None => {
-            pr_warn!("ioremap out of virtual space size={}\n", size);
-            return Err(KernelError::ENOMEM);
+            pr_warn!("ioremap out of virtual space size={}", size);
+            return Err(KernelError::NoMem);
         }
     };
 
@@ -530,11 +529,11 @@ pub fn ioremap_with_flags(phys_addr: u32, size: usize, flags: u32) -> KResult<*m
                 }
                 state.release_pages(ArenaKind::Ioremap, start_page, total_pages);
                 pr_warn!(
-                    "ioremap physical range overflow phys={:#x} pages={}\n",
+                    "ioremap physical range overflow phys={:#x} pages={}",
                     phys_addr,
                     page_count
                 );
-                return Err(KernelError::EOVERFLOW);
+                return Err(KernelError::Overflow);
             }
         };
         if page_table::map_page(va, pa, flags).is_err() {
@@ -543,7 +542,7 @@ pub fn ioremap_with_flags(phys_addr: u32, size: usize, flags: u32) -> KResult<*m
                 let _ = page_table::unmap_page(mapped_va);
             }
             state.release_pages(ArenaKind::Ioremap, start_page, total_pages);
-            return Err(KernelError::ENOMEM);
+            return Err(KernelError::NoMem);
         }
     }
 
@@ -553,14 +552,13 @@ pub fn ioremap_with_flags(phys_addr: u32, size: usize, flags: u32) -> KResult<*m
         page_count,
         total_pages,
         kind: AllocKind::IoRemap,
-        flags,
         arena: ArenaKind::Ioremap,
     });
     state.alloc_count += 1;
     state.total_allocated_bytes += size;
 
     pr_debug!(
-        "ioremap phys={:#x} size={} virt={:#x}\n",
+        "ioremap phys={:#x} size={} virt={:#x}",
         phys_addr,
         size,
         base + offset as u32
@@ -591,6 +589,7 @@ pub fn debug_stats() -> VmemStats {
         total_bytes: range_end - range_start,
         free_bytes: free_bytes as u32,
         free_ranges,
+        arenas: 2,
         alloc_count: state.alloc_count,
         alloc_bytes: state.total_allocated_bytes,
     }

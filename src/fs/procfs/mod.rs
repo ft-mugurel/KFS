@@ -26,11 +26,12 @@ pub const PROCFS_CMDLINE_INODE: u32 = 10;
 pub const PROCFS_DEVICES_INODE: u32 = 11;
 pub const PROCFS_LOADAVG_INODE: u32 = 12;
 pub const PROCFS_KMSG_INODE: u32 = 13;
+pub const PROCFS_SYS_DIR_INODE: u32 = 14;
+pub const PROCFS_SYS_KERNEL_DIR_INODE: u32 = 15;
+pub const PROCFS_SYS_PRINTK_INODE: u32 = 16;
 
 pub const PROC_PID_BASE: u32 = 100;
 pub const PROC_PID_STRIDE: u32 = 16;
-#[allow(dead_code)]
-pub const PROC_FILE_OFFSET_DIR: u32 = 0;
 pub const PROC_FILE_OFFSET_STATUS: u32 = 1;
 pub const PROC_FILE_OFFSET_CMDLINE: u32 = 2;
 pub const PROC_FILE_OFFSET_STAT: u32 = 3;
@@ -66,20 +67,21 @@ impl<'a> Write for BufferWriter<'a> {
 }
 
 pub unsafe fn mount_procfs() -> KResult<()> {
-    pr_debug!("Mounting procfs pseudo-filesystem at /proc...\n");
+    pr_debug!("Mounting procfs pseudo-filesystem at /proc...");
 
     let root = fs::ROOT_NODE;
     if root.is_null() {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let target = fs::resolve_path("/proc", root)?;
     if (*target).node_type != VfsNodeType::Directory {
-        return Err(KernelError::ENOTDIR);
+        return Err(KernelError::NotDir);
     }
 
     let mount_ptr = fs::register_mount(|_idx| fs::Mount {
         device: 0,
+        mount_point: "/proc",
         backend: &PROCFS_BACKEND,
         private_data: fs::MountPrivate::Procfs,
     })?;
@@ -104,8 +106,9 @@ pub unsafe fn mount_procfs() -> KResult<()> {
     (*target).mount = mount_ptr;
 
     // Pre-populate static entries and initial PIDs onto target
-    ops::populate_proc_root(target, proc_root)?;
+    ops::populate_proc_root(target)?;
+    ops::set_proc_root(target);
 
-    pr_debug!("procfs mounted successfully at /proc\n");
+    pr_debug!("procfs mounted successfully at /proc");
     Ok(())
 }

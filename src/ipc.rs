@@ -1,3 +1,4 @@
+
 use crate::{
     error::{KResult, KernelError},
     locks::Spinlock,
@@ -8,7 +9,7 @@ pub const SOCKET_BUFFER_SIZE: usize = 1024;
 pub const MAX_SOCKETS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "for bind/listen")]
 pub enum SocketState {
     Unbound,
     Bound,
@@ -28,7 +29,7 @@ pub struct Socket {
 }
 
 impl Socket {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             state: SocketState::Unbound,
             rx_buffer: [0; SOCKET_BUFFER_SIZE],
@@ -40,52 +41,51 @@ impl Socket {
     }
 }
 
-const INIT_SOCKET: Spinlock<Socket> = Spinlock::new(Socket::new());
-pub static SOCKETS: [Spinlock<Socket>; MAX_SOCKETS] = [INIT_SOCKET; MAX_SOCKETS];
+static SOCKETS: [Spinlock<Socket>; MAX_SOCKETS] =
+    [const { Spinlock::new(Socket::new()) }; MAX_SOCKETS];
 
 pub fn create_socket() -> KResult<usize> {
-    for i in 0..MAX_SOCKETS {
-        let mut sock = SOCKETS[i].lock();
-        if sock.ref_count == 0 {
-            sock.ref_count = 1;
-            sock.state = SocketState::Connected;
-            sock.rx_head = 0;
-            sock.rx_tail = 0;
-            sock.peer_index = Some(i);
-            return Ok(i);
+    for (ndx, slot) in SOCKETS.iter().enumerate() {
+        let mut socket = slot.lock();
+        if socket.ref_count == 0 {
+            socket.ref_count = 1;
+            socket.state = SocketState::Connected;
+            socket.rx_head = 0;
+            socket.rx_tail = 0;
+            socket.peer_index = Some(ndx);
+            return Ok(ndx);
         }
     }
-    pr_warn!("create_socket: no available sockets\n");
-    Err(KernelError::ENOBUFS)
+    pr_warn!("create_socket: no available sockets");
+    Err(KernelError::NoBufs)
 }
 
-#[allow(dead_code)]
-pub fn create_socket_pair() -> KResult<(usize, usize)> {
+/* pub fn create_socket_pair() -> KResult<(usize, usize)> {
     let mut first = None;
 
-    for i in 0..MAX_SOCKETS {
-        let mut sock = SOCKETS[i].lock();
+    for (ndx, socket) in SOCKETS.iter().enumerate() {
+        let mut sock = socket.lock();
         if sock.ref_count == 0 {
             sock.ref_count = 1;
-            first = Some(i);
+            first = Some(ndx);
             break;
         }
     }
 
     let idx1 = match first {
         Some(i) => i,
-        None => return Err(KernelError::ENOBUFS),
+        None => return Err(KernelError::NoBufs),
     };
 
     let mut second = None;
-    for i in 0..MAX_SOCKETS {
-        if i == idx1 {
+    for (ndx, socket) in SOCKETS.iter().enumerate() {
+        if ndx == idx1 {
             continue;
         }
-        let mut sock = SOCKETS[i].lock();
+        let mut sock = socket.lock();
         if sock.ref_count == 0 {
             sock.ref_count = 1;
-            second = Some(i);
+            second = Some(ndx);
             break;
         }
     }
@@ -96,7 +96,7 @@ pub fn create_socket_pair() -> KResult<(usize, usize)> {
             let mut sock1 = SOCKETS[idx1].lock();
             sock1.ref_count = 0;
             sock1.state = SocketState::Closed;
-            return Err(KernelError::ENOBUFS);
+            return Err(KernelError::NoBufs);
         }
     };
 
@@ -117,18 +117,18 @@ pub fn create_socket_pair() -> KResult<(usize, usize)> {
     }
 
     Ok((idx1, idx2))
-}
+} */
 
 pub fn read_socket(index: usize, buffer: &mut [u8]) -> KResult<usize> {
     if index >= MAX_SOCKETS {
-        pr_warn!("read_socket: invalid socket index {}\n", index);
-        return Err(KernelError::EINVAL);
+        pr_warn!("read_socket: invalid socket index {}", index);
+        return Err(KernelError::Inval);
     }
 
     let mut sock = SOCKETS[index].lock();
     if sock.ref_count == 0 || sock.state == SocketState::Closed {
-        pr_warn!("read_socket: socket {} is not open\n", index);
-        return Err(KernelError::EBADF);
+        pr_warn!("read_socket: socket {} is not open", index);
+        return Err(KernelError::BadF);
     }
 
     if buffer.is_empty() {
@@ -149,13 +149,13 @@ pub fn read_socket(index: usize, buffer: &mut [u8]) -> KResult<usize> {
 
 pub fn write_socket(index: usize, buffer: &[u8]) -> KResult<usize> {
     pr_debug!(
-        "write_socket: writing {} bytes to socket {}\n",
+        "write_socket: writing {} bytes to socket {}",
         buffer.len(),
         index
     );
     if index >= MAX_SOCKETS {
-        pr_warn!("write_socket: invalid socket index {}\n", index);
-        return Err(KernelError::EINVAL);
+        pr_warn!("write_socket: invalid socket index {}", index);
+        return Err(KernelError::Inval);
     }
 
     if buffer.is_empty() {
@@ -171,26 +171,26 @@ pub fn write_socket(index: usize, buffer: &[u8]) -> KResult<usize> {
     };
 
     if !is_open {
-        pr_warn!("write_socket: socket {} is not open\n", index);
-        return Err(KernelError::EBADF);
+        pr_warn!("write_socket: socket {} is not open", index);
+        return Err(KernelError::BadF);
     }
 
     let target_idx = match peer_idx {
         Some(idx) => idx,
         None => {
-            pr_warn!("write_socket: socket {} is not connected\n", index);
-            return Err(KernelError::EPIPE);
+            pr_warn!("write_socket: socket {} is not connected", index);
+            return Err(KernelError::Pipe);
         }
     };
 
     if target_idx >= MAX_SOCKETS {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let mut peer_sock = SOCKETS[target_idx].lock();
     if peer_sock.ref_count == 0 || peer_sock.state == SocketState::Closed {
-        pr_warn!("write_socket: peer socket {} is closed\n", target_idx);
-        return Err(KernelError::EPIPE);
+        pr_warn!("write_socket: peer socket {} is closed", target_idx);
+        return Err(KernelError::Pipe);
     }
 
     let mut bytes_written = 0;
@@ -209,7 +209,7 @@ pub fn write_socket(index: usize, buffer: &[u8]) -> KResult<usize> {
     }
 
     if bytes_written == 0 {
-        return Err(KernelError::ENOBUFS);
+        return Err(KernelError::NoBufs);
     }
 
     Ok(bytes_written)
@@ -217,7 +217,7 @@ pub fn write_socket(index: usize, buffer: &[u8]) -> KResult<usize> {
 
 pub fn close_socket(index: usize) {
     if index >= MAX_SOCKETS {
-        pr_warn!("close_socket: invalid socket index {}\n", index);
+        pr_warn!("close_socket: invalid socket index {}", index);
         return;
     }
 
@@ -244,13 +244,13 @@ pub fn close_socket(index: usize) {
     };
 
     // If we severed the connection to a separate peer, inform the peer
-    if let Some(p_idx) = peer_to_notify {
-        if p_idx < MAX_SOCKETS {
-            let mut peer = SOCKETS[p_idx].lock();
-            peer.peer_index = None;
-            if peer.state == SocketState::Connected {
-                peer.state = SocketState::Disconnected;
-            }
+    if let Some(p_idx) = peer_to_notify
+        && p_idx < MAX_SOCKETS
+    {
+        let mut peer = SOCKETS[p_idx].lock();
+        peer.peer_index = None;
+        if peer.state == SocketState::Connected {
+            peer.state = SocketState::Disconnected;
         }
     }
 }

@@ -15,3 +15,6 @@ panic = "abort"
 [[bin]]
 name = "sh"
 path = "src/main.rs"
+
+[dependencies]
+kfs-abi = { path = "../abi" }

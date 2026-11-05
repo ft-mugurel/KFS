@@ -42,12 +42,12 @@ qemu_cmd = [
     "-nographic",
     "-monitor", f"unix:{SOCK_PATH},server,nowait",
     "-serial", f"file:{LOG_PATH}",
-    "-smp", "8",
+    "-smp", "16",
     "-no-reboot",
     "-accel", "kvm",
 ]
 
-print("[TEST] Launching QEMU with 8 SMP cores...")
+print("[TEST] Launching QEMU with 16 SMP cores...")
 proc = subprocess.Popen(qemu_cmd)
 
 def wait_for_pattern(pattern, timeout=25):
@@ -155,6 +155,8 @@ try:
     send_string("chaos probe\n")
     ok, log = wait_for_new_pattern("Diagnostic probes complete", offset, timeout=15)
     assert ok, f"FAILED: Diagnostic probes did not complete within timeout!\nTail:\n{log[-1000:]}"
+    for bug in ("DETECTED BUG #6", "DETECTED BUG #7"):
+        assert bug not in log, f"FAILED: {bug} reported!\nTail:\n{log[-1000:]}"
     print("[✓] Diagnostic probes executed. Detected unnoticed kernel issues reported.")
 
     print("4b. Launching concurrent chaotic limit-test simulation (4 workers across SMP cores)...")
@@ -164,7 +166,7 @@ try:
     print("   - Waiting for swarm startup...")
     ok, log = wait_for_new_pattern("[CHAOS] Successfully spawned", offset, timeout=20)
     assert ok, f"FAILED: Worker swarm did not start!\nTail:\n{log[-1000:]}"
-    print("   - Swarm spawned across 8 SMP cores.")
+    print("   - Swarm spawned across 16 SMP cores.")
 
     print("   - Workers executing chaotic actions in parallel (I/O, memory, paging, syscalls)...")
     ok, log = wait_for_new_pattern("[CHAOS] Simulation complete: SUCCESS", offset, timeout=40)

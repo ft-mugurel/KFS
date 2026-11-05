@@ -1,12 +1,11 @@
+use crate::locks::Spinlock;
+
 use super::print;
-use super::{
-    cursor, Color, ColorCode, ScreenCursor, ScreenFormatter, VirtualScreen,
-};
+use super::{Color, ColorCode, ScreenCursor, ScreenFormatter, VirtualScreen, cursor};
 use super::{
     SCREEN_CONTENT_HEIGHT, SCROLLBACK_LINES, VGA_BUFFER, VGA_HEIGHT, VGA_WIDTH,
     VIRTUAL_SCREENS_COUNT,
 };
-use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,8 +17,23 @@ impl Write for ScreenFormatter<'_> {
 }
 
 impl VirtualScreen {
+    const fn new() -> Self {
+        Self {
+            index: 0,
+            buffer: [0; VGA_WIDTH * SCROLLBACK_LINES],
+            cursor: ScreenCursor { x: 0, y: 0 },
+            cursor_visible: false,
+            used_lines: 1,
+            viewport: 0,
+            accepts_input: false,
+            color: ColorCode::new(Color::LightGray, Color::Black),
+            esc_seq_color: None,
+            active: false,
+        }
+    }
+
     pub fn set_color(&mut self, color: ColorCode) {
-        self.color = color.clone();
+        self.color = color;
     }
 
     pub fn set_esc_seq_color(&mut self, color: ColorCode) {
@@ -27,13 +41,13 @@ impl VirtualScreen {
     }
 
     pub fn set_esc_seq_color_background(&mut self, color: Color) {
-        let mut color_code = self.esc_seq_color.unwrap_or(self.color.clone());
+        let mut color_code = self.esc_seq_color.unwrap_or(self.color);
         color_code.set_background(color);
         self.set_esc_seq_color(color_code);
     }
 
     pub fn set_esc_seq_color_foreground(&mut self, color: Color) {
-        let mut color_code = self.esc_seq_color.unwrap_or(self.color.clone());
+        let mut color_code = self.esc_seq_color.unwrap_or(self.color);
         color_code.set_foreground(color);
         self.set_esc_seq_color(color_code);
     }
@@ -61,30 +75,9 @@ impl VirtualScreen {
     }
 }
 
-struct VirtualScreenCell(UnsafeCell<[VirtualScreen; VIRTUAL_SCREENS_COUNT]>);
+static VIRTUAL_SCREENS: [Spinlock<VirtualScreen>; VIRTUAL_SCREENS_COUNT] =
+    [const { Spinlock::new(VirtualScreen::new()) }; VIRTUAL_SCREENS_COUNT];
 
-impl VirtualScreenCell {
-    const fn new() -> Self {
-        Self(UnsafeCell::new(
-            [VirtualScreen {
-                index: 0,
-                buffer: [0; VGA_WIDTH * SCROLLBACK_LINES],
-                cursor: ScreenCursor { x: 0, y: 0 },
-                cursor_visible: false,
-                used_lines: 1,
-                viewport: 0,
-                accepts_input: false,
-                color: ColorCode::new(Color::LightGray, Color::Black),
-                esc_seq_color: None,
-                active: false,
-            }; VIRTUAL_SCREENS_COUNT],
-        ))
-    }
-}
-
-unsafe impl Sync for VirtualScreenCell {}
-
-static VIRTUAL_SCREENS: VirtualScreenCell = VirtualScreenCell::new();
 static ACTIVE_SCREEN_IDX: AtomicUsize = AtomicUsize::new(0);
 
 pub fn with_screen_mut<R>(
@@ -95,8 +88,7 @@ pub fn with_screen_mut<R>(
         return None;
     }
 
-    let screens = unsafe { &mut *VIRTUAL_SCREENS.0.get() };
-    Some(f(&mut screens[screen_index]))
+    Some(f(&mut VIRTUAL_SCREENS[screen_index].lock()))
 }
 
 pub fn active_screen_index() -> usize {
@@ -111,7 +103,7 @@ pub fn with_active_screen_mut<R>(f: impl FnOnce(&mut VirtualScreen) -> R) -> Opt
 fn write_vga_cell(row: usize, column: usize, value: u16) {
     unsafe {
         VGA_BUFFER
-            .offset(cell_index(row, column) as isize)
+            .add(cell_index(row, column))
             .write_volatile(value);
     }
 }

@@ -1,8 +1,11 @@
-use crate::io::{parse_dec, parse_hex, print_dec, print_str, read_line_raw};
+use crate::io::{
+    parse_dec, parse_hex, print_bytes, print_dec, print_dec_width, print_str, read_line_raw,
+};
 use crate::syscall::{
-    sys_chdir, sys_close, sys_debug, sys_debug4, sys_fork, sys_getcwd, sys_getdents, sys_getuid,
-    sys_getusername, sys_kill, sys_login, sys_mknod, sys_open, sys_read, sys_wait, sys_write,
-    DebugOp, LinuxDirent, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    DebugOp, LinuxDirent, O_CREAT, O_TRUNC, O_WRONLY, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
+    S_IFMT, S_IFSOCK, Stat, sys_chdir, sys_close, sys_debug, sys_debug4, sys_fork, sys_getcwd,
+    sys_getdents, sys_getuid, sys_getusername, sys_kill, sys_login, sys_lstat, sys_mknod,
+    sys_nanosleep, sys_open, sys_read, sys_readlink, sys_unlink, sys_wait, sys_write,
 };
 
 pub const MAX_INPUT_LEN: usize = 256;
@@ -32,10 +35,13 @@ pub const COMMANDS: &[&str] = &[
     "memtest",
     "mkdir",
     "passwd",
+    "print_errors",
     "ps",
     "pte",
     "pwd",
+    "readlink",
     "reboot",
+    "rm",
     "screen",
     "shutdown",
     "spawn",
@@ -83,11 +89,11 @@ impl History {
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(MAX_INPUT_LEN);
-            if let Ok(last_str) = core::str::from_utf8(&self.entries[last_idx][..last_len]) {
-                if last_str == trimmed {
-                    self.offset = 0;
-                    return;
-                }
+            if let Ok(last_str) = core::str::from_utf8(&self.entries[last_idx][..last_len])
+                && last_str == trimmed
+            {
+                self.offset = 0;
+                return;
             }
         }
 
@@ -130,6 +136,34 @@ pub fn longest_common_prefix(partial: &str) -> (&'static str, usize) {
     (&first[..prefix_len], count)
 }
 
+fn echo_to_file(text: &str, path: &str) {
+    let mut null_path = [0u8; 128];
+    if path.is_empty() || path.len() >= null_path.len() {
+        print_str("Usage: echo <text> > <path>\n");
+        return;
+    }
+    null_path[..path.len()].copy_from_slice(path.as_bytes());
+    let fd = sys_open(
+        &null_path[..=path.len()],
+        O_WRONLY | O_CREAT | O_TRUNC,
+        0o644,
+    );
+    if fd < 0 {
+        print_str("echo: cannot open ");
+        print_str(path);
+        print_str("\n");
+        return;
+    }
+    let mut line = [0u8; MAX_INPUT_LEN + 1];
+    let len = text.len().min(MAX_INPUT_LEN);
+    line[..len].copy_from_slice(&text.as_bytes()[..len]);
+    line[len] = b'\n';
+    if sys_write(fd as usize, &line[..=len]) < 0 {
+        print_str("echo: write failed\n");
+    }
+    sys_close(fd as usize);
+}
+
 fn dump_file(path: &str) {
     let mut null_term_path = [0u8; 128];
     if path.len() >= null_term_path.len() {
@@ -159,14 +193,220 @@ fn dump_file(path: &str) {
     sys_close(fd);
 }
 
+const LS_PATH_MAX: usize = 128;
+const NAME_MAX: usize = 256;
+
+fn mode_string(mode: u32) -> [u8; 10] {
+    let mut out = *b"----------";
+    out[0] = match mode & S_IFMT {
+        S_IFDIR => b'd',
+        S_IFLNK => b'l',
+        S_IFCHR => b'c',
+        S_IFBLK => b'b',
+        S_IFIFO => b'p',
+        S_IFSOCK => b's',
+        _ => b'-',
+    };
+    for i in 0..9 {
+        if mode & (0o400 >> i) != 0 {
+            out[i + 1] = b"rwx"[i % 3];
+        }
+    }
+    // setuid, setgid and sticky share a column with the execute bit.
+    for (bit, column, letter) in [(0o4000, 3, b's'), (0o2000, 6, b's'), (0o1000, 9, b't')] {
+        if mode & bit != 0 {
+            let executable = out[column] == b'x';
+            out[column] = if executable { letter } else { letter.to_ascii_uppercase() };
+        }
+    }
+    out
+}
+
+/// Reads as much of /etc/passwd as fits in `buf`; a cut-off last line only
+/// means that user shows up as a number.
+fn read_passwd(buf: &mut [u8]) -> usize {
+    let fd = sys_open(b"/etc/passwd\0", 0, 0);
+    if fd < 0 {
+        return 0;
+    }
+    let fd = fd as usize;
+    let mut len = 0;
+    while len < buf.len() {
+        let n = sys_read(fd, &mut buf[len..]);
+        if n <= 0 {
+            break;
+        }
+        len += n as usize;
+    }
+    sys_close(fd);
+    len
+}
+
+fn owner_name(passwd: &[u8], uid: u32) -> Option<&str> {
+    core::str::from_utf8(passwd).ok()?.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let id = fields.nth(1)?;
+        (id.parse() == Ok(uid)).then_some(name)
+    })
+}
+
+/// One `ls -l` line. `path` is NUL terminated and locates the entry, `name`
+/// is what gets displayed.
+fn print_long_entry(path: &[u8], name: &str, stat: &Stat, passwd: &[u8]) {
+    print_bytes(&mode_string(stat.st_mode));
+    print_dec_width(stat.st_nlink as usize, 3);
+    print_str(" ");
+    match owner_name(passwd, stat.st_uid) {
+        Some(owner) => {
+            print_str(owner);
+            for _ in owner.len()..8 {
+                print_str(" ");
+            }
+        }
+        None => print_dec_width(stat.st_uid as usize, 8),
+    }
+    print_dec_width(stat.st_gid as usize, 5);
+    print_dec_width(stat.st_size as usize, 9);
+    print_str(" ");
+    print_str(name);
+    if stat.st_mode & S_IFMT == S_IFLNK {
+        let mut target = [0u8; NAME_MAX];
+        let len = sys_readlink(path, &mut target);
+        if len > 0 {
+            print_str(" -> ");
+            print_bytes(&target[..len as usize]);
+        }
+    }
+    print_str("\n");
+}
+
+fn print_ls_access_error(path: &str) {
+    print_str("ls: cannot access '");
+    print_str(path);
+    print_str("'\n");
+}
+
+fn command_ls<'a>(first: &'a str, rest: impl Iterator<Item = &'a str>) {
+    let mut long = false;
+    let mut path = "";
+    for arg in core::iter::once(first).chain(rest) {
+        if arg == "-l" {
+            long = true;
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            print_str("ls: invalid option '");
+            print_str(arg);
+            print_str("'\n");
+            return;
+        } else if path.is_empty() {
+            path = arg;
+        }
+    }
+    if path.is_empty() {
+        path = ".";
+    }
+
+    let mut null_path = [0u8; LS_PATH_MAX];
+    if path.len() >= null_path.len() {
+        print_str("ls: path too long\n");
+        return;
+    }
+    null_path[..path.len()].copy_from_slice(path.as_bytes());
+    let null_path = &null_path[..=path.len()];
+
+    let mut passwd = [0u8; 1024];
+    let passwd_len = if long { read_passwd(&mut passwd) } else { 0 };
+    let passwd = &passwd[..passwd_len];
+
+    if long {
+        let mut stat = Stat::default();
+        if sys_lstat(null_path, &mut stat) < 0 {
+            print_ls_access_error(path);
+            return;
+        }
+        if stat.st_mode & S_IFMT != S_IFDIR {
+            print_long_entry(null_path, path, &stat, passwd);
+            return;
+        }
+    }
+
+    let fd = sys_open(null_path, 0, 0);
+    if fd < 0 {
+        print_ls_access_error(path);
+        return;
+    }
+    let fd = fd as usize;
+
+    // "<path>/<name>\0", the path of the entry being listed.
+    let mut entry_path = [0u8; LS_PATH_MAX + 1 + NAME_MAX + 1];
+    entry_path[..path.len()].copy_from_slice(path.as_bytes());
+    entry_path[path.len()] = b'/';
+    let name_start = path.len() + 1;
+
+    let mut buf = [0u8; 512];
+    loop {
+        let n = sys_getdents(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        let mut offset = 0;
+        while offset < n as usize {
+            let dirent = unsafe { &*(buf.as_ptr().add(offset) as *const LinuxDirent) };
+            let reclen = dirent.d_reclen as usize;
+            if reclen == 0 || offset + reclen > n as usize {
+                break;
+            }
+            let name_ptr = unsafe { buf.as_ptr().add(offset + 10) };
+            let max_name_len = reclen - 10;
+            let mut name_len = 0;
+            while name_len < max_name_len && unsafe { *name_ptr.add(name_len) } != 0 {
+                name_len += 1;
+            }
+            if let Ok(name_str) =
+                core::str::from_utf8(unsafe { core::slice::from_raw_parts(name_ptr, name_len) })
+            {
+                if long {
+                    let name_end = name_start + name_str.len();
+                    entry_path[name_start..name_end].copy_from_slice(name_str.as_bytes());
+                    entry_path[name_end] = 0;
+                    let entry = &entry_path[..=name_end];
+                    let mut stat = Stat::default();
+                    if sys_lstat(entry, &mut stat) < 0 {
+                        print_ls_access_error(name_str);
+                    } else {
+                        print_long_entry(entry, name_str, &stat, passwd);
+                    }
+                } else {
+                    print_str(name_str);
+                    print_str("  ");
+                }
+            }
+            offset += reclen;
+        }
+    }
+    if !long {
+        print_str("\n");
+    }
+    sys_close(fd);
+}
+
 fn print_help() {
     print_str("Available commands:\n");
-    print_str("  help, clear, echo, pwd, cd, ls, cat, touch, truncate, mkdir, whoami\n");
+    print_str("File and shell commands:\n");
+    print_str("  help, clear, echo, pwd, cd, ls [-l], cat, touch, truncate, mkdir, rm, whoami\n");
+    print_str("  readlink <path>, echo <text> > <path>\n");
+    print_str("User management:\n");
     print_str("  login, logout, su, useradd, userdel, passwd, users\n");
+    print_str("Process management:\n");
     print_str("  ps, spawn, wait, kill <pid>, chaos [procs] [rounds]\n");
-    print_str("  memstat, memdebug, initcalls, sysinfo, dmesg [-c], klog [msg|console on/off/status]\n");
-    print_str("  memdump <hex_addr>, pte <hex_addr>, memtest, stack [words]\n");
-    print_str("  layout, crash, loglevel <0-7>, color <0-15>, screen <1-6>\n");
+    print_str("Kernel and diagnostics:\n");
+    print_str("  memstat, memdebug, initcalls, sysinfo, dmesg [-c], print_errors\n");
+    print_str("  klog [msg|console on/off/status], memdump <hex_addr>, pte <hex_addr>\n");
+    print_str("Testing and debugging:\n");
+    print_str("  memtest, stack [words], layout, crash\n");
+    print_str("Display and logging:\n");
+    print_str("  loglevel <0-7>, color <0-15>, screen <1-6>\n");
+    print_str("System control:\n");
     print_str("  reboot, shutdown, exit\n");
 }
 
@@ -188,6 +428,9 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
         "help" => print_help(),
         "clear" => {
             print_str("\x1b[2J\x1b[H");
+        }
+        "print_errors" => {
+            sys_debug(DebugOp::PrintErrors, 0, 0);
         }
         "klog" => {
             let rest = trimmed.strip_prefix("klog").unwrap_or("").trim_start();
@@ -219,8 +462,30 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
         }
         "echo" => {
             let rest = trimmed.strip_prefix("echo").unwrap_or("").trim_start();
-            print_str(rest);
-            print_str("\n");
+            match rest.rsplit_once('>') {
+                Some((text, path)) => echo_to_file(text.trim_end(), path.trim()),
+                None => {
+                    print_str(rest);
+                    print_str("\n");
+                }
+            }
+        }
+        "readlink" => {
+            let mut null_path = [0u8; 128];
+            if arg.is_empty() || arg.len() >= null_path.len() {
+                print_str("Usage: readlink <path>\n");
+            } else {
+                null_path[..arg.len()].copy_from_slice(arg.as_bytes());
+                let mut target = [0u8; 256];
+                let len = sys_readlink(&null_path[..=arg.len()], &mut target);
+                match core::str::from_utf8(&target[..len.max(0) as usize]) {
+                    Ok(target) if len > 0 => {
+                        print_str(target);
+                        print_str("\n");
+                    }
+                    _ => print_str("readlink: not a readable symbolic link\n"),
+                }
+            }
         }
         "pwd" => {
             let mut buf = [0u8; 128];
@@ -248,54 +513,7 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                 }
             }
         }
-        "ls" => {
-            let path = if arg.is_empty() { "." } else { arg };
-            let mut null_path = [0u8; 128];
-            if path.len() >= null_path.len() {
-                print_str("ls: path too long\n");
-            } else {
-                null_path[..path.len()].copy_from_slice(path.as_bytes());
-                null_path[path.len()] = 0;
-                let fd = sys_open(&null_path[..=path.len()], 0, 0);
-                if fd < 0 {
-                    print_str("ls: cannot access '");
-                    print_str(path);
-                    print_str("'\n");
-                } else {
-                    let fd = fd as usize;
-                    let mut buf = [0u8; 512];
-                    loop {
-                        let n = sys_getdents(fd, &mut buf);
-                        if n <= 0 {
-                            break;
-                        }
-                        let mut offset = 0;
-                        while offset < n as usize {
-                            let dirent = unsafe { &*(buf.as_ptr().add(offset) as *const LinuxDirent) };
-                            let reclen = dirent.d_reclen as usize;
-                            if reclen == 0 || offset + reclen > n as usize {
-                                break;
-                            }
-                            let name_ptr = unsafe { buf.as_ptr().add(offset + 10) };
-                            let max_name_len = reclen - 10;
-                            let mut name_len = 0;
-                            while name_len < max_name_len && unsafe { *name_ptr.add(name_len) } != 0 {
-                                name_len += 1;
-                            }
-                            if let Ok(name_str) = core::str::from_utf8(unsafe {
-                                core::slice::from_raw_parts(name_ptr, name_len)
-                            }) {
-                                print_str(name_str);
-                                print_str("  ");
-                            }
-                            offset += reclen;
-                        }
-                    }
-                    print_str("\n");
-                    sys_close(fd);
-                }
-            }
-        }
+        "ls" => command_ls(arg, parts),
         "cat" => {
             if arg.is_empty() {
                 print_str("Usage: cat <path>\n");
@@ -325,7 +543,10 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
         "truncate" => {
             let mut no_create = false;
             let mut target_path = "";
-            let mut iter = trimmed.strip_prefix("truncate").unwrap_or("").split_whitespace();
+            let mut iter = trimmed
+                .strip_prefix("truncate")
+                .unwrap_or("")
+                .split_whitespace();
             let mut size_unsupported = false;
 
             while let Some(tok) = iter.next() {
@@ -386,6 +607,22 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                 }
             }
         }
+        "rm" => {
+            if arg.is_empty() {
+                print_str("Usage: rm <path>\n");
+            } else {
+                let mut null_path = [0u8; 128];
+                if arg.len() >= null_path.len() {
+                    print_str("rm: path too long\n");
+                } else {
+                    null_path[..arg.len()].copy_from_slice(arg.as_bytes());
+                    null_path[arg.len()] = 0;
+                    if sys_unlink(&null_path[..=arg.len()]) < 0 {
+                        print_str("rm: failed to remove file\n");
+                    }
+                }
+            }
+        }
         "whoami" => {
             let mut name_buf = [0u8; 64];
             let ret = sys_getusername(&mut name_buf);
@@ -416,12 +653,17 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
         "su" => {
             let target = if arg.is_empty() { "root" } else { arg };
             let uid = sys_getuid();
-            if uid == 0 {
-                if target != "root" {
-                    if sys_debug4(DebugOp::Su, target.as_ptr() as u32, target.len() as u32, 0, 0) < 0 {
-                        print_str("user not found\n");
-                    }
-                }
+            if uid == 0
+                && target != "root"
+                && sys_debug4(
+                    DebugOp::Su,
+                    target.as_ptr() as u32,
+                    target.len() as u32,
+                    0,
+                    0,
+                ) < 0
+            {
+                print_str("user not found\n");
             } else {
                 let mut pass_buf = [0u8; 64];
                 let plen = read_line_raw("Password: ", &mut pass_buf, true, history);
@@ -433,6 +675,13 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
         }
         "users" => {
             sys_debug(DebugOp::Users, 0, 0);
+        }
+        "sleep" => {
+            if arg.is_empty() {
+                print_str("usage: sleep <seconds>\n");
+            } else {
+                sys_nanosleep(parse_dec(arg).unwrap_or(1) as u32);
+            }
         }
         "useradd" => {
             if arg.is_empty() {
@@ -449,7 +698,8 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                     arg.len() as u32,
                     password.as_ptr() as u32,
                     password.len() as u32,
-                ) == 0 {
+                ) == 0
+                {
                     print_str("User updated/added\n");
                 } else {
                     print_str("User creation failed\n");
@@ -461,11 +711,7 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                 print_str("usage: userdel <name>\n");
             } else if sys_getuid() != 0 {
                 print_str("permission denied\n");
-            } else if sys_debug(
-                DebugOp::UserDel,
-                arg.as_ptr() as u32,
-                arg.len() as u32,
-            ) == 0 {
+            } else if sys_debug(DebugOp::UserDel, arg.as_ptr() as u32, arg.len() as u32) == 0 {
                 print_str("User deleted\n");
             } else {
                 print_str("User deletion failed\n");
@@ -492,7 +738,8 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                     target.len() as u32,
                     password.as_ptr() as u32,
                     password.len() as u32,
-                ) == 0 {
+                ) == 0
+                {
                     print_str("User updated/added\n");
                 } else {
                     print_str("User creation failed\n");
@@ -538,24 +785,24 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
                 print_str("Usage: kill <pid>\n");
             }
         }
-        "memstat" => dump_file("/sys/kernel/memory/stat"),
-        "memdebug" => dump_file("/sys/kernel/memory/debug"),
-        "initcalls" => dump_file("/sys/kernel/system/initcalls"),
-        "sysinfo" => dump_file("/sys/kernel/system/info"),
+        "memstat" => dump_file("/sys/kernel/debug/memstat"),
+        "memdebug" => dump_file("/sys/kernel/debug/memdebug"),
+        "initcalls" => dump_file("/sys/kernel/debug/initcalls"),
+        "sysinfo" => dump_file("/sys/kernel/debug/sysinfo"),
         "dmesg" => {
             let clear = if arg == "-c" { 1 } else { 0 };
             sys_debug(DebugOp::Dmesg, clear, 0);
         }
         "memdump" => {
             let addr = parse_hex(arg).unwrap_or(0xC010_0000);
-            sys_debug(DebugOp::Memdump, addr, 64);
+            sys_debug(DebugOp::MemDump, addr, 64);
         }
         "pte" => {
             let addr = parse_hex(arg).unwrap_or(0xC010_0000);
             sys_debug(DebugOp::Pte, addr, 0);
         }
         "memtest" => {
-            sys_debug(DebugOp::Memtest, 0, 0);
+            sys_debug(DebugOp::MemTest, 0, 0);
         }
         "stack" => {
             let words = parse_dec(arg).unwrap_or(16) as u32;
@@ -573,7 +820,7 @@ pub fn execute_command(line: &str, history: &mut History) -> bool {
         }
         "loglevel" => {
             let lvl = parse_dec(arg).unwrap_or(7) as u32;
-            sys_debug(DebugOp::Loglevel, lvl, 0);
+            sys_debug(DebugOp::LogLevel, lvl, 0);
         }
         "color" => {
             let col = parse_dec(arg).unwrap_or(15) as u32;
@@ -611,13 +858,13 @@ pub fn run_shell(_user: &str, history: &mut History) {
 
     loop {
         let len = read_line_raw("mysh > ", &mut line_buffer, false, history);
-        if len > 0 {
-            if let Ok(line_str) = core::str::from_utf8(&line_buffer[..len]) {
-                history.add(line_str);
-                let keep_running = execute_command(line_str, history);
-                if !keep_running {
-                    break;
-                }
+        if len > 0
+            && let Ok(line_str) = core::str::from_utf8(&line_buffer[..len])
+        {
+            history.add(line_str);
+            let keep_running = execute_command(line_str, history);
+            if !keep_running {
+                break;
             }
         }
     }

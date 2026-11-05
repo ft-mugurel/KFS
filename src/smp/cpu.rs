@@ -18,19 +18,12 @@ pub fn register_cpu(cpu_id: usize, apic_id: u8) {
     CPU_TABLE.count.fetch_add(1, Ordering::SeqCst);
 }
 
-#[allow(dead_code)]
 pub fn cpu_count() -> usize {
     CPU_TABLE.count.load(Ordering::SeqCst)
 }
 
-#[allow(dead_code)]
 pub fn mark_online(cpu_id: usize) {
     CPU_TABLE.online[cpu_id].store(true, Ordering::SeqCst);
-}
-
-#[allow(dead_code)]
-pub fn mark_offline(cpu_id: usize) {
-    CPU_TABLE.online[cpu_id].store(false, Ordering::SeqCst);
 }
 
 pub fn is_online(cpu_id: usize) -> bool {
@@ -41,7 +34,20 @@ pub fn online_count() -> usize {
     (0..MAX_CPUS).filter(|&i| is_online(i)).count()
 }
 
-#[allow(dead_code)]
 pub fn apic_id_of(cpu_id: usize) -> u8 {
     CPU_TABLE.apic_id[cpu_id].load(Ordering::SeqCst)
+}
+
+static IDENTITY_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Called by each AP as it comes up: its LAPIC and its ThreadInfo must both
+/// agree with the cpu_id it was started as.
+pub fn verify_identity(cpu_id: usize, lapic_id: u8, thread_cpu: usize) {
+    if apic_id_of(cpu_id) != lapic_id || thread_cpu != cpu_id {
+        IDENTITY_MISMATCHES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub fn identity_mismatches() -> usize {
+    IDENTITY_MISMATCHES.load(Ordering::SeqCst)
 }

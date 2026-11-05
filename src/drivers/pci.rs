@@ -1,14 +1,29 @@
-use crate::error::KResult;
-use crate::pr_info;
-use crate::x86::{inl, outl};
+use crate::{
+    error::KResult,
+    locks::Spinlock,
+    pr_info, pr_warn,
+    x86::{inl, outl},
+};
 
-use super::{block_device, ide, BlockDevice, SECTOR_SIZE};
+use super::{
+    BlockDevice, SECTOR_SIZE,
+    block_device::{self, DiskKind},
+    ide,
+};
 
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 const PCI_CLASS_STORAGE: u8 = 0x01;
+const PCI_SUBCLASS_SCSI: u8 = 0x00;
 const PCI_SUBCLASS_IDE: u8 = 0x01;
+const PCI_SUBCLASS_SATA: u8 = 0x06;
+
+const PCI_VENDOR_VIRTIO: u16 = 0x1AF4;
+const PCI_DEVICE_VIRTIO_BLK_LEGACY: u16 = 0x1001;
+const PCI_DEVICE_VIRTIO_BLK: u16 = 0x1042;
+
+static PCI_CONFIG_LOCK: Spinlock<()> = Spinlock::new(());
 
 fn pci_config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     (1 << 31)
@@ -19,11 +34,14 @@ fn pci_config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 }
 
 fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    outl(
-        PCI_CONFIG_ADDRESS,
-        pci_config_address(bus, device, function, offset),
-    );
-    inl(PCI_CONFIG_DATA)
+    let _guard = PCI_CONFIG_LOCK.lock();
+    unsafe {
+        outl(
+            PCI_CONFIG_ADDRESS,
+            pci_config_address(bus, device, function, offset),
+        );
+        inl(PCI_CONFIG_DATA)
+    }
 }
 
 fn read_vendor_id(bus: u8, device: u8, function: u8) -> u16 {
@@ -42,21 +60,41 @@ fn read_bar(bus: u8, device: u8, function: u8, index: u8) -> u16 {
     (read_config_dword(bus, device, function, 0x10 + index * 4) & 0xFFFC) as u16
 }
 
-fn register_ide_drive(io_base: u16, control_base: u16, drive: u8, name_index: u8) -> KResult<bool> {
-    let Some(sector_count) = ide::identify(io_base, control_base, drive) else {
+fn detect_disk_kind(bus: u8, device: u8, function: u8) -> Option<DiskKind> {
+    let id = read_config_dword(bus, device, function, 0x00);
+    let (vendor_id, device_id) = (id as u16, (id >> 16) as u16);
+    // Legacy virtio-blk reports the SCSI class, so match it by ID first.
+    if vendor_id == PCI_VENDOR_VIRTIO
+        && matches!(
+            device_id,
+            PCI_DEVICE_VIRTIO_BLK_LEGACY | PCI_DEVICE_VIRTIO_BLK
+        )
+    {
+        return Some(DiskKind::Virtio);
+    }
+
+    let (class_code, subclass, _) = read_class_info(bus, device, function);
+    match (class_code, subclass) {
+        (PCI_CLASS_STORAGE, PCI_SUBCLASS_IDE) => Some(DiskKind::Ide),
+        (PCI_CLASS_STORAGE, PCI_SUBCLASS_SCSI | PCI_SUBCLASS_SATA) => Some(DiskKind::Scsi),
+        _ => None,
+    }
+}
+
+unsafe fn register_ide_drive(io_base: u16, control_base: u16, drive: u8) -> KResult<bool> {
+    let Some((sector_count, kind)) = (unsafe { ide::identify(io_base, control_base, drive) })
+    else {
         return Ok(false);
     };
 
-    let mut name = [0u8; 32];
-    name[..3].copy_from_slice(b"ide");
-    name[3] = b'0' + name_index;
     block_device::register_block_device(BlockDevice {
-        name,
+        name: block_device::next_disk_name(kind),
         sector_size: SECTOR_SIZE,
         parent: 0,
         start_lba: 0,
         sector_count,
         partition: false,
+        kind,
         io_base,
         drive,
         read: ide::read_sectors,
@@ -75,10 +113,22 @@ pub fn scan_and_register_block_devices() -> KResult<()> {
                     continue;
                 }
 
-                let (class_code, subclass, prog_if) = read_class_info(bus, device, function);
-                if class_code != PCI_CLASS_STORAGE || subclass != PCI_SUBCLASS_IDE {
-                    continue;
+                match detect_disk_kind(bus, device, function) {
+                    Some(DiskKind::Ide) => {}
+                    Some(kind) => {
+                        pr_warn!(
+                            "PCI: {:?} controller {:02x}:{:02x}.{:x} has no driver, skipping",
+                            kind,
+                            bus,
+                            device,
+                            function
+                        );
+                        continue;
+                    }
+                    None => continue,
                 }
+
+                let (_, _, prog_if) = read_class_info(bus, device, function);
 
                 let primary_io = if prog_if & 1 != 0 {
                     read_bar(bus, device, function, 0)
@@ -106,14 +156,14 @@ pub fn scan_and_register_block_devices() -> KResult<()> {
                     (secondary_io, secondary_control),
                 ] {
                     for drive in [0xA0, 0xB0] {
-                        if register_ide_drive(io_base, control_base, drive, ide_count)? {
+                        if unsafe { register_ide_drive(io_base, control_base, drive) }? {
                             ide_count += 1;
                         }
                     }
                 }
 
                 pr_info!(
-                    "PCI: IDE controller {:02x}:{:02x}.{:x} discovered (prog_if={:02x})\n",
+                    "PCI: IDE controller {:02x}:{:02x}.{:x} discovered (prog_if={:02x})",
                     bus,
                     device,
                     function,
@@ -126,12 +176,10 @@ pub fn scan_and_register_block_devices() -> KResult<()> {
     if ide_count == 0 {
         for (io_base, control_base) in [(0x1F0, 0x3F4), (0x170, 0x374)] {
             for drive in [0xA0, 0xB0] {
-                if register_ide_drive(io_base, control_base, drive, ide_count)? {
-                    ide_count += 1;
-                }
+                unsafe { register_ide_drive(io_base, control_base, drive) }?;
             }
         }
-        pr_info!("PCI: no IDE controller discovered, falling back to legacy IDE ports\n");
+        pr_info!("PCI: no IDE controller discovered, falling back to legacy IDE ports");
     }
 
     Ok(())

@@ -1,7 +1,10 @@
 use crate::{
+    error::KResultExt,
     interrupts::register_interrupt_handler,
     paging, panic, pr_emerg, pr_err, pr_info, pr_warn,
-    sched::{self, ProcessState},
+    sched::{self, ProcessMemory},
+    syscalls,
+    utils::MemUtils,
     x86,
 };
 
@@ -106,6 +109,102 @@ pub struct ExceptionStackFrame {
     pub user_ss: u32,
 }
 
+/// Page flags for `addr`, or `None` if no region of `mem` covers it.
+fn user_region_flags(mem: &ProcessMemory, addr: u32) -> Option<u32> {
+    let flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+    // sbrk maps whole pages, so the tail of the last heap page is addressable.
+    let heap_end = mem.heap_brk.next_multiple_of(paging::PAGE_SIZE as u32);
+    let writable_regions = [
+        (mem.code_base, mem.code_size),
+        (mem.data_base, mem.data_size),
+        (mem.bss_base, mem.bss_size),
+        (mem.stack_limit, mem.stack_base - mem.stack_limit),
+        (mem.heap_base, heap_end - mem.heap_base),
+    ];
+    if writable_regions
+        .iter()
+        .any(|&region| MemUtils::region_contains(region, addr))
+    {
+        return Some(flags | paging::PAGE_WRITABLE);
+    }
+
+    let vma = mem
+        .vmas
+        .iter()
+        .find(|vma| vma.used && MemUtils::region_contains((vma.base, vma.size), addr))?;
+    if vma.flags & sched::VMA_WRITE != 0 {
+        Some(flags | paging::PAGE_WRITABLE)
+    } else {
+        Some(flags)
+    }
+}
+
+/// Gives a present, read-only page a writable frame of its own.
+fn resolve_cow_fault(vaddr: u32, flags: u32) -> bool {
+    let Some(phys) = (unsafe { paging::virt_to_phys(vaddr) }) else {
+        return false;
+    };
+    if paging::frame_ref_count(phys) <= 1 {
+        return paging::map_page(vaddr, phys, flags).is_ok();
+    }
+
+    let Ok(new_phys) = paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT) else {
+        pr_err!("OOM: Cannot copy page at {:#x}", vaddr);
+        return false;
+    };
+    let src = paging::phys_to_virt(phys) as *const u8;
+    let dst = paging::phys_to_virt(new_phys) as *mut u8;
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, paging::PAGE_SIZE) };
+    if paging::map_page(vaddr, new_phys, flags).is_err() {
+        paging::free_physical_page(new_phys).consume_err("Failed to free unused COW frame");
+        return false;
+    }
+    paging::frame_ref_dec(phys);
+    true
+}
+
+/// Handles a ring 3 page fault; `false` means the process must be killed.
+fn resolve_user_page_fault(
+    mem: &ProcessMemory,
+    pid: u32,
+    fault_addr: u32,
+    error_code: u32,
+) -> bool {
+    let present = (error_code & 0b001) != 0;
+    let write = (error_code & 0b010) != 0;
+    let aligned_vaddr = fault_addr & !0xFFF;
+
+    let Some(flags) = user_region_flags(mem, fault_addr) else {
+        pr_err!("Segmentation Fault at {:#x}", fault_addr);
+        return false;
+    };
+
+    if !present {
+        // map_zero_page already cleared the frame.
+        return match paging::map_zero_page(aligned_vaddr, flags) {
+            Ok(()) => {
+                pr_info!(
+                    "Demand paging: Mapped page for PID {} at {:#x}",
+                    pid,
+                    aligned_vaddr
+                );
+                true
+            }
+            Err(e) => {
+                pr_err!("OOM: Cannot demand page PID {}: {:?}", pid, e);
+                false
+            }
+        };
+    }
+
+    if write && (flags & paging::PAGE_WRITABLE) != 0 {
+        return resolve_cow_fault(aligned_vaddr, flags);
+    }
+
+    pr_err!("Protection fault at {:#x}", fault_addr);
+    false
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const ExceptionStackFrame) {
     let idx = vector as usize;
@@ -113,108 +212,30 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         .get(idx)
         .copied()
         .unwrap_or("Unknown Exception");
-    let frame = &*regs;
+    let frame = unsafe { &*regs };
     let fault_cr2 = if vector == 14 { x86::read_cr2() } else { 0 };
-    let task_opt = sched::current().as_mut();
+    let task_opt = unsafe { sched::current().as_mut() };
 
     if (frame.cs & 0x03) == 3 && task_opt.is_none() {
         pr_emerg!(
-            "User-mode exception {} (vector {}) occurred, but no current task found. Halting.\n",
+            "User-mode exception {} (vector {}) occurred, but no current task found. Halting.",
             name,
             idx
         );
     } else if (frame.cs & 0x03) == 3 {
-        let current_pid = sched::current_pid();
+        let current_pid = task_opt.as_ref().unwrap().pid;
         let idx_usize = vector as usize;
 
         let task = task_opt.unwrap();
 
-        if idx_usize == 14 {
-            let fault_addr = x86::read_cr2();
-
-            let present = (frame.error_code & 0b001) != 0;
-            let write = (frame.error_code & 0b010) != 0;
-            let user = (frame.error_code & 0b100) != 0;
-
-            if present && write && user {
-                let aligned_vaddr = fault_addr & !0xFFF;
-                if let Some(phys) = paging::virt_to_phys(aligned_vaddr) {
-                    let refcount = paging::frame_ref_count(phys);
-                    if refcount > 1 {
-                        if let Ok(new_phys) =
-                            paging::alloc_physical_page_below(paging::PAGE_TABLE_ALLOC_LIMIT)
-                        {
-                            let src = paging::phys_to_virt(phys) as *const u8;
-                            let dst = paging::phys_to_virt(new_phys) as *mut u8;
-                            core::ptr::copy_nonoverlapping(src, dst, 4096);
-                            paging::frame_ref_dec(phys);
-                            let flags =
-                                paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
-                            let _ = paging::map_page(aligned_vaddr, new_phys, flags);
-                            return;
-                        }
-                    } else if refcount == 1 {
-                        let flags =
-                            paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
-                        let _ = paging::map_page(aligned_vaddr, phys, flags);
-                        return;
-                    }
-                }
-            }
-
-            let mem = &task.memory;
-
-            let mut is_valid = false;
-            let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
-
-            if fault_addr >= mem.code_base && fault_addr < mem.code_base + mem.code_size {
-                is_valid = true;
-                flags |= paging::PAGE_WRITABLE;
-            } else if fault_addr >= mem.data_base && fault_addr < mem.data_base + mem.data_size {
-                is_valid = true;
-                flags |= paging::PAGE_WRITABLE;
-            } else if fault_addr >= mem.bss_base && fault_addr < mem.bss_base + mem.bss_size {
-                is_valid = true;
-                flags |= paging::PAGE_WRITABLE;
-            } else if fault_addr >= mem.stack_limit && fault_addr <= mem.stack_base {
-                is_valid = true;
-                flags |= paging::PAGE_WRITABLE;
-            } else if fault_addr >= mem.heap_base && fault_addr < mem.heap_brk {
-                is_valid = true;
-                flags |= paging::PAGE_WRITABLE;
-            } else {
-                for vma in &mem.vmas {
-                    if vma.used && fault_addr >= vma.base && fault_addr < vma.base + vma.size {
-                        is_valid = true;
-                        flags |= paging::PAGE_WRITABLE;
-                        break;
-                    }
-                }
-            }
-
-            if is_valid {
-                let aligned_vaddr = fault_addr & !0xFFF;
-                match paging::map_zero_page(aligned_vaddr, flags) {
-                    Ok(()) => {
-                        pr_info!(
-                            "Demand paging: Mapped page for PID {} at {:#x}\n",
-                            current_pid,
-                            aligned_vaddr
-                        );
-                        core::ptr::write_bytes(aligned_vaddr as *mut u8, 0, 4096);
-                        return;
-                    }
-                    Err(e) => {
-                        pr_err!("OOM: Cannot demand page PID {}: {:?}\n", current_pid, e);
-                    }
-                }
-            } else {
-                pr_err!("Segmentation Fault at {:#x}\n", fault_addr);
-            }
+        if idx_usize == 14
+            && resolve_user_page_fault(&task.memory, current_pid, fault_cr2, frame.error_code)
+        {
+            return;
         }
 
         pr_emerg!(
-            "[EXC] Exception #{} ({}) at EIP={:#x}, CS={:#x}, err={:#x}, cr2={:#x}, esp={:#x}\n",
+            "[EXC] Exception #{} ({}) at EIP={:#x}, CS={:#x}, err={:#x}, cr2={:#x}, esp={:#x}",
             vector,
             name,
             frame.eip,
@@ -232,17 +253,23 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         };
 
         pr_info!(
-            "PID {} killed by hardware exception {} (Signal {})\n",
+            "PID {} killed by hardware exception {} (Signal {})",
             current_pid,
             idx_usize,
             sig_num
         );
 
-        sched::set_state(task, ProcessState::Zombie);
-
-        x86::write_cr3(paging::bootstrap_directory_phys_addr());
-        let next_esp = sched::schedule(0);
-        restore_context_and_iret(next_esp);
+        // SAFETY: the parent may reap this task, freeing its address space, as
+        // soon as `terminate_current` marks it a Zombie, so switch to the
+        // kernel's own directory first (it maps all kernel code and stacks).
+        // `schedule(0)` saves no frame for a Zombie and returns the next task's
+        // saved ESP, which `restore_context_and_iret` resumes; it never returns.
+        unsafe {
+            x86::write_cr3(paging::bootstrap_directory_phys_addr());
+            syscalls::terminate_current(128 + sig_num);
+            let next_esp = sched::schedule(0);
+            restore_context_and_iret(next_esp);
+        }
     }
 
     if idx == 14 || idx == 13 {
@@ -250,28 +277,28 @@ pub unsafe extern "C" fn exception_common_handler(vector: u32, regs: *const Exce
         let write = (frame.error_code & 0b010) != 0;
         let user = (frame.error_code & 0b100) != 0;
         let fault_addr = x86::read_cr2();
-        pr_emerg!("EXCEPTION #{}: {} (cr2={:#x})\n", idx, name, fault_addr);
+        pr_emerg!("EXCEPTION #{}: {} (cr2={:#x})", idx, name, fault_addr);
         pr_emerg!(
-            "Page Fault Details: present={}, write={}, user={}\n",
+            "Page Fault Details: present={}, write={}, user={}",
             present,
             write,
             user
         );
     } else if is_non_fatal_exception(idx) {
-        pr_warn!("EXCEPTION #{}: {} (continuing)\n", idx, name);
+        pr_warn!("EXCEPTION #{}: {} (continuing)", idx, name);
         return;
     } else {
-        pr_err!("EXCEPTION #{}: {}\n", idx, name);
+        pr_err!("EXCEPTION #{}: {}", idx, name);
     }
 
-    pr_emerg!("fatal CPU exception, halting kernel\n");
+    pr_emerg!("fatal CPU exception, halting kernel");
     x86::disable_interrupts();
 
     pr_emerg!(
         "Registers:\n\
         EAX: {:#010x} EBX: {:#010x} ECX: {:#010x} EDX: {:#010x}\n\
         ESI: {:#010x} EDI: {:#010x} EBP: {:#010x} ESP: {:#010x}\n\
-        EIP: {:#010x} CS:  {:#010x} EFLAGS: {:#010x}\n",
+        EIP: {:#010x} CS:  {:#010x} EFLAGS: {:#010x}",
         frame.eax,
         frame.ebx,
         frame.ecx,

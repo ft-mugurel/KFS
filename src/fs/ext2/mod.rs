@@ -62,7 +62,6 @@ pub struct Ext2GroupDesc {
 #[derive(Clone, Copy)]
 pub struct Ext2Mount {
     pub device_id: BlockDeviceId,
-    pub mount_index: usize,
     pub sb: Ext2Superblock,
 }
 
@@ -106,6 +105,7 @@ pub const EXT2_BACKEND: FsBackend = FsBackend {
     read: read_from_inode,
     write: write_to_inode,
     truncate: truncate_inode,
-    lazy_load_directory: lazy_load_directory,
+    lazy_load_directory: lazy_load_directory_node,
     unlink: unlink_node,
+    evict: evict_inode,
 };

@@ -1,23 +1,22 @@
-use crate::{
-    error::KernelError,
-    fs::{self, VfsNodeType},
-    sched::{self, ContextFrame, MAX_FDS_PER_PROCESS},
-    security::{self, Decision, Operation},
-    utils,
-};
+use kfs_abi::{O_CREAT, O_TRUNC};
 
-const O_CREAT: u32 = 0x40;
-const O_TRUNC: u32 = 0x200;
+use super::args::{Caller, PATH_MAX, UserPtr, caller, syscall_define};
+use crate::{
+    error::{KResult, KernelError},
+    fs::{self, VfsNode, VfsNodeType},
+    sched::{self, MAX_FDS_PER_PROCESS},
+    security::{self, Decision, Operation},
+};
 
 fn split_parent_path(path: &str) -> Result<(&str, &str), KernelError> {
     if path.is_empty() || path == "/" {
-        return Err(KernelError::E2BIG);
+        return Err(KernelError::TooBig);
     }
 
     if let Some((parent, name)) = path.rsplit_once('/') {
         let parent_path = if parent.is_empty() { "/" } else { parent };
         if name.is_empty() {
-            return Err(KernelError::ETXTBSY);
+            return Err(KernelError::TxtBsy);
         }
         Ok((parent_path, name))
     } else {
@@ -25,194 +24,104 @@ fn split_parent_path(path: &str) -> Result<(&str, &str), KernelError> {
     }
 }
 
-pub unsafe fn syscall_open(regs: *mut ContextFrame) {
-    let path_ptr = (*regs).arg1() as *const u8;
-    let flags = (*regs).arg2();
-    let mode = (*regs).arg3();
-
-    let path_str = utils::c_str_to_rust(path_ptr);
-
-    let task = sched::current().as_mut().unwrap();
-    let cwd = task.cwd;
-
-    let node = match fs::resolve_path(path_str, cwd) {
-        Ok(n) => n,
-        Err(err) => {
-            if err != KernelError::ENOENT || (flags & O_CREAT) == 0 {
-                (*regs).set_return_error(err);
-                return;
-            }
-
-            let (parent_path, name) = match split_parent_path(path_str) {
-                Ok(parts) => parts,
-                Err(split_err) => {
-                    (*regs).set_return_error(split_err);
-                    return;
-                }
-            };
-
-            let parent = match fs::resolve_path(parent_path, cwd) {
-                Ok(parent_node) => parent_node,
-                Err(parent_err) => {
-                    (*regs).set_return_error(parent_err);
-                    return;
-                }
-            };
-
-            if (*parent).node_type != VfsNodeType::Directory {
-                (*regs).set_return_error(KernelError::ENOTDIR);
-                return;
-            }
-
-            if security::check(
-                &task.credentials,
-                &security::object_for_node(parent),
-                Operation::Create,
-            ) == Decision::Deny
-            {
-                (*regs).set_return_error(KernelError::EACCES);
-                return;
-            }
-
-            match fs::create_child_node(parent, name, VfsNodeType::File, (mode & 0x0FFF) as u16) {
-                Ok(new_node) => new_node,
-                Err(create_err) => {
-                    (*regs).set_return_error(create_err);
-                    return;
-                }
-            }
-        }
-    };
-
-    let requested = match flags & 0x3 {
-        0 => 0o4,
-        1 => 0o2,
-        2 => 0o6,
-        _ => {
-            (*regs).set_return_error(KernelError::EINVAL);
-            return;
-        }
-    };
-    let operation = match requested {
-        0o4 => Operation::Read,
-        0o2 => Operation::Write,
-        0o6 => Operation::ReadWrite,
-        _ => unreachable!(),
-    };
-    if security::check(
-        &task.credentials,
-        &security::object_for_node(node),
-        operation,
-    ) == Decision::Deny
-    {
-        (*regs).set_return_error(KernelError::EACCES);
-        return;
+unsafe fn create_file(path: &str, caller: &Caller, mode: u32) -> KResult<*mut VfsNode> {
+    let (parent_path, name) = split_parent_path(path)?;
+    let parent = unsafe { fs::resolve_path(parent_path, caller.cwd) }?;
+    if unsafe { (*parent).node_type } != VfsNodeType::Directory {
+        return Err(KernelError::NotDir);
     }
-
-    if (flags & O_TRUNC) != 0 {
-        if (*node).node_type == VfsNodeType::Directory {
-            (*regs).set_return_error(KernelError::EISDIR);
-            return;
-        }
-
-        if security::check(
-            &task.credentials,
-            &security::object_for_node(node),
-            Operation::Truncate,
-        ) == Decision::Deny
-        {
-            (*regs).set_return_error(KernelError::EACCES);
-            return;
-        }
-
-        if let Err(err) = (*node).truncate() {
-            (*regs).set_return_error(err);
-            return;
-        }
+    let object = unsafe { security::object_for_node(parent) };
+    if security::check(&caller.credentials, &object, Operation::Create) == Decision::Deny {
+        return Err(KernelError::Acces);
     }
-
-    let l_fd = match task.alloc_fd() {
-        Some(f) => f,
-        None => {
-            (*regs).set_return_error(KernelError::EMFILE);
-            return;
-        }
-    };
-
-    let g_fd = match fs::alloc_open_file(node, 1) {
-        Ok(g) => g,
-        Err(e) => {
-            (*regs).set_return_error(e);
-            return;
-        }
-    };
-
-    fs::vfs_ref_get(node);
-    task.fd_tbl[l_fd] = Some(g_fd);
-    (*regs).set_return_value(l_fd as u32);
+    unsafe { fs::create_child_node(parent, name, VfsNodeType::File, (mode & 0x0FFF) as u16) }
 }
 
-pub unsafe fn syscall_close(regs: *mut ContextFrame) {
-    let local_fd = (*regs).arg1() as usize;
+syscall_define! {
+    pub fn syscall_open(path: UserPtr<u8>, flags: u32, mode: u32) {
+        let path = path.read_cstr(PATH_MAX)?;
+        // Check the access mode first, so an invalid one creates nothing.
+        let operation = match flags & 0x3 {
+            0 => Operation::Read,
+            1 => Operation::Write,
+            2 => Operation::ReadWrite,
+            _ => return Err(KernelError::Inval),
+        };
+        let caller = caller()?;
+        let _pin = fs::pin_nodes();
 
-    if local_fd >= MAX_FDS_PER_PROCESS {
-        (*regs).set_return_error(KernelError::EBADF);
-        return;
-    }
+        let node = match unsafe { fs::resolve_path(path, caller.cwd) } {
+            Ok(node) => node,
+            Err(KernelError::NoEnt) if (flags & O_CREAT) != 0 => unsafe { create_file(path, &caller, mode) }?,
+            Err(err) => return Err(err),
+        };
 
-    let fd_tbl = &mut sched::current().as_mut().unwrap().fd_tbl;
-
-    let global_fd = match fd_tbl[local_fd] {
-        Some(idx) => idx,
-        _ => {
-            (*regs).set_return_error(KernelError::EBADF);
-            return;
+        let object = unsafe { security::object_for_node(node) };
+        if security::check(&caller.credentials, &object, operation) == Decision::Deny {
+            return Err(KernelError::Acces);
         }
-    };
 
-    let node = match fs::get_open_file(global_fd) {
-        Some(f) => f.node,
-        None => core::ptr::null_mut(),
-    };
+        if (flags & O_TRUNC) != 0 {
+            if unsafe { (*node).node_type } == VfsNodeType::Directory {
+                return Err(KernelError::IsDir);
+            }
+            if security::check(&caller.credentials, &object, Operation::Truncate) == Decision::Deny {
+                return Err(KernelError::Acces);
+            }
+            unsafe { (*node).truncate() }?;
+        }
 
-    fd_tbl[local_fd] = None;
-    fs::close_open_file(global_fd);
-
-    if !node.is_null() {
-        fs::vfs_ref_put(node);
+        let task = unsafe { sched::current().as_mut() }.ok_or(KernelError::Srch)?;
+        let l_fd = task.alloc_fd().ok_or(KernelError::MFile)?;
+        let g_fd = fs::alloc_open_file(node, 1)?;
+        unsafe { fs::vfs_ref_get(node) };
+        task.fd_tbl[l_fd] = Some(g_fd);
+        Ok(l_fd as u32)
     }
-
-    (*regs).set_return_value(0);
 }
 
-pub(crate) unsafe fn syscall_dup2(regs: *mut ContextFrame) {
-    let old_fd = (*regs).ebx as usize;
-    let new_fd = (*regs).ecx as usize;
-
-    let task = sched::current().as_mut().unwrap();
-
-    if old_fd >= sched::MAX_FDS_PER_PROCESS || new_fd >= sched::MAX_FDS_PER_PROCESS {
-        (*regs).set_return_error(KernelError::EBADF);
-        return;
-    }
-
-    let Some(global_fd) = task.fd_tbl[old_fd] else {
-        (*regs).set_return_error(KernelError::EBADF);
-        return;
-    };
-
-    if let Some(existing) = task.fd_tbl[new_fd] {
-        if let Some(open_file) = fs::get_open_file(existing) {
-            fs::vfs_ref_put(open_file.node);
+syscall_define! {
+    pub fn syscall_close(local_fd: usize) {
+        if local_fd >= MAX_FDS_PER_PROCESS {
+            return Err(KernelError::BadF);
         }
-        fs::close_open_file(existing);
-    }
+        let fd_tbl = &mut unsafe { sched::current().as_mut() }.ok_or(KernelError::Srch)?.fd_tbl;
+        let global_fd = fd_tbl[local_fd].take().ok_or(KernelError::BadF)?;
 
-    fs::retain_open_file(global_fd);
-    if let Some(open_file) = fs::get_open_file(global_fd) {
-        fs::vfs_ref_get(open_file.node);
+        let node = fs::get_open_file(global_fd).map_or(core::ptr::null_mut(), |f| f.node);
+        // Before closing: the last close can free the node.
+        unsafe { fs::vfs_ref_put(node) };
+        unsafe { fs::close_open_file(global_fd) };
+        Ok(0)
     }
-    task.fd_tbl[new_fd] = Some(global_fd);
+}
 
-    (*regs).set_return_value(new_fd as u32);
+syscall_define! {
+    pub fn syscall_dup2(old_fd: usize, new_fd: usize) {
+        if old_fd >= MAX_FDS_PER_PROCESS || new_fd >= MAX_FDS_PER_PROCESS {
+            return Err(KernelError::BadF);
+        }
+        let task = unsafe { sched::current().as_mut() }.ok_or(KernelError::Srch)?;
+        let global_fd = task.fd_tbl[old_fd].ok_or(KernelError::BadF)?;
+        if old_fd == new_fd {
+            // Closing `new_fd` first would free the entry being duplicated.
+            return Ok(new_fd as u32);
+        }
+
+        if let Some(existing) = task.fd_tbl[new_fd] {
+            unsafe {
+                if let Some(open_file) = fs::get_open_file(existing) {
+                    fs::vfs_ref_put(open_file.node);
+                }
+                fs::close_open_file(existing);
+            }
+        }
+
+        fs::retain_open_file(global_fd);
+        if let Some(open_file) = fs::get_open_file(global_fd) {
+            unsafe { fs::vfs_ref_get(open_file.node) };
+        }
+        task.fd_tbl[new_fd] = Some(global_fd);
+        Ok(new_fd as u32)
+    }
 }

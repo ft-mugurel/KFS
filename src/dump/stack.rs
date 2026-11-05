@@ -1,11 +1,11 @@
 use core::{fmt, ptr};
 
-use super::kallsyms;
-use super::DumpStackOptions;
 use super::DEFAULT_DUMP_WORDS;
 use super::DEFAULT_TRACE_FRAMES;
+use super::DumpStackOptions;
 use super::MAX_DUMP_WORDS;
 use super::MAX_TRACE_FRAMES;
+use super::kallsyms;
 use crate::paging;
 use crate::x86;
 
@@ -133,9 +133,7 @@ fn scan_stack(
     emit(format_args!("Call Trace (stack scan):\n"));
     let mut emitted = 0usize;
     let mut last_name: Option<&str> = None;
-    let scan_words = (words.saturating_mul(8))
-        .max(DEFAULT_SCAN_WORDS)
-        .min(MAX_SCAN_WORDS);
+    let scan_words = (words.saturating_mul(8)).clamp(DEFAULT_SCAN_WORDS, MAX_SCAN_WORDS);
 
     for i in 0..scan_words {
         let offset = match (i as u32).checked_mul(4) {

@@ -6,23 +6,19 @@ dd 0x1BADB002                   ; Magic number
 dd 0x00000003                   ; Flags: align modules + request memory info
 dd - (0x1BADB002 + 0x00000003)  ; Checksum
 
-section .bss
-align 16
-global _stack_start
-_stack_start:
-    resb 16384                  ; Reserve 16 KB for the boot stack
-global _stack_end
-_stack_end:
+%define THREAD_SIZE 16384       ; must match sched::THREAD_SIZE
 
 section .text
 global _start
 extern kmain
+extern IDLE_KERNEL_STACKS         ; sched/scheduler.rs, THREAD_SIZE-aligned per-CPU stacks
 
 _start:
     cli             ; Disable interrupts immediately to avoid pre-kmain IRQs
 
-    ; setup the stack ptr
-    mov esp, _stack_end
+    ; boot on CPU 0's idle stack so current_thread_info() (esp masked down to
+    ; THREAD_SIZE) finds CPU 0's ThreadInfo for the whole of kmain
+    mov esp, IDLE_KERNEL_STACKS + THREAD_SIZE
 
     push ebx        ; multiboot info pointer
     push eax        ; multiboot magic

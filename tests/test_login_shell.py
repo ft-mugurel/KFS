@@ -2,6 +2,7 @@
 import os
 import socket
 import subprocess
+import re
 import time
 import sys
 
@@ -154,6 +155,34 @@ try:
     assert ok, "FAILED: truncate did not create /tmp/trunc_file.txt!"
     wait_for_new_pattern("mysh > ", offset, timeout=8)
     print("[✓] truncate successfully created new file via O_CREAT | O_TRUNC.")
+
+    print("5c. Testing ls -l...")
+    offset = get_log_offset()
+    send_string("ls -l /tmp\n")
+    ok, log = wait_for_new_pattern("mysh > ", offset, timeout=8)
+    assert ok, "FAILED: ls -l did not return shell prompt!"
+    assert re.search(r"-rw\S+\s+1 root\s+0\s+0 trunc_file\.txt", log), \
+        "FAILED: ls -l did not show trunc_file.txt metadata!"
+
+    offset = get_log_offset()
+    send_string("ls -l /etc/passwd\n")
+    ok, log = wait_for_new_pattern("mysh > ", offset, timeout=8)
+    assert ok, "FAILED: ls -l on a file did not return shell prompt!"
+    assert re.search(r"-rw-r--r--\s+1 root\s+0\s+\d+ /etc/passwd", log), \
+        "FAILED: ls -l on a file did not show its metadata!"
+
+    offset = get_log_offset()
+    send_string("ls -l /no_such_path\n")
+    ok, log = wait_for_new_pattern("cannot access", offset, timeout=8)
+    assert ok, "FAILED: ls -l on a missing path did not report an error!"
+    wait_for_new_pattern("mysh > ", offset, timeout=8)
+
+    offset = get_log_offset()
+    send_string("ls -z\n")
+    ok, log = wait_for_new_pattern("invalid option", offset, timeout=8)
+    assert ok, "FAILED: ls did not reject an unknown option!"
+    wait_for_new_pattern("mysh > ", offset, timeout=8)
+    print("[✓] ls -l shows metadata for directories and files and reports errors.")
 
     offset = get_log_offset()
     send_string("truncate /tmp/trunc_file.txt\n")

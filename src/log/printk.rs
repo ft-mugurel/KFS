@@ -1,10 +1,6 @@
-use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use crate::locks::Spinlock;
-use crate::vga::text_mod;
-
-pub static LOG_LEVEL: AtomicU8 = AtomicU8::new(KernelLogLevel::Info as u8);
-pub static DIRECT_SCREEN_OUTPUT: AtomicBool = AtomicBool::new(true);
+use super::{DIRECT_SCREEN_OUTPUT, LOG_LEVEL};
+use crate::{locks::Spinlock, vga::text_mod};
+use core::{fmt, sync::atomic::Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -40,12 +36,10 @@ fn is_enabled(level: KernelLogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(Ordering::Relaxed)
 }
 
-#[allow(dead_code)]
 pub fn is_direct_screen_output_enabled() -> bool {
     DIRECT_SCREEN_OUTPUT.load(Ordering::Acquire)
 }
 
-#[allow(dead_code)]
 pub fn set_direct_screen_output(enabled: bool) {
     DIRECT_SCREEN_OUTPUT.store(enabled, Ordering::Release);
 }
@@ -86,11 +80,9 @@ pub fn printk_emit(
         let lock = &LOCKS[screen_index % LOCKS.len()];
         let _guard = lock.lock();
         text_mod::print_str_on(screen_index, level_tag(level));
-        text_mod::print_fmt_on(
-            screen_index,
-            &format_args!("({}) ", pid),
-        );
+        text_mod::print_fmt_on(screen_index, &format_args!("({}) ", pid));
         text_mod::print_fmt_on(screen_index, args);
+        text_mod::print_str_on(screen_index, "\n");
     } else {
         crate::serial::write_printk_to_serial(level_tag(level), pid, args);
     }
@@ -103,20 +95,6 @@ pub fn printk_level_to_default(level: KernelLogLevel, args: &fmt::Arguments<'_>)
         0
     };
     printk_emit(screen, level, args, false);
-}
-
-#[allow(dead_code)]
-pub fn printk_level_to_screen(
-    screen_index: usize,
-    level: KernelLogLevel,
-    args: &fmt::Arguments<'_>,
-) {
-    printk_emit(screen_index, level, args, false);
-}
-
-#[allow(dead_code)]
-pub fn printk_to_screen(screen_index: usize, args: &fmt::Arguments<'_>) {
-    printk_emit(screen_index, KernelLogLevel::Info, args, false);
 }
 
 pub fn printk_to_debug(args: &fmt::Arguments<'_>) {

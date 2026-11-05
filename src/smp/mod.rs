@@ -3,4 +3,4 @@ pub mod ipi;
 pub mod lapic;
 pub mod trampoline;
 
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = 16;

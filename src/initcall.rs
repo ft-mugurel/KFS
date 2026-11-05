@@ -214,16 +214,7 @@ unsafe fn slice_from_bounds(
     }
     let entry_size = core::mem::size_of::<InitcallEntry>();
     let count = (end_addr - start_addr) / entry_size;
-    core::slice::from_raw_parts(start, count)
-}
-
-pub fn all_initcalls() -> &'static [InitcallEntry] {
-    unsafe {
-        slice_from_bounds(
-            core::ptr::addr_of!(__initcall_start) as *const InitcallEntry,
-            core::ptr::addr_of!(__initcall_end) as *const InitcallEntry,
-        )
-    }
+    unsafe { core::slice::from_raw_parts(start, count) }
 }
 
 pub fn level_initcalls(level: u8) -> &'static [InitcallEntry] {
@@ -271,12 +262,11 @@ pub struct InitcallRecord {
     pub name: &'static str,
     pub level: u8,
     pub result: i32,
-    pub func_addr: u32,
 }
 
 const MAX_HISTORY: usize = 64;
 static mut HISTORY: [InitcallRecord; MAX_HISTORY] =
-    [InitcallRecord { name: "", level: 0, result: 0, func_addr: 0 }; MAX_HISTORY];
+    [InitcallRecord { name: "", level: 0, result: 0 }; MAX_HISTORY];
 static mut HISTORY_COUNT: usize = 0;
 static mut FREED_INIT_MEMORY: Option<(u32, u32, usize)> = None;
 
@@ -293,7 +283,7 @@ pub fn freed_memory_info() -> Option<(u32, u32, usize)> {
 
 #[unsafe(link_section = ".init.text")]
 pub fn do_initcalls() {
-    pr_info!("initcall: starting kernel initialization calls\n");
+    pr_info!("initcall: starting kernel initialization calls");
 
     for level in 0..=7 {
         let entries = level_initcalls(level);
@@ -304,15 +294,14 @@ pub fn do_initcalls() {
         let level_name = InitcallLevel::from_u8(level).map_or("unknown", |l| l.as_str());
 
         pr_debug!(
-            "initcall: level {} ({}) [{} call(s)]\n",
+            "initcall: level {} ({}) [{} call(s)]",
             level,
             level_name,
             entries.len()
         );
 
         for entry in entries {
-            let func_ptr = entry.func as usize as u32;
-            pr_info!("[initcall:{}] {}...\n", level_name, entry.name);
+            pr_info!("[initcall:{}] {}...", level_name, entry.name);
             let ret = (entry.func)();
 
             unsafe {
@@ -321,7 +310,6 @@ pub fn do_initcalls() {
                         name: entry.name,
                         level: entry.level,
                         result: ret,
-                        func_addr: func_ptr,
                     };
                     HISTORY_COUNT += 1;
                 }
@@ -329,26 +317,32 @@ pub fn do_initcalls() {
 
             if ret != 0 {
                 pr_err!(
-                    "[initcall:{}] {} failed with error code {}\n",
+                    "[initcall:{}] {} failed with error code {}",
                     level_name,
                     entry.name,
                     ret
                 );
             } else {
-                pr_debug!("[initcall:{}] {} ok\n", level_name, entry.name);
+                pr_debug!("[initcall:{}] {} ok", level_name, entry.name);
             }
         }
     }
 
-    pr_info!("initcall: all initialization calls completed\n");
+    pr_info!("initcall: all initialization calls completed");
 }
 
+/// Poisons, unmaps and frees the `.init` sections.
+///
+/// # Safety
+/// Must run once, on the BSP, after every initcall has finished and every AP
+/// is past its init code: nothing in `.init.text`/`.init.data` may run or be
+/// read afterwards.
 pub unsafe fn free_init_memory() {
     let start_addr = core::ptr::addr_of!(__init_start) as u32;
     let end_addr = core::ptr::addr_of!(__init_end) as u32;
 
     if end_addr <= start_addr {
-        pr_warn!("initcall: no init memory section to free\n");
+        pr_warn!("initcall: no init memory section to free");
         return;
     }
 
@@ -357,7 +351,7 @@ pub unsafe fn free_init_memory() {
     let total_pages = total_bytes / page_size;
 
     pr_info!(
-        "Freeing unused kernel init memory: {:#010X} - {:#010X} ({} KiB, {} pages)\n",
+        "Freeing unused kernel init memory: {:#010X} - {:#010X} ({} KiB, {} pages)",
         start_addr,
         end_addr,
         total_bytes / 1024,
@@ -368,7 +362,12 @@ pub unsafe fn free_init_memory() {
     let mut freed_pages = 0usize;
 
     while current_addr < end_addr {
-        if let Some(phys_addr) = paging::virt_to_phys(current_addr) {
+        if let Some(phys_addr) = unsafe { paging::virt_to_phys(current_addr) } {
+            // Poison with int3
+            let page = paging::phys_to_virt(phys_addr) as *mut u8;
+            // SAFETY: the direct map covers the kernel image, and nothing uses
+            // init memory any more
+            unsafe { core::ptr::write_bytes(page, 0xCC, page_size as usize) };
             paging::free_physical_page(phys_addr)
                 .consume_err("Failed to free physical page for init memory");
 
@@ -383,16 +382,16 @@ pub unsafe fn free_init_memory() {
             freed_pages += 1;
         } else {
             pr_warn!(
-                "Failed to convert init virtual address to physical: {:#010X}\n",
+                "Failed to convert init virtual address to physical: {:#010X}",
                 current_addr
             );
         }
         current_addr += page_size;
     }
 
-    FREED_INIT_MEMORY = Some((start_addr, end_addr, freed_pages));
+    unsafe { FREED_INIT_MEMORY = Some((start_addr, end_addr, freed_pages)) };
     pr_info!(
-        "Init memory reclaimed: {} pages successfully freed\n",
+        "Init memory reclaimed: {} pages successfully freed",
         freed_pages
     );
 }

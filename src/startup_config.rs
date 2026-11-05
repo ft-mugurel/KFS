@@ -38,25 +38,10 @@ pub mod pic {
     pub const EOI: u8 = 0x20;
 
     pub const KEYBOARD_IRQ_LINE: u8 = 1;
-    pub const TIMER_IRQ_VECTOR: u8 = MASTER_IRQ_OFFSET + 0;
+    pub const TIMER_IRQ_VECTOR: u8 = MASTER_IRQ_OFFSET;
     pub const KEYBOARD_IRQ_VECTOR: u8 = MASTER_IRQ_OFFSET + KEYBOARD_IRQ_LINE;
 }
 
 pub mod power {
-    pub const QEMU_SHUTDOWN_PORT: u16 = 0x604;
-    pub const QEMU_SHUTDOWN_VALUE: u16 = 0x2000;
-
-    pub const BOCHS_SHUTDOWN_PORT: u16 = 0xB004;
-    pub const BOCHS_SHUTDOWN_VALUE: u16 = 0x2000;
-
-    pub const VBOX_SHUTDOWN_PORT: u16 = 0x4004;
-    pub const VBOX_SHUTDOWN_VALUE: u16 = 0x3400;
-
-    pub const KEYBOARD_CONTROLLER_COMMAND_PORT: u16 = 0x64;
-    pub const KEYBOARD_CONTROLLER_REBOOT: u8 = 0xFE;
-
-    pub const PCI_RESET_PORT: u16 = 0xCF9;
-    pub const PCI_RESET_VALUE: u8 = 0x06;
-
-    pub const CONFIG_HZ: u32 = 1000;
+    pub const CONFIG_HZ: u32 = 10;
 }

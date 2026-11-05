@@ -37,7 +37,7 @@ fn tty_index(index: usize) -> KResult<usize> {
     if index < TTY_COUNT {
         Ok(index)
     } else {
-        Err(KernelError::ENXIO)
+        Err(KernelError::NxIO)
     }
 }
 
@@ -57,38 +57,68 @@ pub fn push_char(c: char) {
     drop(buffers);
 
     let mut table = sched::PROCESS_TABLE.lock();
-    for task_opt in table.iter_mut() {
-        if let Some(task) = task_opt {
-            if task.state == sched::ProcessState::Waiting {
-                let matches_tty = task.fd_tbl[0].and_then(|gfd| {
-                    fs::get_open_file(gfd).and_then(|f| {
-                        if unsafe { (*f.node).node_type == VfsNodeType::CharDevice } {
-                            let inode = unsafe { (*f.node).inode };
-                            if (inode as usize) < TTY_COUNT {
-                                Some(inode as usize == tty)
-                            } else if inode == crate::fs::dev::CHAR_DEV_TTY0
-                                || inode == crate::fs::dev::CHAR_DEV_CONSOLE
-                                || inode == crate::fs::dev::CHAR_DEV_TTY
-                            {
-                                Some(true)
-                            } else {
-                                Some(false)
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                }) == Some(true);
-
-                if matches_tty {
-                    sched::set_state(task, sched::ProcessState::Ready);
-                }
-            }
+    for task in table.iter_mut().flatten() {
+        let reads_tty: bool = match stdin_tty(task) {
+            Some(StdinTty::Index(index)) => index == tty,
+            Some(StdinTty::Any) => true,
+            None => false,
+        };
+        if task.state == sched::ProcessState::Waiting && reads_tty {
+            sched::set_state(task, sched::ProcessState::Ready);
         }
     }
 }
 
-pub unsafe fn read(tty: usize, output: &mut [u8]) -> KResult<usize> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdinTty {
+    Index(usize),
+    Any,
+}
+
+fn stdin_tty(task: &sched::TaskStruct) -> Option<StdinTty> {
+    let file = fs::get_open_file(task.fd_tbl[0]?)?;
+    if unsafe { (*file.node).node_type != VfsNodeType::CharDevice } {
+        return None;
+    }
+    let inode = unsafe { (*file.node).inode };
+    if (inode as usize) < TTY_COUNT {
+        Some(StdinTty::Index(inode as usize))
+    } else if inode == crate::fs::dev::CHAR_DEV_TTY0
+        || inode == crate::fs::dev::CHAR_DEV_CONSOLE
+        || inode == crate::fs::dev::CHAR_DEV_TTY
+    {
+        Some(StdinTty::Any)
+    } else {
+        None
+    }
+}
+
+pub fn signal_foreground(signal: u8) -> usize {
+    let Ok(tty) = tty_index(active_screen_index()) else {
+        return 0;
+    };
+    let kernel_spawned = |pid: u32| (pid as usize) < crate::smp::MAX_CPUS;
+
+    let mut signalled = 0;
+    let mut table = sched::PROCESS_TABLE.lock();
+    for task in table.iter_mut().flatten() {
+        if kernel_spawned(task.pid)
+            || kernel_spawned(task.family.parent_pid)
+            || task.state == sched::ProcessState::Zombie
+            || stdin_tty(task) != Some(StdinTty::Index(tty))
+        {
+            continue;
+        }
+        if task.signals.push(signal) {
+            signalled += 1;
+        }
+    }
+    signalled
+}
+
+/// Reads buffered input from `tty`. With nothing buffered, marks the current
+/// task `Waiting` (`push_char` wakes it) and returns `EAGAIN`.
+pub fn read(tty: usize, output: &mut [u8]) -> KResult<usize> {
     let tty = tty_index(tty)?;
     let mut buffers = TTY_BUFFERS.lock();
     let buffer = &mut buffers[tty];
@@ -100,37 +130,37 @@ pub unsafe fn read(tty: usize, output: &mut [u8]) -> KResult<usize> {
     }
 
     if read == 0 {
-        if let Some(task) = sched::current().as_mut() {
+        if let Some(task) = unsafe { sched::current().as_mut() } {
             sched::set_state(task, sched::ProcessState::Waiting);
         }
-        Err(KernelError::EAGAIN)
+        Err(KernelError::Again)
     } else {
         Ok(read)
     }
 }
 
-pub unsafe fn write(tty: usize, input: &[u8]) -> KResult<usize> {
+pub fn write(tty: usize, input: &[u8]) -> KResult<usize> {
     tty_index(tty)?;
-    let text = core::str::from_utf8(input).map_err(|_| KernelError::EILSEQ)?;
+    let text = core::str::from_utf8(input).map_err(|_| KernelError::IlSeq)?;
     print_str_on(tty, text);
     Ok(input.len())
 }
 
 #[unsafe(link_section = ".init.text")]
 pub unsafe fn init() -> KResult<()> {
-    crate::fs::dev::init()
+    unsafe { crate::fs::dev::init() }
 }
 
 crate::device_initcall!(init);
 
 pub(crate) unsafe fn bind_stdio() -> KResult<()> {
-    let node = fs::resolve_path("/dev/tty1", fs::ROOT_NODE)?;
-    let task = sched::current().as_mut().ok_or(KernelError::ENXIO)?;
+    let node = unsafe { fs::resolve_path("/dev/tty1", fs::ROOT_NODE) }?;
+    let task = unsafe { sched::current().as_mut() }.ok_or(KernelError::NxIO)?;
 
     let global_fd = fs::alloc_open_file(node, 3)?;
 
-    for fd in 0..3.min(MAX_FDS_PER_PROCESS) {
-        task.fd_tbl[fd] = Some(global_fd);
+    for slot in task.fd_tbl.iter_mut().take(3.min(MAX_FDS_PER_PROCESS)) {
+        *slot = Some(global_fd);
     }
 
     Ok(())

@@ -7,14 +7,14 @@ use crate::{pr_emerg, x86};
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     x86::disable_interrupts();
-    pr_emerg!("KERNEL PANIC\n");
-    pr_emerg!("{}\n", info);
+    pr_emerg!("KERNEL PANIC");
+    pr_emerg!("{}", info);
     save_stack_trace();
-    unsafe { x86::clean_registers_and_halt() };
+    x86::clean_registers_and_halt();
 }
 
 pub(crate) fn save_stack_trace() {
-    pr_emerg!("Stack Trace:\n");
+    pr_emerg!("Stack Trace:");
     let screen = active_screen_index();
     dump::dump_stack_with_options(
         DumpStackOptions {
@@ -31,5 +31,5 @@ pub(crate) fn save_stack_trace() {
 }
 
 pub(crate) fn clean_registers_and_halt() -> ! {
-    unsafe { x86::clean_registers_and_halt() };
+    x86::clean_registers_and_halt();
 }

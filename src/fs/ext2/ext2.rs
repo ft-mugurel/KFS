@@ -4,11 +4,37 @@ use crate::{
     drivers::{self, BlockDeviceId},
     error::{KResult, KernelError},
     fs::{Mount, MountPrivate, VfsNode, VfsNodeType, buffer_cache, register_mount, vfs},
+    locks::Spinlock,
     paging::{HeapBuffer, kfree, kmalloc},
     pr_debug, pr_err, pr_info, pr_warn,
 };
 
 use super::{EXT2_ROOT_INODE, Ext2DirEntry, Ext2GroupDesc, Ext2Inode, Ext2Mount, Ext2Superblock};
+
+// Unsafe in this file
+// -------------------
+// - The on-disk structs (`Ext2Superblock`, `Ext2GroupDesc`, `Ext2Inode`,
+//   `Ext2DirEntry`) are `repr(C, packed)` and made of integers: alignment 1
+//   and valid for any bytes, so overlaying one on a byte buffer only needs
+//   it to fit inside the buffer.
+// - `kmalloc` memory is 16-byte aligned, so `u32` views of a `HeapBuffer`
+//   are aligned. A `kmalloc(4096)` viewed as `&mut [u8; 4096]` covers exactly
+//   that allocation, which nothing else uses.
+// - Trusted on-disk geometry: mounting doesn't check the superblock, so the
+//   code assumes a block size of at most 4096, inode and group descriptor
+//   offsets that fit in the buffers they are read from, and directory
+//   records whose `rec_len` stays inside the block. A malformed image can
+//   break these.
+// - `*const Mount` arguments point into `MOUNT_TABLE`, whose entries are
+//   never removed.
+
+/// Serializes changes to ext2 metadata: bitmaps, inodes and directory blocks
+/// are all read, changed and written back, so two CPUs would lose each other's
+/// update. Held across disk I/O, which is fine only because that I/O is polled
+/// and nothing here sleeps. Never copy file data from a user buffer with it
+/// held: a fault that kills the task would leave it locked. (Paths are fine,
+/// `read_cstr` has already touched every byte.)
+static EXT2_WRITE_LOCK: Spinlock<()> = Spinlock::new(());
 
 fn ext2_type_to_vfs(ext2_type: u8) -> VfsNodeType {
     match ext2_type {
@@ -30,11 +56,7 @@ impl Ext2Superblock {
     }
     #[inline(always)]
     pub fn inode_size(&self) -> u32 {
-        if self.rev_level == 0 {
-            128
-        } else {
-            self.inode_size as u32
-        }
+        if self.rev_level == 0 { 128 } else { self.inode_size as u32 }
     }
     #[inline(always)]
     pub fn bgdt_block(&self) -> u32 {
@@ -62,17 +84,18 @@ unsafe fn create_ext2_mount(
     device_id: BlockDeviceId,
     sb: &Ext2Superblock,
 ) -> KResult<*const Mount> {
-    register_mount(|mount_index| Mount {
+    register_mount(|_| Mount {
         device: device_id,
+        mount_point: "/",
         backend: &super::EXT2_BACKEND,
-        private_data: MountPrivate::Ext2(Ext2Mount { device_id, mount_index, sb: *sb }),
+        private_data: MountPrivate::Ext2(Ext2Mount { device_id, sb: *sb }),
     })
 }
 
 unsafe fn ext2_mount_from_wrapper(mount_wrapper: *const Mount) -> KResult<Ext2Mount> {
     match (*mount_wrapper).private_data {
         MountPrivate::Ext2(mount) => Ok(mount),
-        _ => Err(KernelError::EOPNOTSUPP),
+        _ => Err(KernelError::OpNotSupp),
     }
 }
 
@@ -80,8 +103,8 @@ const DIRECT_BLOCKS: u32 = 12; // 0-11 are direct blocks
 
 unsafe fn ext2_alloc_block(mount: &Ext2Mount) -> KResult<u32> {
     if mount.sb.free_blocks_count == 0 {
-        pr_err!("Ext2: No free blocks remaining on disk.\n");
-        return Err(KernelError::ENOSPC); // Use EIO if ENOSPC is not defined
+        pr_err!("Ext2: No free blocks remaining on disk.");
+        return Err(KernelError::NoSpc); // Use EIO if ENOSPC is not defined
     }
 
     let mut bgdt_buf = HeapBuffer::new(512)?;
@@ -90,8 +113,8 @@ unsafe fn ext2_alloc_block(mount: &Ext2Mount) -> KResult<u32> {
 
     if bgd.bg_free_blocks_count == 0 {
         // multiple block groups
-        pr_err!("Ext2: No free blocks remaining in Block Group 0.\n");
-        return Err(KernelError::ENOSPC);
+        pr_err!("Ext2: No free blocks remaining in Block Group 0.");
+        return Err(KernelError::NoSpc);
     }
 
     let bitmap_block = bgd.bg_block_bitmap;
@@ -120,7 +143,7 @@ unsafe fn ext2_alloc_block(mount: &Ext2Mount) -> KResult<u32> {
     }
 
     if !found {
-        return Err(KernelError::ENOSPC);
+        return Err(KernelError::NoSpc);
     }
 
     write_block(mount, bitmap_block, &bitmap_buf[..block_size_bytes])?;
@@ -134,14 +157,14 @@ unsafe fn ext2_alloc_block(mount: &Ext2Mount) -> KResult<u32> {
 
 unsafe fn ext2_alloc_inode(mount: &Ext2Mount) -> KResult<u32> {
     if mount.sb.free_inodes_count == 0 {
-        return Err(KernelError::ENOSPC);
+        return Err(KernelError::NoSpc);
     }
 
     let mut bgdt_buf = [0u8; 512];
     drivers::read_sectors(mount.device_id, mount.sb.bgdt_lba(), 1, &mut bgdt_buf)?;
     let bgd = &mut *(bgdt_buf.as_mut_ptr() as *mut Ext2GroupDesc);
     if bgd.bg_free_inodes_count == 0 {
-        return Err(KernelError::ENOSPC);
+        return Err(KernelError::NoSpc);
     }
 
     let mut bitmap_buf = HeapBuffer::new(4096)?;
@@ -160,7 +183,7 @@ unsafe fn ext2_alloc_inode(mount: &Ext2Mount) -> KResult<u32> {
             break;
         }
     }
-    let bit = selected.ok_or(KernelError::ENOSPC)?;
+    let bit = selected.ok_or(KernelError::NoSpc)?;
     write_block(mount, bgd.bg_inode_bitmap, &bitmap_buf)?;
     let inode_number = bit as u32 + 1;
 
@@ -175,6 +198,36 @@ unsafe fn ext2_alloc_inode(mount: &Ext2Mount) -> KResult<u32> {
     Ok(inode_number)
 }
 
+unsafe fn ext2_free_inode(mount: &Ext2Mount, inode_num: u32) -> KResult<()> {
+    let group = (inode_num - 1) / mount.sb.inodes_per_group;
+    let bit = ((inode_num - 1) % mount.sb.inodes_per_group) as usize;
+
+    let bgdt_offset = group * 32;
+    let bgdt_lba = mount.sb.bgdt_lba() + (bgdt_offset / 512);
+    let mut bgdt_buf = [0u8; 512];
+    drivers::read_sectors(mount.device_id, bgdt_lba, 1, &mut bgdt_buf)?;
+    let bgd = &mut *(bgdt_buf.as_mut_ptr().add((bgdt_offset % 512) as usize) as *mut Ext2GroupDesc);
+
+    let mut bitmap_buf = HeapBuffer::new(4096)?;
+    read_block(mount, bgd.bg_inode_bitmap, &mut bitmap_buf)?;
+    if bitmap_buf[bit / 8] & (1 << (bit % 8)) == 0 {
+        pr_warn!("Ext2: Double free detected for inode {}", inode_num);
+        return Ok(());
+    }
+    bitmap_buf[bit / 8] &= !(1 << (bit % 8));
+    write_block(mount, bgd.bg_inode_bitmap, &bitmap_buf)?;
+
+    bgd.bg_free_inodes_count += 1;
+    drivers::write_sectors(mount.device_id, bgdt_lba, 1, &bgdt_buf)?;
+
+    let mut sb_buf = [0u8; 1024];
+    drivers::read_sectors(mount.device_id, 2, 2, &mut sb_buf)?;
+    let sb = &mut *(sb_buf.as_mut_ptr() as *mut Ext2Superblock);
+    sb.free_inodes_count += 1;
+    drivers::write_sectors(mount.device_id, 2, 2, &sb_buf)?;
+    Ok(())
+}
+
 unsafe fn ext2_free_block(mount: &Ext2Mount, block_num: u32) -> KResult<()> {
     if block_num == 0 {
         return Ok(()); // Block 0 is never a valid data block to free
@@ -185,19 +238,16 @@ unsafe fn ext2_free_block(mount: &Ext2Mount, block_num: u32) -> KResult<()> {
     let sb = &mut *(sb_buf.as_mut_ptr() as *mut Ext2Superblock);
 
     if block_num < sb.first_data_block || block_num >= sb.blocks_count {
-        pr_err!(
-            "Ext2: Attempted to free out-of-bounds block {}\n",
-            block_num
-        );
-        return Err(KernelError::EINVAL);
+        pr_err!("Ext2: Attempted to free out-of-bounds block {}", block_num);
+        return Err(KernelError::Inval);
     }
 
     let group = (block_num - sb.first_data_block) / sb.blocks_per_group;
     let local_bit_index = (block_num - sb.first_data_block) % sb.blocks_per_group;
 
     if group > 0 {
-        pr_err!("Ext2: Multiple block groups not yet supported for freeing\n");
-        return Err(KernelError::EOPNOTSUPP);
+        pr_err!("Ext2: Multiple block groups not yet supported for freeing");
+        return Err(KernelError::OpNotSupp);
     }
 
     let mut bgdt_buf = HeapBuffer::new(512)?;
@@ -212,7 +262,7 @@ unsafe fn ext2_free_block(mount: &Ext2Mount, block_num: u32) -> KResult<()> {
     let bit_offset = local_bit_index % 8;
 
     if (bitmap_buf[byte_idx] & (1 << bit_offset)) == 0 {
-        pr_warn!("Ext2: Double free detected for block {}\n", block_num);
+        pr_warn!("Ext2: Double free detected for block {}", block_num);
         return Ok(());
     }
 
@@ -248,7 +298,7 @@ unsafe fn allocate_zeroed_block(mount: &Ext2Mount) -> KResult<u32> {
         new_block,
         &zero_buf[..(mount.sb.block_size() as usize)],
     )?;
-    pr_debug!("Ext2: zeroed new block {}\n", new_block);
+    pr_debug!("Ext2: zeroed new block {}", new_block);
 
     Ok(new_block)
 }
@@ -267,8 +317,7 @@ unsafe fn free_block_tree(mount: &Ext2Mount, block_num: u32, depth: u8) -> KResu
     read_block(mount, block_num, &mut block_buf)?;
 
     let pointers_count = block_size / 4;
-    let pointers =
-        core::slice::from_raw_parts(block_buf.as_ptr() as *const u32, pointers_count);
+    let pointers = core::slice::from_raw_parts(block_buf.as_ptr() as *const u32, pointers_count);
     for &child_block in pointers {
         if child_block != 0 {
             free_block_tree(mount, child_block, depth - 1)?;
@@ -291,9 +340,8 @@ unsafe fn get_alloc_indirect(
     read_block(mount, indirect_block_num, &mut block_buf)?;
 
     // Cast the byte buffer to a u32 slice to read the pointers
-    let pointers = unsafe {
-        core::slice::from_raw_parts_mut(block_buf.as_mut_ptr() as *mut u32, block_size / 4)
-    };
+    let pointers =
+        core::slice::from_raw_parts_mut(block_buf.as_mut_ptr() as *mut u32, block_size / 4);
 
     let mut target_phys_block = pointers[pointer_index as usize];
 
@@ -338,7 +386,7 @@ unsafe fn get_or_allocate_physical_block(
             inode.i_blocks += mount.sb.sectors_per_block();
             let Ok(()) = update_inode(mount, inode_num, &inode) else {
                 ext2_free_block(mount, phys_block).ok();
-                return Err(KernelError::EIO);
+                return Err(KernelError::IO);
             };
         }
 
@@ -358,7 +406,7 @@ unsafe fn get_or_allocate_physical_block(
             inode.i_blocks += mount.sb.sectors_per_block();
             let Ok(()) = update_inode(mount, inode_num, &inode) else {
                 ext2_free_block(mount, indirect_block).ok();
-                return Err(KernelError::EIO);
+                return Err(KernelError::IO);
             };
         }
 
@@ -382,13 +430,13 @@ unsafe fn get_or_allocate_physical_block(
         pr_err!("Ext2: Triply indirect block allocation not yet supported");
     }
 
-    Err(KernelError::ENOSYS)
+    Err(KernelError::NoSys)
 }
 
 fn read_block(mount: &Ext2Mount, block_number: u32, buffer: &mut [u8]) -> KResult<()> {
     let block_size = mount.sb.block_size();
     if buffer.len() < block_size as usize {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     unsafe {
         buffer_cache::read_block_cached(mount.device_id as u32, block_number, block_size, buffer)
@@ -398,7 +446,7 @@ fn read_block(mount: &Ext2Mount, block_number: u32, buffer: &mut [u8]) -> KResul
 fn write_block(mount: &Ext2Mount, block_number: u32, buffer: &[u8]) -> KResult<()> {
     let block_size = mount.sb.block_size();
     if buffer.len() < block_size as usize {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     unsafe {
         buffer_cache::write_block_cached(mount.device_id as u32, block_number, block_size, buffer)
@@ -407,7 +455,7 @@ fn write_block(mount: &Ext2Mount, block_number: u32, buffer: &[u8]) -> KResult<(
 
 unsafe fn get_inode(mount: &Ext2Mount, inode_num: u32) -> KResult<Ext2Inode> {
     if inode_num == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let group = (inode_num - 1) / mount.sb.inodes_per_group;
@@ -436,7 +484,7 @@ unsafe fn get_inode(mount: &Ext2Mount, inode_num: u32) -> KResult<Ext2Inode> {
 
 unsafe fn update_inode(mount: &Ext2Mount, inode_num: u32, inode: &Ext2Inode) -> KResult<()> {
     if inode_num == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let group = (inode_num - 1) / mount.sb.inodes_per_group;
@@ -476,7 +524,7 @@ unsafe fn add_directory_entry(
 ) -> KResult<()> {
     let mut parent = get_inode(mount, parent_inode)?;
     if parent.i_mode & 0xF000 != 0x4000 {
-        return Err(KernelError::ENOTDIR);
+        return Err(KernelError::NotDir);
     }
     let new_block = parent.i_block[0] == 0;
     let block_number = if new_block {
@@ -507,7 +555,7 @@ unsafe fn add_directory_entry(
                 u16::from_le_bytes(block[offset + 4..offset + 6].try_into().unwrap()) as usize;
             let name_length = block[offset + 6] as usize;
             if record_length < 8 || offset + record_length > block_size {
-                return Err(KernelError::EIO);
+                return Err(KernelError::IO);
             }
             let minimum = (8 + name_length + 3) & !3;
             if inode == 0 && record_length >= needed {
@@ -537,7 +585,58 @@ unsafe fn add_directory_entry(
             }
             offset += record_length;
         }
-        Err(KernelError::ENOSPC)
+        Err(KernelError::NoSpc)
+    })();
+    kfree(block_alloc).ok();
+    result
+}
+
+/// Removes `name` from the directory and returns the inode it pointed at. The
+/// space goes to the previous record, or the record is marked unused if it is
+/// the first one. Only the first block is searched, like directory loading.
+unsafe fn remove_directory_entry(
+    mount: &Ext2Mount,
+    parent_inode: u32,
+    name: &[u8],
+) -> KResult<u32> {
+    let parent = get_inode(mount, parent_inode)?;
+    let block_number = parent.i_block[0];
+    if block_number == 0 {
+        return Err(KernelError::NoEnt);
+    }
+
+    let block_size = mount.sb.block_size() as usize;
+    let block_alloc = kmalloc(4096)?;
+    let block = &mut *(block_alloc as *mut [u8; 4096]);
+    let result = (|| {
+        read_block(mount, block_number, block)?;
+        let mut previous = None;
+        let mut offset = 0usize;
+
+        while offset + 8 <= block_size {
+            let inode = u32::from_le_bytes(block[offset..offset + 4].try_into().unwrap());
+            let record_length =
+                u16::from_le_bytes(block[offset + 4..offset + 6].try_into().unwrap()) as usize;
+            let name_length = block[offset + 6] as usize;
+            if record_length < 8 || offset + record_length > block_size {
+                return Err(KernelError::IO);
+            }
+
+            if inode != 0 && &block[offset + 8..offset + 8 + name_length] == name {
+                if let Some(previous) = previous {
+                    let merged = (offset + record_length - previous) as u16;
+                    block[previous + 4..previous + 6].copy_from_slice(&merged.to_le_bytes());
+                } else {
+                    block[offset..offset + 4].fill(0);
+                }
+                write_block(mount, block_number, block)?;
+                return Ok(inode);
+            }
+
+            previous = Some(offset);
+            offset += record_length;
+        }
+        Err(KernelError::NoEnt)
     })();
     kfree(block_alloc).ok();
     result
@@ -573,7 +672,7 @@ unsafe fn init_new_directory(
     let block = &mut *(block_alloc as *mut [u8; 4096]);
     block.fill(0);
 
-    let result = (|| {
+    let result = {
         // "." -> self
         let dot_len = (8 + 1 + 3) & !3;
         write_directory_record(block, 0, dot_len, child_inode, b".", VfsNodeType::Directory);
@@ -589,7 +688,7 @@ unsafe fn init_new_directory(
         );
 
         write_block(mount, new_block, &block[..block_size])
-    })();
+    };
     kfree(block_alloc).ok();
     if let Err(error) = result {
         ext2_free_block(mount, new_block).ok();
@@ -618,17 +717,18 @@ pub(crate) unsafe fn create_node(
     gid: u32,
 ) -> KResult<u32> {
     if name.is_empty() || name.len() > 255 {
-        return Err(KernelError::ENAMETOOLONG);
+        return Err(KernelError::NameTooLong);
     }
     let mount = match (*mount_wrapper).private_data {
         MountPrivate::Ext2(mount) => mount,
-        _ => return Err(KernelError::EOPNOTSUPP),
+        _ => return Err(KernelError::OpNotSupp),
     };
+    let _guard = EXT2_WRITE_LOCK.lock();
     let inode_number = ext2_alloc_inode(&mount)?;
     let file_type = match node_type {
         VfsNodeType::Directory => 0x4000,
         VfsNodeType::File => 0x8000,
-        _ => return Err(KernelError::EOPNOTSUPP),
+        _ => return Err(KernelError::OpNotSupp),
     };
     let inode = Ext2Inode {
         i_mode: file_type | (mode & 0o777),
@@ -639,11 +739,7 @@ pub(crate) unsafe fn create_node(
         i_mtime: 0,
         i_dtime: 0,
         i_gid: gid as u16,
-        i_links_count: if node_type == VfsNodeType::Directory {
-            2
-        } else {
-            1
-        },
+        i_links_count: if node_type == VfsNodeType::Directory { 2 } else { 1 },
         i_blocks: 0,
         i_flags: 0,
         i_osd1: 0,
@@ -654,16 +750,10 @@ pub(crate) unsafe fn create_node(
         i_faddr: 0,
         i_osd2: [0; 3],
     };
-    if let Err(error) = update_inode(&mount, inode_number, &inode) {
-        return Err(error);
-    }
-    if let Err(error) = add_directory_entry(&mount, parent_inode, inode_number, name, node_type) {
-        return Err(error);
-    }
+    update_inode(&mount, inode_number, &inode)?;
+    add_directory_entry(&mount, parent_inode, inode_number, name, node_type)?;
     if node_type == VfsNodeType::Directory {
-        if let Err(error) = init_new_directory(&mount, parent_inode, inode_number) {
-            return Err(error);
-        }
+        init_new_directory(&mount, parent_inode, inode_number)?;
     }
     Ok(inode_number)
 }
@@ -674,7 +764,7 @@ unsafe fn parse_directory_block(
     block_size: usize,
     father_node: *mut VfsNode,
     master_node: *mut VfsNode,
-) {
+) -> KResult<()> {
     let mut offset: usize = 0;
     let mut previous_sibling: *mut VfsNode = core::ptr::null_mut();
 
@@ -685,50 +775,71 @@ unsafe fn parse_directory_block(
             break;
         }
 
-        if entry.inode != 0 {
-            let name_ptr = block_buffer.add(offset + 8);
-            let name_slice = core::slice::from_raw_parts(name_ptr, entry.name_len as usize);
-            let name_str = core::str::from_utf8(name_slice).unwrap_or("?");
+        if entry.inode == 0 {
+            offset += entry.rec_len as usize;
+            continue;
+        }
+        let name_ptr = block_buffer.add(offset + 8);
+        let name_slice = core::slice::from_raw_parts(name_ptr, entry.name_len as usize);
+        let name_str = core::str::from_utf8(name_slice).unwrap_or("?");
 
-            if name_str != "." && name_str != ".." {
-                if let Ok(new_node) = vfs::alloc_vfs_node() {
-                    core::ptr::copy_nonoverlapping(
-                        name_ptr,
-                        (*new_node).name.as_mut_ptr(),
-                        entry.name_len as usize,
-                    );
-                    (*new_node).inode = entry.inode;
-                    (*new_node).node_type = ext2_type_to_vfs(entry.file_type);
-                    (*new_node).father = father_node;
-                    (*new_node).master = master_node;
-
-                    if let Ok(disk_inode) = get_inode(mount, entry.inode) {
-                        (*new_node).size = disk_inode.i_size;
-                        (*new_node).links = disk_inode.i_links_count as u32;
-                        (*new_node).owner_uid = disk_inode.i_uid as u32;
-                        (*new_node).owner_gid = disk_inode.i_gid as u32;
-                        (*new_node).rights = disk_inode.i_mode & 0x0FFF; // Extract permission mask
-                    } else {
-                        pr_warn!(
-                            "Failed to retrieve inode {} for entry {}\n",
-                            entry.inode as u32,
-                            name_str
-                        );
-                        continue;
-                    }
-
-                    if (*father_node).children.is_null() {
-                        (*father_node).children = new_node;
-                    } else if !previous_sibling.is_null() {
-                        (*previous_sibling).next_of_kin = new_node;
-                    }
-
-                    previous_sibling = new_node;
+        if name_str != "." && name_str != ".." {
+            let new_node = match vfs::alloc_vfs_node() {
+                Ok(node) => node,
+                Err(e) => {
+                    discard_children(father_node);
+                    return Err(e);
                 }
+            };
+            core::ptr::copy_nonoverlapping(
+                name_ptr,
+                (*new_node).name.as_mut_ptr(),
+                entry.name_len as usize,
+            );
+            (*new_node).inode = entry.inode;
+            (*new_node).node_type = ext2_type_to_vfs(entry.file_type);
+            (*new_node).father = father_node;
+            (*new_node).master = master_node;
+
+            if let Ok(disk_inode) = get_inode(mount, entry.inode) {
+                (*new_node).size = disk_inode.i_size;
+                (*new_node).links = disk_inode.i_links_count as u32;
+                (*new_node).owner_uid = disk_inode.i_uid as u32;
+                (*new_node).owner_gid = disk_inode.i_gid as u32;
+                (*new_node).rights = disk_inode.i_mode & 0x0FFF; // Extract permission mask
+            } else {
+                pr_warn!(
+                    "Failed to retrieve inode {} for entry {}",
+                    { entry.inode },
+                    name_str
+                );
+                vfs::free_vfs_node(new_node);
+                offset += entry.rec_len as usize;
+                continue;
             }
+
+            if (*father_node).children.is_null() {
+                (*father_node).children = new_node;
+            } else if !previous_sibling.is_null() {
+                (*previous_sibling).next_of_kin = new_node;
+            }
+
+            previous_sibling = new_node;
         }
 
         offset += entry.rec_len as usize;
+    }
+    Ok(())
+}
+
+/// Undoes a partial directory load, so that the next lookup can retry it.
+unsafe fn discard_children(dir: *mut VfsNode) {
+    let mut child = core::mem::take(&mut (*dir).children);
+    while !child.is_null() {
+        let next = (*child).next_of_kin;
+        (*child).father = core::ptr::null_mut();
+        crate::fs::defer_free(child);
+        child = next;
     }
 }
 
@@ -740,18 +851,18 @@ pub unsafe fn mount_device(device_id: BlockDeviceId) -> KResult<()> {
 pub unsafe fn mount_device_at(device_id: BlockDeviceId, target: *mut VfsNode) -> KResult<()> {
     if !target.is_null() {
         if (*target).node_type != VfsNodeType::Directory {
-            return Err(KernelError::ENOTDIR);
+            return Err(KernelError::NotDir);
         }
         if !(*target).children.is_null() {
-            return Err(KernelError::EBUSY);
+            return Err(KernelError::Busy);
         }
     }
 
-    pr_info!("Mounting EXT2 filesystem on device {}\n", device_id);
+    pr_info!("Mounting EXT2 filesystem on device {}", device_id);
     let mut buffer = [0u8; 1024];
     let Ok(()) = drivers::read_sectors(device_id, 2, 2, &mut buffer) else {
-        pr_warn!("Failed to read EXT2 superblock from device {}\n", device_id);
-        return Err(KernelError::EIO);
+        pr_warn!("Failed to read EXT2 superblock from device {}", device_id);
+        return Err(KernelError::IO);
     };
 
     let superblock: Ext2Superblock = core::ptr::read(buffer.as_ptr() as *const _);
@@ -761,7 +872,7 @@ pub unsafe fn mount_device_at(device_id: BlockDeviceId, target: *mut VfsNode) ->
             "Invalid EXT2 superblock magic number: {:#X}",
             superblock.magic as u32
         );
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let mount_wrapper = create_ext2_mount(device_id, &superblock)?;
@@ -780,10 +891,10 @@ pub unsafe fn mount_device_at(device_id: BlockDeviceId, target: *mut VfsNode) ->
 
     if (root_inode.i_mode & 0xF000) != 0x4000 {
         pr_warn!(
-            "Error: Inode 2 is not a directory. Mode: {:#X}\n",
+            "Error: Inode 2 is not a directory. Mode: {:#X}",
             root_inode.i_mode as u16
         );
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let root_vfs = vfs::alloc_vfs_node().unwrap();
@@ -819,14 +930,15 @@ pub unsafe fn mount_device_at(device_id: BlockDeviceId, target: *mut VfsNode) ->
         return Err(e);
     }
 
-    parse_directory_block(
-        &mount,
+    let parsed = parse_directory_block(
+        mount,
         dir_buffer.as_ptr(),
         mount.sb.block_size() as usize,
         root_vfs,
         root_vfs,
     );
     kfree(dir_alloc).ok();
+    parsed?;
 
     if !target.is_null() {
         (*target).children = (*root_vfs).children;
@@ -870,13 +982,12 @@ pub unsafe fn read_from_inode(
             let block_size = mount.sb.block_size() as usize;
             let mut ptr_buf = HeapBuffer::new(block_size)?;
             read_block(&mount, indirect_block, &mut ptr_buf)?;
-            let ptrs =
-                core::slice::from_raw_parts(ptr_buf.as_ptr() as *const u32, block_size / 4);
+            let ptrs = core::slice::from_raw_parts(ptr_buf.as_ptr() as *const u32, block_size / 4);
             ptrs[logical_block_idx - 12]
         }
     } else {
-        pr_err!("File too large, doubly indirect blocks not implemented.\n");
-        return Err(KernelError::ENOSYS);
+        pr_err!("File too large, doubly indirect blocks not implemented.");
+        return Err(KernelError::NoSys);
     };
 
     if physical_block == 0 {
@@ -894,7 +1005,7 @@ pub unsafe fn read_from_inode(
     let block_buf = &mut *(block_alloc as *mut [u8; 4096]);
     if read_block(&mount, physical_block, &mut block_buf[..block_size]).is_err() {
         kfree(block_alloc).ok();
-        return Err(KernelError::EIO);
+        return Err(KernelError::IO);
     }
 
     core::ptr::copy_nonoverlapping(
@@ -922,7 +1033,10 @@ pub unsafe fn write_to_inode(
         let block_offset = offset % mount.sb.block_size();
         let space_in_block = mount.sb.block_size() - block_offset;
         let write_size = core::cmp::min(remaining, space_in_block as usize);
-        let phys_block = get_or_allocate_physical_block(&mount, inode_num, logical_block)?;
+        let phys_block = {
+            let _guard = EXT2_WRITE_LOCK.lock();
+            get_or_allocate_physical_block(&mount, inode_num, logical_block)?
+        };
 
         let block_alloc = kmalloc(4096)?;
         let block_buf = &mut *(block_alloc as *mut [u8; 4096]);
@@ -947,6 +1061,7 @@ pub unsafe fn write_to_inode(
         offset += write_size as u32;
     }
 
+    let _guard = EXT2_WRITE_LOCK.lock();
     let mut inode = get_inode(&mount, inode_num)?;
     if offset > inode.i_size {
         inode.i_size = offset;
@@ -958,37 +1073,46 @@ pub unsafe fn write_to_inode(
 
 pub unsafe fn truncate_inode(mount_wrap: *const Mount, inode_num: u32) -> KResult<()> {
     let mount = ext2_mount_from_wrapper(mount_wrap)?;
-    let mut inode = get_inode(&mount, inode_num)?;
+    let _guard = EXT2_WRITE_LOCK.lock();
+    free_inode_blocks(&mount, inode_num)
+}
 
+unsafe fn free_inode_blocks(mount: &Ext2Mount, inode_num: u32) -> KResult<()> {
+    let mut inode = get_inode(mount, inode_num)?;
+
+    // Ext2Inode is packed and 1-byte aligned, creating references to its fields
+    // is not allowed. Clippy marks this needless, but the other option is to
+    // use raw pointers. So I say this is needed.
+    #[allow(clippy::needless_range_loop)]
     for block_index in 0..12 {
         let block_num = inode.i_block[block_index];
         if block_num != 0 {
-            ext2_free_block(&mount, block_num)?;
+            ext2_free_block(mount, block_num)?;
             inode.i_block[block_index] = 0;
         }
     }
 
     if inode.i_block[12] != 0 {
-        free_block_tree(&mount, inode.i_block[12], 1)?;
+        free_block_tree(mount, inode.i_block[12], 1)?;
         inode.i_block[12] = 0;
     }
 
     if inode.i_block[13] != 0 {
-        free_block_tree(&mount, inode.i_block[13], 2)?;
+        free_block_tree(mount, inode.i_block[13], 2)?;
         inode.i_block[13] = 0;
     }
 
     if inode.i_block[14] != 0 {
-        free_block_tree(&mount, inode.i_block[14], 3)?;
+        free_block_tree(mount, inode.i_block[14], 3)?;
         inode.i_block[14] = 0;
     }
 
     inode.i_size = 0;
     inode.i_blocks = 0;
-    update_inode(&mount, inode_num, &inode)
+    update_inode(mount, inode_num, &inode)
 }
 
-pub unsafe fn lazy_load_directory(
+pub unsafe fn lazy_load_directory_node(
     mount_wrap: *const Mount,
     dir_node: *mut VfsNode,
     dir_node_num: u32,
@@ -1002,18 +1126,16 @@ pub unsafe fn lazy_load_directory(
         return Ok(());
     }
 
-    let lba = block_num * (mount.sb.block_size() / 512);
-    let sector_count = (mount.sb.block_size() / 512) as u8;
-
     let dir_alloc = kmalloc(4096)?;
     let dir_buf = &mut *(dir_alloc as *mut [u8; 4096]);
-    let read_res = drivers::read_sectors(mount.device_id, lba, sector_count, dir_buf);
+    // Through the cache: entries written since boot may not be on disk yet.
+    let read_res = read_block(&mount, block_num, dir_buf);
     if let Err(e) = read_res {
         kfree(dir_alloc).ok();
         return Err(e);
     }
 
-    parse_directory_block(
+    let parsed = parse_directory_block(
         &mount,
         dir_buf.as_ptr(),
         mount.sb.block_size() as usize,
@@ -1021,13 +1143,43 @@ pub unsafe fn lazy_load_directory(
         (*dir_node).master,
     );
     kfree(dir_alloc).ok();
-    Ok(())
+    parsed
 }
 
-pub unsafe fn unlink_node(
-    _mount_wrap: *const Mount,
-    _parent_inode: u32,
-    _name: &str,
-) -> KResult<()> {
-    Err(KernelError::ENOSYS)
+/// Removes the directory entry and drops a link. The inode and its data stay,
+/// so an unlinked file that is still open keeps working; `evict_inode` frees
+/// them once the VFS node goes away.
+pub unsafe fn unlink_node(mount_wrap: *const Mount, parent_inode: u32, name: &str) -> KResult<()> {
+    let mount = ext2_mount_from_wrapper(mount_wrap)?;
+    let _guard = EXT2_WRITE_LOCK.lock();
+
+    let inode_num = remove_directory_entry(&mount, parent_inode, name.as_bytes())?;
+    let mut inode = get_inode(&mount, inode_num)?;
+    inode.i_links_count = inode.i_links_count.saturating_sub(1);
+    update_inode(&mount, inode_num, &inode)
+}
+
+/// Frees an inode and its data if no directory entry refers to it any more.
+pub unsafe fn evict_inode(mount_wrap: *const Mount, inode_num: u32) -> KResult<()> {
+    const S_IFMT: u16 = 0xF000;
+    const S_IFLNK: u16 = 0xA000;
+
+    let mount = ext2_mount_from_wrapper(mount_wrap)?;
+    let _guard = EXT2_WRITE_LOCK.lock();
+
+    let inode = get_inode(&mount, inode_num)?;
+    if inode.i_links_count != 0 {
+        return Ok(());
+    }
+    // A short symlink keeps its target in i_block, so those aren't block numbers.
+    let fast_symlink = inode.i_mode & S_IFMT == S_IFLNK && inode.i_blocks == 0;
+    if !fast_symlink {
+        free_inode_blocks(&mount, inode_num)?;
+    }
+
+    let mut inode = get_inode(&mount, inode_num)?;
+    inode.i_mode = 0;
+    inode.i_dtime = 1; // there is no wall clock here; non-zero marks it deleted
+    update_inode(&mount, inode_num, &inode)?;
+    ext2_free_inode(&mount, inode_num)
 }

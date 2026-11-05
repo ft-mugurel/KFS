@@ -2,8 +2,7 @@ use core::fmt::Write;
 
 use crate::{
     error::{KResult, KernelError},
-    fs::{self, VfsNode},
-    sched, security,
+    fs, paging, sched, security,
 };
 
 use super::BufferWriter;
@@ -18,7 +17,7 @@ unsafe fn check_process_inspect_permission(task_uid: u32) -> KResult<()> {
     if security::check(&credentials, &object, security::Operation::Inspect)
         == security::Decision::Deny
     {
-        return Err(KernelError::EACCES);
+        return Err(KernelError::Acces);
     }
     Ok(())
 }
@@ -28,18 +27,12 @@ pub unsafe fn generate_proc_status(pid: u32, buf: &mut [u8]) -> KResult<usize> {
     let task = table
         .get(pid as usize)
         .and_then(|opt| opt.as_ref())
-        .ok_or(KernelError::ESRCH)?;
+        .ok_or(KernelError::Srch)?;
 
     check_process_inspect_permission(task.credentials.uid)?;
 
     let mut writer = BufferWriter::new(buf);
-    let comm = if pid == 0 {
-        "idle"
-    } else if pid == 1 {
-        "mysh"
-    } else {
-        "user_proc"
-    };
+    let comm = task.comm();
 
     let fd_count = task.fd_tbl.iter().flatten().count();
 
@@ -56,7 +49,11 @@ pub unsafe fn generate_proc_status(pid: u32, buf: &mut [u8]) -> KResult<usize> {
     let _ = writeln!(writer, "FDCount: {}", fd_count);
     let _ = writeln!(writer, "ChildCount: {}", task.family.child_count);
     let _ = writeln!(writer, "KernelStackTop: {:#010X}", task.kernel_stack_top);
-    let _ = writeln!(writer, "KernelStackBottom: {:#010X}", task.kernel_stack_bottom);
+    let _ = writeln!(
+        writer,
+        "KernelStackBottom: {:#010X}",
+        task.kernel_stack_bottom
+    );
     let _ = writeln!(writer, "CR3: {:#010X}", task.context.cr3);
     let _ = writeln!(writer, "ExitCode: {}", task.exit_code.unwrap_or(0));
 
@@ -68,19 +65,14 @@ pub unsafe fn generate_proc_cmdline(pid: u32, buf: &mut [u8]) -> KResult<usize> 
     let task = table
         .get(pid as usize)
         .and_then(|opt| opt.as_ref())
-        .ok_or(KernelError::ESRCH)?;
+        .ok_or(KernelError::Srch)?;
 
     check_process_inspect_permission(task.credentials.uid)?;
 
     let mut writer = BufferWriter::new(buf);
-    let comm = if pid == 0 {
-        "idle\0"
-    } else if pid == 1 {
-        "mysh\0"
-    } else {
-        "user_proc\0"
-    };
-    let _ = writer.write_str(comm);
+    // No argv is kept, so argv[0] is the process name.
+    let _ = writer.write_str(task.comm());
+    let _ = writer.write_str("\0");
     Ok(writer.written())
 }
 
@@ -89,22 +81,15 @@ pub unsafe fn generate_proc_stat(pid: u32, buf: &mut [u8]) -> KResult<usize> {
     let task = table
         .get(pid as usize)
         .and_then(|opt| opt.as_ref())
-        .ok_or(KernelError::ESRCH)?;
+        .ok_or(KernelError::Srch)?;
 
     check_process_inspect_permission(task.credentials.uid)?;
 
     let mut writer = BufferWriter::new(buf);
-    let comm = if pid == 0 {
-        "idle"
-    } else if pid == 1 {
-        "mysh"
-    } else {
-        "user_proc"
-    };
+    let comm = task.comm();
 
     let state_char = match task.state {
-        sched::ProcessState::Running => 'R',
-        sched::ProcessState::Ready => 'D',
+        sched::ProcessState::Running | sched::ProcessState::Ready => 'R',
         sched::ProcessState::Sleeping | sched::ProcessState::Waiting => 'S',
         sched::ProcessState::Zombie => 'Z',
         sched::ProcessState::Terminated => 'T',
@@ -119,74 +104,110 @@ pub unsafe fn generate_proc_stat(pid: u32, buf: &mut [u8]) -> KResult<usize> {
     Ok(writer.written())
 }
 
+/// "rwxp"-style permissions for a region. i686 without PAE has no NX bit, so
+/// every user page is executable; writability comes from the page tables.
+fn perms(writable: bool) -> &'static str {
+    if writable { "rwxp" } else { "r-xp" }
+}
+
+/// Whether any present page in [base, base + size) of `cr3` is writable
+/// regions with nothing mapped yet use `default` (what a fault would map).
+fn region_writable(cr3: u32, base: u32, size: u32, default: bool) -> bool {
+    let mut page = base & !0xFFF;
+    let end = base.saturating_add(size);
+    while page < end {
+        if let Some(entry) = paging::page_entry_in(cr3, page) {
+            return entry & paging::PAGE_WRITABLE != 0;
+        }
+        page = match page.checked_add(paging::PAGE_SIZE as u32) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    default
+}
+
 pub unsafe fn generate_proc_maps(pid: u32, buf: &mut [u8]) -> KResult<usize> {
     let table = sched::PROCESS_TABLE.lock();
     let task = table
         .get(pid as usize)
         .and_then(|opt| opt.as_ref())
-        .ok_or(KernelError::ESRCH)?;
+        .ok_or(KernelError::Srch)?;
 
     check_process_inspect_permission(task.credentials.uid)?;
 
     let mut writer = BufferWriter::new(buf);
     let mem = &task.memory;
-
-    if mem.code_size > 0 {
+    let cr3 = task.context.cr3;
+    let mut region = |start: u32, end: u32, writable: bool, name: &str| {
         let _ = writeln!(
             writer,
-            "{:08x}-{:08x} r-xp {:08x} [text]",
+            "{:08x}-{:08x} {} 00000000 00:00 0 {}",
+            start,
+            end,
+            perms(writable),
+            name
+        );
+    };
+
+    // Text and data share the same pages; report them once.
+    if mem.code_size > 0 {
+        let end = mem.code_base.saturating_add(mem.code_size);
+        region(
             mem.code_base,
-            mem.code_base.saturating_add(mem.code_size),
-            mem.code_size
+            end,
+            region_writable(cr3, mem.code_base, mem.code_size, true),
+            "[text]",
         );
     }
-    if mem.data_size > 0 {
-        let _ = writeln!(
-            writer,
-            "{:08x}-{:08x} rw-p {:08x} [data]",
+    if mem.data_size > 0 && mem.data_base != mem.code_base {
+        let end = mem.data_base.saturating_add(mem.data_size);
+        region(
             mem.data_base,
-            mem.data_base.saturating_add(mem.data_size),
-            mem.data_size
+            end,
+            region_writable(cr3, mem.data_base, mem.data_size, true),
+            "[data]",
         );
     }
     if mem.bss_size > 0 {
-        let _ = writeln!(
-            writer,
-            "{:08x}-{:08x} rw-p {:08x} [bss]",
+        let end = mem.bss_base.saturating_add(mem.bss_size);
+        region(
             mem.bss_base,
-            mem.bss_base.saturating_add(mem.bss_size),
-            mem.bss_size
+            end,
+            region_writable(cr3, mem.bss_base, mem.bss_size, true),
+            "[bss]",
         );
     }
     if mem.heap_brk > mem.heap_base {
-        let _ = writeln!(
-            writer,
-            "{:08x}-{:08x} rw-p {:08x} [heap]",
+        let size = mem.heap_brk - mem.heap_base;
+        region(
             mem.heap_base,
             mem.heap_brk,
-            mem.heap_brk - mem.heap_base
+            region_writable(cr3, mem.heap_base, size, true),
+            "[heap]",
         );
     }
-    if mem.stack_base > 0 {
-        let _ = writeln!(
-            writer,
-            "{:08x}-{:08x} rwxp {:08x} [stack]",
-            mem.stack_base,
+    for vma in mem.vmas.iter().filter(|vma| vma.used && vma.size > 0) {
+        let name = if vma.base == crate::process_memory::ENV_BASE {
+            "[env]"
+        } else {
+            ""
+        };
+        region(
+            vma.base,
+            vma.base.saturating_add(vma.size),
+            vma.flags & sched::VMA_WRITE != 0,
+            name,
+        );
+    }
+    if mem.stack_base > mem.stack_limit {
+        let size = mem.stack_base - mem.stack_limit;
+        region(
             mem.stack_limit,
-            mem.stack_limit.saturating_sub(mem.stack_base)
+            mem.stack_base,
+            region_writable(cr3, mem.stack_limit, size, true),
+            "[stack]",
         );
-    }
-
-    for vma in &mem.vmas {
-        if vma.used && vma.size > 0 {
-            let _ = writeln!(
-                writer,
-                "{:08x}-{:08x} rw-p {:08x} [vma]",
-                vma.base,
-                vma.base.saturating_add(vma.size),
-                vma.size
-            );
-        }
     }
 
     Ok(writer.written())
@@ -197,35 +218,8 @@ pub unsafe fn generate_proc_cwd(pid: u32, buf: &mut [u8]) -> KResult<usize> {
     let task = table
         .get(pid as usize)
         .and_then(|opt| opt.as_ref())
-        .ok_or(KernelError::ESRCH)?;
+        .ok_or(KernelError::Srch)?;
 
     check_process_inspect_permission(task.credentials.uid)?;
-
-    let mut current = task.cwd;
-    let mut writer = BufferWriter::new(buf);
-
-    if current.is_null() || current == fs::ROOT_NODE {
-        let _ = writeln!(writer, "/");
-        return Ok(writer.written());
-    }
-
-    let mut segments: [*mut VfsNode; 16] = [core::ptr::null_mut(); 16];
-    let mut count = 0;
-
-    while !current.is_null() && current != fs::ROOT_NODE && count < 16 {
-        segments[count] = current;
-        count += 1;
-        current = (*current).father;
-    }
-
-    for i in (0..count).rev() {
-        let _ = write!(writer, "/");
-        let node = segments[i];
-        let name_len = (*node).name.iter().position(|&c| c == 0).unwrap_or(256);
-        let name = core::str::from_utf8(&(&(*node).name)[..name_len]).unwrap_or("?");
-        let _ = write!(writer, "{}", name);
-    }
-    let _ = writeln!(writer);
-
-    Ok(writer.written())
+    fs::node_path(task.cwd, buf)
 }

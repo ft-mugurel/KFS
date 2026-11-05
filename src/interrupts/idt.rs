@@ -30,7 +30,6 @@ static mut IDT: [IdtEntry; startup_config::idt::ENTRIES] = [IdtEntry {
     offset_high: 0,
 }; startup_config::idt::ENTRIES];
 
-
 #[unsafe(link_section = ".init.text")]
 pub fn init_idt() {
     // Initialize the IDTPointer first entry the size second the address of the first IDT entry
@@ -46,7 +45,7 @@ pub fn init_idt() {
 }
 
 pub(crate) fn register_interrupt_handler(index: u8, handler: unsafe extern "C" fn()) {
-    let handler_addr = handler as u32;
+    let handler_addr = handler as usize;
     unsafe {
         IDT[index as usize] = IdtEntry {
             offset_low: handler_addr as u16,
@@ -59,7 +58,7 @@ pub(crate) fn register_interrupt_handler(index: u8, handler: unsafe extern "C" f
 }
 
 pub(crate) fn register_user_interrupt_handler(index: u8, handler: unsafe extern "C" fn()) {
-    let handler_addr = handler as u32;
+    let handler_addr = handler as usize;
     unsafe {
         IDT[index as usize] = IdtEntry {
             offset_low: handler_addr as u16,

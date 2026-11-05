@@ -1,6 +1,22 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use super::types::{Glyph, KeyCode, KeyboardLayout, Modifiers};
+use crate::modules::abi::{KeyCode, Modifiers};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum KeyboardLayout {
+    UsQwerty = 0,
+    TrQwerty = 1,
+    GbQwerty = 2,
+
+    LayoutEnd = 3,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Glyph {
+    pub(super) base: char,
+    pub(super) lvl2: char,
+    pub(super) is_letter: bool,
+}
 
 impl Glyph {
     const fn new_l2(base: char, lvl2: char, is_letter: bool) -> Self {
@@ -10,11 +26,7 @@ impl Glyph {
 
 static ACTIVE_LAYOUT: AtomicU8 = AtomicU8::new(KeyboardLayout::UsQwerty as u8);
 
-pub fn set_layout(layout: KeyboardLayout) {
-    ACTIVE_LAYOUT.store(layout as u8, Ordering::Relaxed);
-}
-
-pub fn get_layout() -> KeyboardLayout {
+fn get_layout() -> KeyboardLayout {
     match ACTIVE_LAYOUT.load(Ordering::Relaxed) {
         0 => KeyboardLayout::UsQwerty,
         1 => KeyboardLayout::TrQwerty,

@@ -6,6 +6,7 @@ use rustc_demangle::try_demangle;
 
 fn main() {
     println!("cargo:rerun-if-changed=build/kallsyms.map");
+    emit_build_info();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let out_file = out_dir.join("kallsyms_generated.rs");
@@ -95,13 +96,13 @@ fn dedup_by_addr(entries: &mut Vec<(u32, String)>) {
 
     let mut deduped: Vec<(u32, String)> = Vec::with_capacity(entries.len());
     for (addr, name) in entries.drain(..) {
-        if let Some((last_addr, last_name)) = deduped.last_mut() {
-            if *last_addr == addr {
-                if symbol_score(&name) > symbol_score(last_name) {
-                    *last_name = name;
-                }
-                continue;
+        if let Some((last_addr, last_name)) = deduped.last_mut()
+            && *last_addr == addr
+        {
+            if symbol_score(&name) > symbol_score(last_name) {
+                *last_name = name;
             }
+            continue;
         }
         deduped.push((addr, name));
     }
@@ -157,4 +158,21 @@ fn escape(s: &str) -> String {
         }
     }
     escaped
+}
+
+/// Exposes compiler and profile to the kernel for /proc/version.
+fn emit_build_info() {
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let rustc_version = std::process::Command::new(rustc)
+        .arg("-V")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "rustc (unknown)".to_string());
+    println!("cargo:rustc-env=KFS_RUSTC_VERSION={}", rustc_version);
+    println!(
+        "cargo:rustc-env=KFS_BUILD_PROFILE={}",
+        env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string())
+    );
 }

@@ -13,63 +13,52 @@ impl WaitQueue {
     }
 
     /// Register current task as waiting. Sets task to Waiting state.
-    /// Returns false if queue is full.
+    /// Returns false if queue is full. A task is only queued once.
     pub(crate) unsafe fn sleep(&mut self) -> bool {
-        if self.count >= MAX_WAITERS {
-            return false;
+        let task = unsafe { sched::current().as_mut() }.unwrap();
+        let pid = task.pid;
+        if !self.waiters[..self.count].contains(&pid) {
+            if self.count >= MAX_WAITERS {
+                return false;
+            }
+            self.waiters[self.count] = pid;
+            self.count += 1;
         }
-        let pid = sched::current_pid();
-        self.waiters[self.count] = pid;
-        self.count += 1;
 
-        let task = sched::current().as_mut().unwrap();
         sched::set_state(task, ProcessState::Waiting);
         true
     }
 
+    /// Wakes the first queued task that is still Waiting, skipping stale entries.
     pub(crate) unsafe fn wake_one(&mut self) {
-        if self.count == 0 {
-            return;
-        }
-        let pid = self.waiters[0] as usize;
-        // Shift remaining waiters
-        for i in 0..self.count - 1 {
-            self.waiters[i] = self.waiters[i + 1];
-        }
-        self.count -= 1;
-
         let mut table = PROCESS_TABLE.lock();
-        if let Some(ref mut task) = table[pid] {
-            if task.state == ProcessState::Waiting {
+        while self.count > 0 {
+            let pid = self.waiters[0] as usize;
+            // Shift remaining waiters
+            for i in 0..self.count - 1 {
+                self.waiters[i] = self.waiters[i + 1];
+            }
+            self.count -= 1;
+
+            if let Some(ref mut task) = table[pid]
+                && task.state == ProcessState::Waiting
+            {
                 sched::set_state(task, ProcessState::Ready);
+                return;
             }
         }
     }
 
     pub(crate) unsafe fn wake_all(&mut self) {
         let mut table = PROCESS_TABLE.lock();
-        for i in 0..self.count {
-            let pid = self.waiters[i] as usize;
-            if let Some(ref mut task) = table[pid] {
-                if task.state == ProcessState::Waiting {
-                    sched::set_state(task, ProcessState::Ready);
-                }
+        for p_pid in self.waiters.iter().take(self.count) {
+            let pid = *p_pid as usize;
+            if let Some(ref mut task) = table[pid]
+                && task.state == ProcessState::Waiting
+            {
+                sched::set_state(task, ProcessState::Ready);
             }
         }
         self.count = 0;
-    }
-
-    pub(crate) fn remove(&mut self, pid: u32) {
-        let mut i = 0;
-        while i < self.count {
-            if self.waiters[i] == pid {
-                for j in i..self.count - 1 {
-                    self.waiters[j] = self.waiters[j + 1];
-                }
-                self.count -= 1;
-            } else {
-                i += 1;
-            }
-        }
     }
 }

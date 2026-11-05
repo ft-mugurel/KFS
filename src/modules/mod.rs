@@ -1,23 +1,26 @@
-#![allow(dead_code)]
-
-pub(crate) mod keyboard;
+mod abi;
+mod api;
+mod callbacks;
+mod keyboard;
 mod time;
 
+pub use self::abi::{
+    CallbackToken, KernelModuleContext, KeyboardEvent, MODULE_ABI_VERSION, ModuleDescriptor,
+    ModuleEvent, ModuleEventKind, ModuleId, ModuleStr, TimeValue,
+};
+pub(crate) use self::callbacks::dispatch;
+
+use self::abi::{TIME_NOW_EXPORT, TIME_NOW_VERSION, TimeNowFn};
 use crate::{
     error::{KResult, KernelError},
     locks::Spinlock,
-    paging,
-    pr_debug, pr_err, pr_info, pr_warn,
+    paging, pr_err, pr_info, pr_warn,
 };
-use self::keyboard::types::{KeyEvent, Modifiers};
 
-pub const MODULE_ABI_VERSION: u32 = 1;
 const MAX_MODULES: usize = 16;
-const MAX_CALLBACKS: usize = 64;
 const MAX_DEPENDENCIES: usize = 32;
 const MAX_EXPORTS: usize = 32;
 const MAX_ALLOCATIONS: usize = 128;
-const MAX_DEFERRED_EVENTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -30,101 +33,13 @@ pub enum ModuleState {
     Destroyed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ModuleId(u16);
-
-impl ModuleId {
-    pub const INVALID: Self = Self(0);
-    fn index(self) -> usize {
-        self.0.saturating_sub(1) as usize
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModuleEvent {
-    CpuTick { cpu_id: u32 },
-    KeyPressed(KeyEvent, Modifiers),
-    KeyReleased(KeyEvent, Modifiers),
-}
-
-pub type ModuleCallback = fn(ModuleId, ModuleEvent, &KernelModuleApi);
-pub type ModuleInit = fn(&KernelModuleContext) -> KResult<()>;
-pub type ModuleDestroy = fn(&KernelModuleContext);
-
-#[derive(Clone, Copy)]
-pub struct ModuleDescriptor {
-    pub name: &'static str,
-    pub version: u32,
-    pub abi_version: u32,
-    pub flags: u32,
-    pub init: ModuleInit,
-    pub destroy: ModuleDestroy,
-    pub dependencies: &'static [&'static str],
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct KernelModuleContext {
-    pub module: ModuleId,
-    pub api: KernelModuleApi,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct KernelModuleApi {
-    pub abi_version: u32,
-    pub struct_size: usize,
-    pub log: fn(ModuleId, &'static str),
-    pub alloc: fn(ModuleId, usize) -> KResult<*mut u8>,
-    pub free: fn(ModuleId, *mut u8) -> KResult<()>,
-    pub callback_register: fn(ModuleId, ModuleEventKind, ModuleCallback) -> KResult<CallbackToken>,
-    pub callback_unregister: fn(CallbackToken) -> KResult<()>,
-    pub export_register: fn(ModuleId, &'static str, usize) -> KResult<()>,
-    pub time_now: fn() -> Option<TimeValue>,
-}
-
-impl KernelModuleApi {
-    pub fn validate(self) -> KResult<()> {
-        if self.abi_version != MODULE_ABI_VERSION
-            || self.struct_size < core::mem::size_of::<KernelModuleApi>()
-        {
-            return Err(KernelError::ENOEXEC);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModuleEventKind {
-    CpuTick,
-    KeyPressed,
-    KeyReleased,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CallbackToken(u16);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimeValue {
-    pub ticks: u64,
-    pub frequency_hz: u32,
-}
-
 #[derive(Clone, Copy)]
 struct ModuleRecord {
-    descriptor: ModuleDescriptor,
+    name: &'static str,
+    descriptor: &'static ModuleDescriptor,
     state: ModuleState,
+    dependents: usize,
     references: usize,
-    active_callbacks: usize,
-}
-
-#[derive(Clone, Copy)]
-struct CallbackRecord {
-    token: CallbackToken,
-    owner: ModuleId,
-    event: ModuleEventKind,
-    callback: ModuleCallback,
-    active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +53,7 @@ struct ExportRecord {
     name: &'static str,
     owner: ModuleId,
     address: usize,
+    version: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -146,91 +62,210 @@ struct Allocation {
     ptr: *mut u8,
 }
 
-unsafe impl Send for Allocation {}
-
 struct ModuleManager {
     modules: [Option<ModuleRecord>; MAX_MODULES],
-    callbacks: [Option<CallbackRecord>; MAX_CALLBACKS],
+    generations: [u16; MAX_MODULES],
     dependencies: [Option<Dependency>; MAX_DEPENDENCIES],
     exports: [Option<ExportRecord>; MAX_EXPORTS],
     allocations: [Option<Allocation>; MAX_ALLOCATIONS],
-    next_callback: u16,
+    callbacks: callbacks::CallbackTable,
+}
+
+unsafe impl Send for ModuleManager {}
+
+impl ModuleId {
+    fn new(slot: usize, generation: u16) -> Self {
+        Self(((generation as u32) << 16) | (slot as u32 + 1))
+    }
+
+    fn slot(self) -> Option<usize> {
+        let slot = (self.0 & 0xFFFF) as usize;
+        (slot != 0 && slot <= MAX_MODULES).then(|| slot - 1)
+    }
+
+    fn generation(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
 }
 
 impl ModuleManager {
     const fn new() -> Self {
         Self {
             modules: [None; MAX_MODULES],
-            callbacks: [None; MAX_CALLBACKS],
+            generations: [0; MAX_MODULES],
             dependencies: [None; MAX_DEPENDENCIES],
             exports: [None; MAX_EXPORTS],
             allocations: [None; MAX_ALLOCATIONS],
-            next_callback: 1,
+            callbacks: callbacks::CallbackTable::new(),
         }
     }
 
     fn find(&self, name: &str) -> Option<ModuleId> {
-        self.modules.iter().enumerate().find_map(|(index, record)| {
-            (record.is_some() && record.unwrap().descriptor.name == name)
-                .then_some(ModuleId(index as u16 + 1))
+        self.modules.iter().enumerate().find_map(|(slot, record)| {
+            record
+                .filter(|record| record.name == name)
+                .map(|_| ModuleId::new(slot, self.generations[slot]))
         })
     }
 
-    fn record(&self, id: ModuleId) -> KResult<ModuleRecord> {
-        self.modules
-            .get(id.index())
-            .and_then(|record| *record)
-            .ok_or(KernelError::ENOENT)
+    fn record(&self, id: ModuleId) -> KResult<&ModuleRecord> {
+        let slot = id.slot().ok_or(KernelError::NoEnt)?;
+        if self.generations[slot] != id.generation() {
+            return Err(KernelError::NoEnt);
+        }
+        self.modules[slot].as_ref().ok_or(KernelError::NoEnt)
     }
 
     fn record_mut(&mut self, id: ModuleId) -> KResult<&mut ModuleRecord> {
-        self.modules
-            .get_mut(id.index())
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::ENOENT)
+        let slot = id.slot().ok_or(KernelError::NoEnt)?;
+        if self.generations[slot] != id.generation() {
+            return Err(KernelError::NoEnt);
+        }
+        self.modules[slot].as_mut().ok_or(KernelError::NoEnt)
+    }
+
+    fn state(&self, id: ModuleId) -> Option<ModuleState> {
+        self.record(id).ok().map(|record| record.state)
+    }
+
+    fn is_live(&self, id: ModuleId) -> bool {
+        matches!(
+            self.state(id),
+            Some(ModuleState::Initializing | ModuleState::Active)
+        )
+    }
+
+    fn remove(&mut self, id: ModuleId) {
+        if let Some(slot) = id.slot() {
+            self.modules[slot] = None;
+            self.generations[slot] = self.generations[slot].wrapping_add(1);
+        }
+    }
+
+    fn reaches(&self, from: ModuleId, target: ModuleId) -> bool {
+        let mut stack = [ModuleId::INVALID; MAX_MODULES];
+        let mut depth = 0;
+        let mut visited = 0u32;
+        stack[0] = from;
+        depth += 1;
+        while depth > 0 {
+            depth -= 1;
+            let node = stack[depth];
+            if node == target {
+                return true;
+            }
+            for edge in self.dependencies.iter().flatten() {
+                let Some(slot) = edge.provider.slot() else {
+                    continue;
+                };
+                if edge.consumer == node && visited & (1 << slot) == 0 {
+                    visited |= 1 << slot;
+                    stack[depth] = edge.provider;
+                    depth += 1;
+                }
+            }
+        }
+        false
+    }
+
+    fn add_dependency(&mut self, consumer: ModuleId, provider: ModuleId) -> KResult<()> {
+        if !self.is_live(consumer) && self.state(consumer) != Some(ModuleState::Creating) {
+            return Err(KernelError::NoEnt);
+        }
+        if self.state(provider) != Some(ModuleState::Active) {
+            return Err(if self.record(provider).is_ok() {
+                KernelError::Busy
+            } else {
+                KernelError::NoEnt
+            });
+        }
+        if self.reaches(provider, consumer) {
+            return Err(KernelError::Deadlock);
+        }
+        if self
+            .dependencies
+            .iter()
+            .flatten()
+            .any(|edge| edge.consumer == consumer && edge.provider == provider)
+        {
+            return Ok(());
+        }
+        let slot = self
+            .dependencies
+            .iter()
+            .position(Option::is_none)
+            .ok_or(KernelError::NoSpc)?;
+        self.dependencies[slot] = Some(Dependency { consumer, provider });
+        self.record_mut(provider)?.dependents += 1;
+        Ok(())
+    }
+
+    fn release_dependencies(&mut self, consumer: ModuleId) {
+        for index in 0..MAX_DEPENDENCIES {
+            let Some(edge) = self.dependencies[index] else {
+                continue;
+            };
+            if edge.consumer == consumer {
+                self.dependencies[index] = None;
+                if let Ok(provider) = self.record_mut(edge.provider) {
+                    provider.dependents -= 1;
+                }
+            }
+        }
+    }
+
+    fn acquire_declared_dependencies(
+        &mut self,
+        consumer: ModuleId,
+        descriptor: &ModuleDescriptor,
+    ) -> KResult<()> {
+        for index in 0..descriptor.dependency_count {
+            let name = unsafe { (*descriptor.dependencies.add(index)).to_str()? };
+            let provider = self.find(name).ok_or(KernelError::NoEnt)?;
+            if provider == consumer {
+                return Err(KernelError::Inval);
+            }
+            self.add_dependency(consumer, provider)?;
+        }
+        Ok(())
     }
 }
 
 static MANAGER: Spinlock<ModuleManager> = Spinlock::new(ModuleManager::new());
-static DEFERRED_EVENTS: Spinlock<([Option<ModuleEvent>; MAX_DEFERRED_EVENTS], usize, usize)> =
-    Spinlock::new(([None; MAX_DEFERRED_EVENTS], 0, 0));
 
-fn api() -> KernelModuleApi {
-    KernelModuleApi {
-        abi_version: MODULE_ABI_VERSION,
-        struct_size: core::mem::size_of::<KernelModuleApi>(),
-        log: module_log,
-        alloc: module_alloc,
-        free: module_free,
-        callback_register,
-        callback_unregister: callback_unregister,
-        export_register,
-        time_now,
-    }
+fn context_for(module: ModuleId) -> KernelModuleContext {
+    KernelModuleContext { module, api: &api::API }
 }
 
-pub fn register(descriptor: ModuleDescriptor) -> KResult<ModuleId> {
+pub fn register(descriptor: &'static ModuleDescriptor) -> KResult<ModuleId> {
     if descriptor.abi_version != MODULE_ABI_VERSION {
-        return Err(KernelError::ENOEXEC);
+        return Err(KernelError::NoExec);
     }
+    if descriptor.flags != 0 || descriptor.dependency_count > MAX_DEPENDENCIES {
+        return Err(KernelError::Inval);
+    }
+    let name = unsafe { descriptor.name.to_str()? };
+    for index in 0..descriptor.dependency_count {
+        unsafe { (*descriptor.dependencies.add(index)).to_str()? };
+    }
+
     let mut manager = MANAGER.lock();
-    if manager.find(descriptor.name).is_some() {
-        return Err(KernelError::EEXIST);
+    if manager.find(name).is_some() {
+        return Err(KernelError::Exist);
     }
     let slot = manager
         .modules
         .iter()
         .position(Option::is_none)
-        .ok_or(KernelError::ENOSPC)?;
-    let id = ModuleId(slot as u16 + 1);
+        .ok_or(KernelError::NoSpc)?;
     manager.modules[slot] = Some(ModuleRecord {
+        name,
         descriptor,
         state: ModuleState::Registered,
+        dependents: 0,
         references: 0,
-        active_callbacks: 0,
     });
-    pr_info!("module registered: {}\n", descriptor.name);
-    Ok(id)
+    Ok(ModuleId::new(slot, manager.generations[slot]))
 }
 
 pub fn find(name: &str) -> Option<ModuleId> {
@@ -241,125 +276,119 @@ pub fn state(id: ModuleId) -> KResult<ModuleState> {
     MANAGER.lock().record(id).map(|record| record.state)
 }
 
+fn name_of(id: ModuleId) -> Option<&'static str> {
+    MANAGER.lock().record(id).ok().map(|record| record.name)
+}
+
 pub fn create(id: ModuleId) -> KResult<()> {
-    let descriptor;
-    {
+    if callbacks::in_callback() {
+        return Err(KernelError::Deadlock);
+    }
+    let (name, descriptor) = {
         let mut manager = MANAGER.lock();
-        descriptor = manager.record(id)?.descriptor;
-        if manager.record(id)?.state != ModuleState::Registered {
-            return Err(KernelError::EBUSY);
+        let record = *manager.record(id)?;
+        if record.state != ModuleState::Registered {
+            return Err(KernelError::Busy);
         }
         manager.record_mut(id)?.state = ModuleState::Creating;
-        for dependency in descriptor.dependencies {
-            if manager.find(dependency).is_none() {
-                manager.record_mut(id)?.state = ModuleState::Destroyed;
-                return Err(KernelError::ENOENT);
-            }
-        }
-        for dependency in descriptor.dependencies {
-            let provider = manager.find(dependency).ok_or(KernelError::ENOENT)?;
-            if manager.record(provider)?.state != ModuleState::Active {
-                manager.record_mut(id)?.state = ModuleState::Destroyed;
-                return Err(KernelError::EBUSY);
-            }
-            add_dependency_locked(&mut manager, id, provider)?;
+        if let Err(error) = manager.acquire_declared_dependencies(id, record.descriptor) {
+            manager.release_dependencies(id);
+            manager.remove(id);
+            pr_warn!(
+                "module {}: dependencies unavailable: {:?}",
+                record.name,
+                error
+            );
+            return Err(error);
         }
         manager.record_mut(id)?.state = ModuleState::Initializing;
-    }
+        (record.name, record.descriptor)
+    };
 
-    let context = KernelModuleContext { module: id, api: api() };
-    if let Err(error) = (descriptor.init)(&context) {
-        let _ = cleanup(id, descriptor);
+    let status = (descriptor.init)(&context_for(id));
+    if status != 0 {
+        let error = KernelError::from_code(status);
+        teardown(id, None);
+        MANAGER.lock().remove(id);
+        pr_warn!("module {}: init failed: {:?}", name, error);
         return Err(error);
     }
     MANAGER.lock().record_mut(id)?.state = ModuleState::Active;
-    pr_info!("module initialized: {}\n", descriptor.name);
+    pr_info!("module {} v{}: active", name, descriptor.version);
     Ok(())
 }
 
 pub fn destroy(id: ModuleId) -> KResult<()> {
-    let descriptor;
-    loop {
+    if callbacks::in_callback() {
+        return Err(KernelError::Deadlock);
+    }
+    let record = {
         let mut manager = MANAGER.lock();
         let record = manager.record_mut(id)?;
         if record.state != ModuleState::Active {
-            return Err(KernelError::EBUSY);
+            return Err(KernelError::Inval);
         }
-        if record.references != 0 {
-            return Err(KernelError::EBUSY);
+        if record.dependents != 0 || record.references != 0 {
+            return Err(KernelError::Busy);
         }
         record.state = ModuleState::Destroying;
-        descriptor = record.descriptor;
-        break;
-    }
-    cleanup(id, descriptor)?;
-    pr_info!("module destroyed: {}\n", descriptor.name);
+        *record
+    };
+    teardown(id, Some(record.descriptor));
+    MANAGER.lock().record_mut(id)?.state = ModuleState::Destroyed;
+    pr_info!("module {}: destroyed", record.name);
     Ok(())
 }
 
-fn cleanup(id: ModuleId, descriptor: ModuleDescriptor) -> KResult<()> {
-    unregister_all(id);
-    loop {
-        let active = MANAGER.lock().record(id)?.active_callbacks;
-        if active == 0 {
-            break;
-        }
-        core::hint::spin_loop();
+fn teardown(id: ModuleId, descriptor: Option<&'static ModuleDescriptor>) {
+    MANAGER
+        .lock()
+        .exports
+        .iter_mut()
+        .filter(|export| export.is_some_and(|export| export.owner == id))
+        .for_each(|export| *export = None);
+
+    callbacks::revoke_all(id);
+
+    if let Some(descriptor) = descriptor {
+        (descriptor.destroy)(&context_for(id));
     }
-    (descriptor.destroy)(&KernelModuleContext { module: id, api: api() });
-    let mut owned_allocations = [core::ptr::null_mut(); MAX_ALLOCATIONS];
-    let mut allocation_count = 0;
-    let mut manager = MANAGER.lock();
-    for allocation in &mut manager.allocations {
-        if let Some(entry) = *allocation {
-            if entry.owner == id {
-                owned_allocations[allocation_count] = entry.ptr;
-                allocation_count += 1;
+
+    let mut owned = [core::ptr::null_mut(); MAX_ALLOCATIONS];
+    let mut count = 0;
+    {
+        let mut manager = MANAGER.lock();
+        for allocation in &mut manager.allocations {
+            if let Some(entry) = allocation.filter(|entry| entry.owner == id) {
+                owned[count] = entry.ptr;
+                count += 1;
                 *allocation = None;
             }
         }
     }
-    drop(manager);
-    for ptr in owned_allocations.iter().take(allocation_count) {
+    for ptr in &owned[..count] {
         let _ = paging::kfree(*ptr);
     }
-    let mut manager = MANAGER.lock();
-    for index in 0..manager.dependencies.len() {
-        if let Some(entry) = manager.dependencies[index] {
-            if entry.consumer == id {
-                if let Ok(provider) = manager.record_mut(entry.provider) {
-                    provider.references = provider.references.saturating_sub(1);
-                }
-                manager.dependencies[index] = None;
-            }
-        }
-    }
-    if let Ok(record) = manager.record_mut(id) {
-        record.state = ModuleState::Destroyed;
-    }
-    manager.exports.iter_mut().for_each(|export| {
-        if export.map(|entry| entry.owner == id).unwrap_or(false) {
-            *export = None;
-        }
-    });
-    Ok(())
+
+    MANAGER.lock().release_dependencies(id);
 }
 
 pub fn unregister_module(id: ModuleId) -> KResult<()> {
     let mut manager = MANAGER.lock();
-    let record = manager.record(id)?;
-    if record.state != ModuleState::Destroyed || record.references != 0 {
-        return Err(KernelError::EBUSY);
+    match manager.record(id)?.state {
+        ModuleState::Registered | ModuleState::Destroyed => {
+            manager.remove(id);
+            Ok(())
+        }
+        _ => Err(KernelError::Busy),
     }
-    manager.modules[id.index()] = None;
-    Ok(())
 }
 
 pub fn acquire(id: ModuleId) -> KResult<()> {
     let mut manager = MANAGER.lock();
     let record = manager.record_mut(id)?;
     if record.state != ModuleState::Active {
-        return Err(KernelError::EBUSY);
+        return Err(KernelError::Busy);
     }
     record.references += 1;
     Ok(())
@@ -369,216 +398,243 @@ pub fn release(id: ModuleId) -> KResult<()> {
     let mut manager = MANAGER.lock();
     let record = manager.record_mut(id)?;
     if record.references == 0 {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
     record.references -= 1;
     Ok(())
 }
 
-fn add_dependency_locked(manager: &mut ModuleManager, consumer: ModuleId, provider: ModuleId) -> KResult<()> {
-    if manager.dependencies.iter().flatten().any(|entry| entry.consumer == consumer && entry.provider == provider) {
-        return Ok(());
-    }
-    let slot = manager.dependencies.iter().position(Option::is_none).ok_or(KernelError::ENOSPC)?;
-    manager.dependencies[slot] = Some(Dependency { consumer, provider });
-    manager.record_mut(provider)?.references += 1;
-    Ok(())
-}
-
 pub fn add_dependency(consumer: ModuleId, provider: ModuleId) -> KResult<()> {
-    let mut manager = MANAGER.lock();
-    if manager.record(provider)?.state != ModuleState::Active {
-        return Err(KernelError::EBUSY);
+    if consumer == provider {
+        return Err(KernelError::Inval);
     }
-    add_dependency_locked(&mut manager, consumer, provider)
+    MANAGER.lock().add_dependency(consumer, provider)
 }
 
-fn event_kind(event: ModuleEvent) -> ModuleEventKind {
-    match event {
-        ModuleEvent::CpuTick { .. } => ModuleEventKind::CpuTick,
-        ModuleEvent::KeyPressed(_, _) => ModuleEventKind::KeyPressed,
-        ModuleEvent::KeyReleased(_, _) => ModuleEventKind::KeyReleased,
-    }
-}
-
-pub fn callback_register(owner: ModuleId, event: ModuleEventKind, callback: ModuleCallback) -> KResult<CallbackToken> {
+fn export_register(
+    owner: ModuleId,
+    name: &'static str,
+    address: usize,
+    version: u32,
+) -> KResult<()> {
     let mut manager = MANAGER.lock();
-    if manager.record(owner)?.state != ModuleState::Initializing
-        && manager.record(owner)?.state != ModuleState::Active
+    if manager.state(owner) != Some(ModuleState::Initializing) {
+        return Err(KernelError::Perm);
+    }
+    if address == 0 {
+        return Err(KernelError::Inval);
+    }
+    if manager
+        .exports
+        .iter()
+        .flatten()
+        .any(|export| export.name == name)
     {
-        return Err(KernelError::EBUSY);
+        return Err(KernelError::Exist);
     }
-    let slot = manager.callbacks.iter().position(Option::is_none).ok_or(KernelError::ENOSPC)?;
-    let token = CallbackToken(manager.next_callback);
-    manager.next_callback = manager.next_callback.wrapping_add(1).max(1);
-    manager.callbacks[slot] = Some(CallbackRecord { token, owner, event, callback, active: true });
-    pr_debug!("callback registered for module {}\n", owner.0);
-    Ok(token)
-}
-
-pub fn callback_unregister(token: CallbackToken) -> KResult<()> {
-    let mut manager = MANAGER.lock();
-    let callback = manager.callbacks.iter_mut().flatten().find(|entry| entry.token == token).ok_or(KernelError::ENOENT)?;
-    callback.active = false;
+    let slot = manager
+        .exports
+        .iter()
+        .position(Option::is_none)
+        .ok_or(KernelError::NoSpc)?;
+    manager.exports[slot] = Some(ExportRecord { name, owner, address, version });
     Ok(())
 }
 
-fn unregister_all(owner: ModuleId) {
+fn find_export(manager: &ModuleManager, name: &str, version: u32) -> KResult<ExportRecord> {
+    let export = *manager
+        .exports
+        .iter()
+        .flatten()
+        .find(|export| export.name == name)
+        .ok_or(KernelError::NoDev)?;
+    if export.version != version {
+        return Err(KernelError::NoExec);
+    }
+    Ok(export)
+}
+
+fn export_lookup(consumer: ModuleId, name: &str, version: u32) -> KResult<usize> {
     let mut manager = MANAGER.lock();
-    for callback in &mut manager.callbacks {
-        if callback.map(|entry| entry.owner == owner).unwrap_or(false) {
-            *callback = None;
-        }
+    if !manager.is_live(consumer) {
+        return Err(KernelError::Perm);
     }
+    let export = find_export(&manager, name, version)?;
+    if export.owner != consumer {
+        manager.add_dependency(consumer, export.owner)?;
+    }
+    Ok(export.address)
 }
 
-pub fn dispatch(event: ModuleEvent) {
-    let kind = event_kind(event);
-    let mut pending: [(ModuleId, ModuleCallback); MAX_CALLBACKS] = [(ModuleId::INVALID, noop); MAX_CALLBACKS];
-    let mut count = 0;
-    {
+fn with_export<R>(name: &str, version: u32, call: impl FnOnce(usize) -> R) -> KResult<R> {
+    let export = {
         let mut manager = MANAGER.lock();
-        for index in 0..manager.callbacks.len() {
-            if let Some(callback) = manager.callbacks[index] {
-                if callback.active && callback.event == kind && count < MAX_CALLBACKS {
-                    if manager.record(callback.owner).map(|record| record.state == ModuleState::Active).unwrap_or(false) {
-                    pending[count] = (callback.owner, callback.callback);
-                    count += 1;
-                    if let Ok(owner) = manager.record_mut(callback.owner) {
-                        owner.active_callbacks += 1;
-                    }
-                }
-            }
+        let export = find_export(&manager, name, version)?;
+        let owner = manager.record_mut(export.owner)?;
+        if owner.state != ModuleState::Active {
+            return Err(KernelError::NoDev);
         }
-        }
-    }
-    for (owner, callback) in pending.iter().take(count) {
-        callback(*owner, event, &api());
-        let mut manager = MANAGER.lock();
-        if let Ok(record) = manager.record_mut(*owner) {
-            record.active_callbacks = record.active_callbacks.saturating_sub(1);
-        }
-    }
+        owner.references += 1;
+        export
+    };
+    let result = call(export.address);
+    let _ = release(export.owner);
+    Ok(result)
 }
 
-fn noop(_: ModuleId, _: ModuleEvent, _: &KernelModuleApi) {}
-
-fn module_log(_: ModuleId, message: &'static str) {
-    pr_info!("[module] {}\n", message);
+pub fn time_now() -> KResult<TimeValue> {
+    with_export(TIME_NOW_EXPORT, TIME_NOW_VERSION, |address| {
+        let now = unsafe { core::mem::transmute::<usize, TimeNowFn>(address) };
+        let mut value = TimeValue::default();
+        match now(&mut value) {
+            0 => Ok(value),
+            status => Err(KernelError::from_code(status)),
+        }
+    })?
 }
 
 fn module_alloc(owner: ModuleId, size: usize) -> KResult<*mut u8> {
-    {
-        let manager = MANAGER.lock();
-        if manager.record(owner)?.state != ModuleState::Active
-            && manager.record(owner)?.state != ModuleState::Initializing
-        {
-            return Err(KernelError::EBUSY);
-        }
+    if callbacks::in_callback() {
+        return Err(KernelError::Perm);
+    }
+    if size == 0 {
+        return Err(KernelError::Inval);
+    }
+    if !MANAGER.lock().is_live(owner) {
+        return Err(KernelError::Perm);
     }
     let ptr = paging::kmalloc(size)?;
     let mut manager = MANAGER.lock();
-    if manager.record(owner)?.state != ModuleState::Active
-        && manager.record(owner)?.state != ModuleState::Initializing
-    {
-        drop(manager);
-        let _ = paging::kfree(ptr);
-        return Err(KernelError::EBUSY);
-    }
     let Some(slot) = manager.allocations.iter().position(Option::is_none) else {
         drop(manager);
         let _ = paging::kfree(ptr);
-        return Err(KernelError::ENOSPC);
+        return Err(KernelError::NoSpc);
     };
     manager.allocations[slot] = Some(Allocation { owner, ptr });
     Ok(ptr)
 }
 
 fn module_free(owner: ModuleId, ptr: *mut u8) -> KResult<()> {
+    if callbacks::in_callback() {
+        return Err(KernelError::Perm);
+    }
     let mut manager = MANAGER.lock();
-    let slot = manager.allocations.iter().position(|entry| entry.map(|allocation| allocation.owner == owner && allocation.ptr == ptr).unwrap_or(false)).ok_or(KernelError::EINVAL)?;
+    let slot = manager
+        .allocations
+        .iter()
+        .position(|entry| entry.is_some_and(|entry| entry.owner == owner && entry.ptr == ptr))
+        .ok_or(KernelError::Inval)?;
     manager.allocations[slot] = None;
     drop(manager);
     paging::kfree(ptr)
 }
 
-fn export_register(owner: ModuleId, name: &'static str, address: usize) -> KResult<()> {
-    let mut manager = MANAGER.lock();
-    let slot = manager.exports.iter().position(Option::is_none).ok_or(KernelError::ENOSPC)?;
-    manager.exports[slot] = Some(ExportRecord { name, owner, address });
-    Ok(())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceCounts {
+    pub modules: usize,
+    pub callbacks: usize,
+    pub dependencies: usize,
+    pub exports: usize,
+    pub allocations: usize,
 }
 
-fn time_now() -> Option<TimeValue> {
+pub fn resource_counts() -> ResourceCounts {
     let manager = MANAGER.lock();
-    let export = manager.exports.iter().flatten().find(|entry| entry.name == "time.now")?;
-    let function: fn() -> TimeValue = unsafe { core::mem::transmute(export.address) };
-    Some(function())
-}
-
-pub fn module_time() -> Option<TimeValue> {
-    time_now()
-}
-
-pub fn dispatch_cpu_tick() {
-    let mut queue = DEFERRED_EVENTS.lock();
-    let next = (queue.1 + 1) % MAX_DEFERRED_EVENTS;
-    if next != queue.2 {
-        let head = queue.1;
-        queue.0[head] = Some(ModuleEvent::CpuTick {
-            cpu_id: unsafe { crate::sched::current_cpu() },
-        });
-        queue.1 = next;
+    ResourceCounts {
+        modules: manager.modules.iter().flatten().count(),
+        callbacks: manager.callbacks.len(),
+        dependencies: manager.dependencies.iter().flatten().count(),
+        exports: manager.exports.iter().flatten().count(),
+        allocations: manager.allocations.iter().flatten().count(),
     }
 }
 
-pub fn run_deferred_work() {
-    loop {
-        let event = {
-            let mut queue = DEFERRED_EVENTS.lock();
-            if queue.2 == queue.1 {
-                None
-            } else {
-                let tail = queue.2;
-                let event = queue.0[tail].take();
-                queue.2 = (queue.2 + 1) % MAX_DEFERRED_EVENTS;
-                event
-            }
-        };
-        let Some(event) = event else {
-            break;
-        };
-        dispatch(event);
-    }
-}
-
-pub fn dispatch_key_event(event: KeyEvent, modifiers: Modifiers) {
-    dispatch(if event.pressed {
-        ModuleEvent::KeyPressed(event, modifiers)
-    } else {
-        ModuleEvent::KeyReleased(event, modifiers)
+pub fn dispatch_cpu_tick(cpu_id: u32) {
+    dispatch(ModuleEvent::CpuTick {
+        cpu_id,
+        ticks: crate::interrupts::timer::get_ticks() as u64,
     });
+}
+
+struct BuiltinModule {
+    descriptor: &'static ModuleDescriptor,
+    autostart: bool,
+}
+
+static BUILTIN_MODULES: [BuiltinModule; 2] = [
+    BuiltinModule { descriptor: &time::DESCRIPTOR, autostart: true },
+    BuiltinModule { descriptor: &keyboard::DESCRIPTOR, autostart: true },
+];
+
+pub const fn builtin_count() -> usize {
+    BUILTIN_MODULES.len()
+}
+
+pub fn builtin_name(index: usize) -> Option<&'static str> {
+    let builtin = BUILTIN_MODULES.get(index)?;
+    unsafe { builtin.descriptor.name.to_str() }.ok()
+}
+
+pub fn builtin_state(index: usize) -> Option<ModuleState> {
+    find(builtin_name(index)?).and_then(|id| state(id).ok())
+}
+
+pub fn set_builtin_enabled(index: usize, enabled: bool) -> KResult<()> {
+    let builtin = BUILTIN_MODULES.get(index).ok_or(KernelError::NoEnt)?;
+    let name = builtin_name(index).ok_or(KernelError::Inval)?;
+    let existing = find(name);
+    let current = existing.map(state).transpose()?;
+
+    if !enabled {
+        return match (existing, current) {
+            (Some(id), Some(ModuleState::Active)) => destroy(id),
+            (_, None | Some(ModuleState::Registered | ModuleState::Destroyed)) => Ok(()),
+            _ => Err(KernelError::Busy),
+        };
+    }
+
+    let id = match (existing, current) {
+        (_, Some(ModuleState::Active)) => return Ok(()),
+        (Some(id), Some(ModuleState::Registered)) => id,
+        (Some(id), Some(ModuleState::Destroyed)) => {
+            unregister_module(id)?;
+            register(builtin.descriptor)?
+        }
+        (None, _) => register(builtin.descriptor)?,
+        _ => return Err(KernelError::Busy),
+    };
+    create(id)
 }
 
 #[unsafe(link_section = ".init.text")]
 pub fn init_modules() {
-    let keyboard = match register(keyboard::DESCRIPTOR).and_then(|id| create(id).map(|_| id)) {
-        Ok(id) => id,
-        Err(error) => {
-            pr_err!("keyboard module failed: {:?}\n", error);
-            return;
+    let mut registered = [None; BUILTIN_MODULES.len()];
+    for (index, builtin) in BUILTIN_MODULES.iter().enumerate() {
+        if !builtin.autostart {
+            continue;
         }
-    };
-    let time = match register(time::DESCRIPTOR).and_then(|id| create(id).map(|_| id)) {
-        Ok(id) => id,
-        Err(error) => {
-            pr_warn!("time module failed: {:?}\n", error);
-            let _ = destroy(keyboard);
-            let _ = unregister_module(keyboard);
-            return;
+        match register(builtin.descriptor) {
+            Ok(id) => registered[index] = Some(id),
+            Err(error) => pr_err!("module #{}: registration failed: {:?}", index, error),
         }
-    };
-    pr_info!("modules active: keyboard={}, time={}\n", keyboard.0, time.0);
+    }
+
+    let mut active = 0;
+    for id in registered.into_iter().flatten() {
+        if create(id).is_ok() {
+            active += 1;
+        }
+    }
+    let autostart = BUILTIN_MODULES
+        .iter()
+        .filter(|builtin| builtin.autostart)
+        .count();
+    pr_info!(
+        "modules: {}/{} built-in modules active ({} disabled)",
+        active,
+        autostart,
+        BUILTIN_MODULES.len() - autostart
+    );
 }
 
 crate::device_initcall!(init_modules);

@@ -1,15 +1,15 @@
-use crate::sched::{self, ContextFrame};
+use super::args::syscall_define;
+use crate::sched;
 
-pub(crate) unsafe fn syscall_getpid(regs: *mut ContextFrame) {
-    let pid = sched::current_pid();
-    (*regs).set_return_value(pid);
+syscall_define! {
+    pub(crate) fn syscall_getpid() {
+        Ok(unsafe { sched::current_pid() })
+    }
 }
 
-pub(crate) unsafe fn syscall_getppid(regs: *mut ContextFrame) {
-    let task = sched::current().as_ref();
-    let ppid = match task {
-        Some(t) => t.family.parent_pid,
-        None => 0,
-    };
-    (*regs).set_return_value(ppid);
+syscall_define! {
+    pub(crate) fn syscall_getppid() {
+        let parent = unsafe { sched::current().as_ref() }.map_or(0, |task| task.family.parent_pid);
+        Ok(parent)
+    }
 }

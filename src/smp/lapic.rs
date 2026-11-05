@@ -1,8 +1,7 @@
 use crate::{
-    error::KResultExt,
     interrupts::timer,
     paging::{self, PAGE_PCD, PAGE_PRESENT, PAGE_WRITABLE},
-    startup_config::power::CONFIG_HZ,
+    pr_err,
     x86::{rdmsr, wrmsr},
 };
 
@@ -41,103 +40,120 @@ static LAPIC_BASE: AtomicU32 = AtomicU32::new(0);
 /// across all cores, every core sees this same mapping once CR3 is loaded.
 #[unsafe(link_section = ".init.text")]
 pub unsafe fn map_lapic(phys_base: u32) {
-    paging::map_page(
+    // Only publish the base once it is mapped: register accesses through an
+    // unmapped (or zero) base would fault, or scribble on low memory.
+    match paging::map_page(
         phys_base,
         phys_base,
         PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD,
-    )
-    .consume_err("Failed to map LAPIC page\n");
-    LAPIC_BASE.store(phys_base, Ordering::SeqCst);
+    ) {
+        Ok(()) => LAPIC_BASE.store(phys_base, Ordering::SeqCst),
+        Err(e) => {
+            pr_err!("Failed to map LAPIC page: {:?}", e)
+        }
+    }
 }
 
-static mut LAPIC_TICKS_PER_MS: u32 = 0;
+static LAPIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(0);
 
 pub unsafe fn calibrate() {
-    reg_write(REG_TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
-    reg_write(REG_LVT_TIMER, TIMER_MASKED); // don't fire yet, just measuring
-    reg_write(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
+    unsafe {
+        reg_write(REG_TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
+        reg_write(REG_LVT_TIMER, TIMER_MASKED); // don't fire yet, just measuring
+        reg_write(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
+    }
 
+    const CALIBRATION_PIT_TICKS: u32 = 10;
+
+    // Start on a PIT tick edge, otherwise the first period is partial
+    let edge = timer::get_ticks();
+    while timer::get_ticks() == edge {}
     let start_pit_tick = timer::get_ticks();
-    while timer::get_ticks() < start_pit_tick + 10 {}
+    let start_count = unsafe { reg_read(REG_TIMER_CURRENT_COUNT) };
+    while timer::get_ticks() < start_pit_tick + CALIBRATION_PIT_TICKS as usize {}
 
-    let elapsed_lapic = 0xFFFF_FFFFu32 - reg_read(REG_TIMER_CURRENT_COUNT);
-    let ms_elapsed = (10 * 1000) / CONFIG_HZ; // however you expose the configured PIT rate
-    LAPIC_TICKS_PER_MS = elapsed_lapic / ms_elapsed.max(1);
+    let elapsed_lapic = start_count - unsafe { reg_read(REG_TIMER_CURRENT_COUNT) };
+    let ms_elapsed = timer::pit_ticks_to_ms(CALIBRATION_PIT_TICKS);
+    LAPIC_TICKS_PER_MS.store(elapsed_lapic / ms_elapsed.max(1), Ordering::SeqCst);
 
-    reg_write(REG_TIMER_INITIAL_COUNT, 0); // stop it until start_periodic_timer runs for real
+    unsafe { reg_write(REG_TIMER_INITIAL_COUNT, 0) }; // stop it until start_periodic_timer runs for real
 }
 
 unsafe fn reg_write(reg: u32, value: u32) {
     let base = LAPIC_BASE.load(Ordering::SeqCst);
-    core::ptr::write_volatile((base + reg) as *mut u32, value);
+    debug_assert!(base != 0, "LAPIC register write before map_lapic");
+    unsafe { core::ptr::write_volatile((base + reg) as *mut u32, value) };
 }
 
 unsafe fn reg_read(reg: u32) -> u32 {
     let base = LAPIC_BASE.load(Ordering::SeqCst);
-    core::ptr::read_volatile((base + reg) as *const u32)
+    debug_assert!(base != 0, "LAPIC register read before map_lapic");
+    unsafe { core::ptr::read_volatile((base + reg) as *const u32) }
 }
 
 /// Called by every core (BSP once in kmain, each AP once from ap_entry)
 /// to switch its own local APIC on.
 pub unsafe fn enable_local_apic(cpu_id: usize) {
-    // Make sure the MSR-level enable bit is set
-    let base = rdmsr(IA32_APIC_BASE_MSR);
-    wrmsr(IA32_APIC_BASE_MSR, base | APIC_BASE_ENABLE);
+    unsafe {
+        // Make sure the MSR-level enable bit is set
+        let base = rdmsr(IA32_APIC_BASE_MSR);
+        wrmsr(IA32_APIC_BASE_MSR, base | APIC_BASE_ENABLE);
 
-    reg_write(REG_TPR, 0); // accept all interrupt priorities
-    reg_write(REG_SVR, SVR_APIC_ENABLE | SPURIOUS_VECTOR);
+        reg_write(REG_TPR, 0); // accept all interrupt priorities
+        reg_write(REG_SVR, SVR_APIC_ENABLE | SPURIOUS_VECTOR);
 
-    if cpu_id == 0 {
-        reg_write(REG_LVT_LINT0, LVT_DELIVERY_EXTINT);
-    } else {
-        reg_write(REG_LVT_LINT0, LVT_MASKED);
+        if cpu_id == 0 {
+            reg_write(REG_LVT_LINT0, LVT_DELIVERY_EXTINT);
+        } else {
+            reg_write(REG_LVT_LINT0, LVT_MASKED);
+        }
+        reg_write(REG_LVT_LINT1, LVT_DELIVERY_NMI | LVT_MASKED);
     }
-    reg_write(REG_LVT_LINT1, LVT_DELIVERY_NMI | LVT_MASKED);
 }
 
 pub unsafe fn start_periodic_timer(slice_ms: u32) {
-    reg_write(REG_TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
-    reg_write(REG_LVT_TIMER, TIMER_PERIODIC | TIMER_VECTOR as u32);
-    reg_write(REG_TIMER_INITIAL_COUNT, LAPIC_TICKS_PER_MS * slice_ms);
+    let initial_count = LAPIC_TICKS_PER_MS.load(Ordering::SeqCst) * slice_ms;
+    unsafe {
+        reg_write(REG_TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
+        reg_write(REG_LVT_TIMER, TIMER_PERIODIC | TIMER_VECTOR as u32);
+        reg_write(REG_TIMER_INITIAL_COUNT, initial_count);
+    }
 }
 
 pub unsafe fn this_cpu_apic_id() -> u8 {
-    (reg_read(REG_ID) >> 24) as u8
+    (unsafe { reg_read(REG_ID) } >> 24) as u8
 }
 
 const ICR_LOW: u32 = 0x300;
 const ICR_HIGH: u32 = 0x310;
 
-unsafe fn lapic_write(reg: u32, value: u32) {
-    LAPIC_BASE.load(Ordering::SeqCst);
-    let base = LAPIC_BASE.load(Ordering::SeqCst);
-    core::ptr::write_volatile((base + reg) as *mut u32, value);
-}
-unsafe fn lapic_read(reg: u32) -> u32 {
-    LAPIC_BASE.load(Ordering::SeqCst);
-    let base = LAPIC_BASE.load(Ordering::SeqCst);
-    core::ptr::read_volatile((base + reg) as *const u32)
-}
-
 pub unsafe fn send_init_ipi(apic_id: u8) {
-    lapic_write(ICR_HIGH, (apic_id as u32) << 24);
-    lapic_write(ICR_LOW, 0x4500); // INIT, edge, assert, physical destination
-    while lapic_read(ICR_LOW) & (1 << 12) != 0 {} // wait for delivery
+    unsafe {
+        reg_write(ICR_HIGH, (apic_id as u32) << 24);
+        reg_write(ICR_LOW, 0x4500); // INIT, edge, assert, physical destination
+        while reg_read(ICR_LOW) & (1 << 12) != 0 {} // wait for delivery
+    }
 }
 
 pub unsafe fn send_sipi(apic_id: u8, vector: u8) {
-    lapic_write(ICR_HIGH, (apic_id as u32) << 24);
-    lapic_write(ICR_LOW, 0x4600 | vector as u32); // Startup IPI
-    while lapic_read(ICR_LOW) & (1 << 12) != 0 {}
+    unsafe {
+        reg_write(ICR_HIGH, (apic_id as u32) << 24);
+        reg_write(ICR_LOW, 0x4600 | vector as u32); // Startup IPI
+        while reg_read(ICR_LOW) & (1 << 12) != 0 {}
+    }
 }
 
+/// Acknowledges the interrupt being handled. Does nothing before the LAPIC is
+/// mapped
 pub unsafe fn send_eoi() {
     if LAPIC_BASE.load(Ordering::Relaxed) != 0 {
-        lapic_write(REG_EOI, 0);
+        unsafe { reg_write(REG_EOI, 0) };
     }
 }
 
 pub unsafe fn send_ipi_all_excluding_self(vector: u8) {
-    reg_write(ICR_HIGH, 0);
-    reg_write(ICR_LOW, (0b11 << 18) | vector as u32); // fixed delivery, all-excl-self shorthand
+    unsafe {
+        reg_write(ICR_HIGH, 0);
+        reg_write(ICR_LOW, (0b11 << 18) | vector as u32); // fixed delivery, all-excl-self shorthand
+    }
 }

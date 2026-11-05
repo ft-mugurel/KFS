@@ -1,4 +1,4 @@
-use crate::shell::{History, COMMANDS, MAX_INPUT_LEN};
+use crate::shell::{COMMANDS, History, MAX_INPUT_LEN};
 use crate::syscall::{sys_read, sys_write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +23,20 @@ pub fn print_str(s: &str) {
 
 pub fn print_bytes(b: &[u8]) {
     sys_write(1, b);
+}
+
+/// `print_dec`, right-aligned in a field of `width` columns.
+pub fn print_dec_width(n: usize, width: usize) {
+    let mut digits = 1;
+    let mut rest = n / 10;
+    while rest > 0 {
+        digits += 1;
+        rest /= 10;
+    }
+    for _ in digits..width {
+        print_str(" ");
+    }
+    print_dec(n);
 }
 
 pub fn print_dec(mut n: usize) {
@@ -51,7 +65,7 @@ pub fn parse_dec(s: &str) -> Option<usize> {
     }
     let mut res = 0usize;
     for b in s.bytes() {
-        if (b'0'..=b'9').contains(&b) {
+        if b.is_ascii_digit() {
             res = res.checked_mul(10)?.checked_add((b - b'0') as usize)?;
         } else {
             return None;
@@ -107,27 +121,15 @@ pub fn read_key() -> Key {
                     b'F' => Key::End,
                     b'1' => {
                         let b4 = read_byte();
-                        if b4 == b'~' {
-                            Key::Home
-                        } else {
-                            Key::Unknown
-                        }
+                        if b4 == b'~' { Key::Home } else { Key::Unknown }
                     }
                     b'3' => {
                         let b4 = read_byte();
-                        if b4 == b'~' {
-                            Key::Delete
-                        } else {
-                            Key::Unknown
-                        }
+                        if b4 == b'~' { Key::Delete } else { Key::Unknown }
                     }
                     b'4' => {
                         let b4 = read_byte();
-                        if b4 == b'~' {
-                            Key::End
-                        } else {
-                            Key::Unknown
-                        }
+                        if b4 == b'~' { Key::End } else { Key::Unknown }
                     }
                     _ => Key::Unknown,
                 }
@@ -273,7 +275,8 @@ pub fn read_line_raw(prompt: &str, buf: &mut [u8], mask: bool, history: &mut His
                             .rposition(|&b| b == b' ')
                             .map_or(0, |pos| pos + 1);
                         if let Ok(partial) = core::str::from_utf8(&buf[start..idx]) {
-                            let (common_prefix, match_count) = crate::shell::longest_common_prefix(partial);
+                            let (common_prefix, match_count) =
+                                crate::shell::longest_common_prefix(partial);
                             if match_count > 0 {
                                 let missing = &common_prefix[partial.len()..];
                                 if !missing.is_empty() {
@@ -289,7 +292,9 @@ pub fn read_line_raw(prompt: &str, buf: &mut [u8], mask: bool, history: &mut His
                                     }
                                 } else if match_count > 1 {
                                     print_str("\n");
-                                    for cmd in COMMANDS.iter().filter(|&&cmd| cmd.starts_with(partial)) {
+                                    for cmd in
+                                        COMMANDS.iter().filter(|&&cmd| cmd.starts_with(partial))
+                                    {
                                         print_str(cmd);
                                         print_str(" ");
                                     }

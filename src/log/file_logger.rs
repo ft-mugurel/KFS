@@ -11,11 +11,7 @@ static FLUSH_LOCK: AtomicBool = AtomicBool::new(false);
 static ROTATED_THIS_BOOT: AtomicBool = AtomicBool::new(false);
 
 const MAX_LOG_ROTATIONS: usize = 3;
-const ROTATED_NAMES: [&str; MAX_LOG_ROTATIONS] = [
-    "kernel.log.1",
-    "kernel.log.2",
-    "kernel.log.3",
-];
+const ROTATED_NAMES: [&str; MAX_LOG_ROTATIONS] = ["kernel.log.1", "kernel.log.2", "kernel.log.3"];
 const ROTATED_PATHS: [&str; MAX_LOG_ROTATIONS] = [
     "/var/log/kernel.log.1",
     "/var/log/kernel.log.2",
@@ -23,23 +19,25 @@ const ROTATED_PATHS: [&str; MAX_LOG_ROTATIONS] = [
 ];
 
 unsafe fn copy_file_content(src: *mut VfsNode, dst: *mut VfsNode) -> KResult<()> {
-    (*dst).truncate()?;
-    let mut offset = 0u32;
-    let mut buf = [0u8; 1024];
-    let total_size = (*src).size;
-    while offset < total_size {
-        let to_read = (total_size - offset).min(buf.len() as u32) as usize;
-        let read_bytes = (*src).read(&mut buf[..to_read], offset)?;
-        if read_bytes == 0 {
-            break;
+    unsafe {
+        (*dst).truncate()?;
+        let mut offset = 0u32;
+        let mut buf = [0u8; 1024];
+        let total_size = (*src).size;
+        while offset < total_size {
+            let to_read = (total_size - offset).min(buf.len() as u32) as usize;
+            let read_bytes = (*src).read(&mut buf[..to_read], offset)?;
+            if read_bytes == 0 {
+                break;
+            }
+            let written = (*dst).write(&buf[..read_bytes], offset)?;
+            offset += written as u32;
+            if written < read_bytes {
+                break;
+            }
         }
-        let written = (*dst).write(&buf[..read_bytes], offset)?;
-        offset += written as u32;
-        if written < read_bytes {
-            break;
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 unsafe fn get_or_create_child_file(
@@ -48,56 +46,63 @@ unsafe fn get_or_create_child_file(
     full_path: &str,
     root: *mut VfsNode,
 ) -> KResult<*mut VfsNode> {
-    match fs::resolve_path(full_path, root) {
-        Ok(node) => {
-            if (*node).node_type == VfsNodeType::File {
-                Ok(node)
-            } else {
-                Err(KernelError::EINVAL)
+    unsafe {
+        match fs::resolve_path(full_path, root) {
+            Ok(node) => {
+                if (*node).node_type == VfsNodeType::File {
+                    Ok(node)
+                } else {
+                    Err(KernelError::Inval)
+                }
             }
+            Err(_) => fs::create_child_node(parent, name, VfsNodeType::File, 0o644),
         }
-        Err(_) => fs::create_child_node(parent, name, VfsNodeType::File, 0o644),
     }
 }
 
 pub unsafe fn rotate_boot_logs() -> KResult<()> {
-    if ROTATED_THIS_BOOT.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
+    let _pin = fs::pin_nodes();
+    unsafe {
+        if ROTATED_THIS_BOOT.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
 
-    let root = fs::ROOT_NODE;
-    if root.is_null() {
-        return Ok(());
-    }
+        let root = fs::ROOT_NODE;
+        if root.is_null() {
+            return Ok(());
+        }
 
-    let var_log = match fs::resolve_path("/var/log", root) {
-        Ok(dir) => dir,
-        Err(_) => return Ok(()),
-    };
+        let var_log = match fs::resolve_path("/var/log", root) {
+            Ok(dir) => dir,
+            Err(_) => return Ok(()),
+        };
 
-    if (*var_log).node_type != VfsNodeType::Directory {
-        return Ok(());
-    }
+        if (*var_log).node_type != VfsNodeType::Directory {
+            return Ok(());
+        }
 
-    let current_log = match fs::resolve_path("/var/log/kernel.log", root) {
-        Ok(file) => file,
-        Err(_) => return Ok(()),
-    };
+        let current_log = match fs::resolve_path("/var/log/kernel.log", root) {
+            Ok(file) => file,
+            Err(_) => return Ok(()),
+        };
 
-    if (*current_log).node_type != VfsNodeType::File {
-        return Ok(());
-    }
+        if (*current_log).node_type != VfsNodeType::File {
+            return Ok(());
+        }
 
-    let prev_size = (*current_log).size;
-    if prev_size == 0 {
-        return Ok(());
-    }
+        let prev_size = (*current_log).size;
+        if prev_size == 0 {
+            return Ok(());
+        }
 
-    // Rotate older archives backwards: kernel.log.2 -> kernel.log.3, kernel.log.1 -> kernel.log.2
-    for idx in (1..MAX_LOG_ROTATIONS).rev() {
-        let src_path = ROTATED_PATHS[idx - 1];
-        if let Ok(src_node) = fs::resolve_path(src_path, root) {
-            if (*src_node).node_type == VfsNodeType::File && (*src_node).size > 0 {
+        // Rotate older archives backwards: kernel.log.2 -> kernel.log.3, kernel.log.1 -> kernel.log.2
+        for idx in (1..MAX_LOG_ROTATIONS).rev() {
+            let src_path = ROTATED_PATHS[idx - 1];
+
+            if let Ok(src_node) = fs::resolve_path(src_path, root)
+                && (*src_node).node_type == VfsNodeType::File
+                && (*src_node).size > 0
+            {
                 let dst_name = ROTATED_NAMES[idx];
                 let dst_path = ROTATED_PATHS[idx];
                 if let Ok(dst_node) = get_or_create_child_file(var_log, dst_name, dst_path, root) {
@@ -105,27 +110,28 @@ pub unsafe fn rotate_boot_logs() -> KResult<()> {
                 }
             }
         }
+
+        // Rotate current log: kernel.log -> kernel.log.1
+        let dst_name = ROTATED_NAMES[0];
+        let dst_path = ROTATED_PATHS[0];
+        let dst_node = get_or_create_child_file(var_log, dst_name, dst_path, root)?;
+        copy_file_content(current_log, dst_node)?;
+
+        // Truncate current log so the current boot starts with a clean file
+        (*current_log).truncate()?;
+        let _ = crate::fs::buffer_cache::bsync();
+
+        pr_info!(
+            "Kernel log rotated per boot: /var/log/kernel.log ({} bytes) -> /var/log/kernel.log.1",
+            prev_size
+        );
+
+        Ok(())
     }
-
-    // Rotate current log: kernel.log -> kernel.log.1
-    let dst_name = ROTATED_NAMES[0];
-    let dst_path = ROTATED_PATHS[0];
-    let dst_node = get_or_create_child_file(var_log, dst_name, dst_path, root)?;
-    copy_file_content(current_log, dst_node)?;
-
-    // Truncate current log so the current boot starts with a clean file
-    (*current_log).truncate()?;
-    let _ = crate::fs::buffer_cache::bsync();
-
-    pr_info!(
-        "Kernel log rotated per boot: /var/log/kernel.log ({} bytes) -> /var/log/kernel.log.1\n",
-        prev_size
-    );
-
-    Ok(())
 }
 
 pub fn flush_to_file() -> KResult<usize> {
+    let _pin = fs::pin_nodes();
     unsafe {
         let root = fs::ROOT_NODE;
         if root.is_null() {
@@ -151,7 +157,7 @@ pub fn flush_to_file() -> KResult<usize> {
             };
 
             if (*log_file).node_type != VfsNodeType::File {
-                return Err(KernelError::EINVAL);
+                return Err(KernelError::Inval);
             }
 
             // Ext2 singly indirect block limit is ~268 KB. Rotate/truncate if log file exceeds
@@ -216,18 +222,18 @@ pub fn flush_to_file() -> KResult<usize> {
 pub fn init_file_logger() -> KResult<()> {
     unsafe {
         if let Err(e) = rotate_boot_logs() {
-            pr_warn!("Kernel log boot rotation failed: {:?}\n", e);
+            pr_warn!("Kernel log boot rotation failed: {:?}", e);
         }
     }
     match flush_to_file() {
         Ok(bytes) => {
             pr_info!(
-                "Kernel log persistence initialized: /var/log/kernel.log ({} bytes written)\n",
+                "Kernel log persistence initialized: /var/log/kernel.log ({} bytes written)",
                 bytes
             );
         }
         Err(e) => {
-            pr_warn!("Kernel log persistence initialization failed: {:?}\n", e);
+            pr_warn!("Kernel log persistence initialization failed: {:?}", e);
         }
     }
     Ok(())

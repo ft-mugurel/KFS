@@ -121,7 +121,7 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fm
         emit(&format_args!("{:#010x}: ", line_addr));
 
         let mut ascii = [b'.'; 16];
-        for i in 0usize..16 {
+        for (i, byte) in ascii.iter_mut().enumerate() {
             let pos = offset + i;
             if pos >= len {
                 emit(&format_args!("   "));
@@ -132,13 +132,13 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fm
             let page_base = byte_addr & 0xFFFF_F000;
             if paging::get_page(page_base).is_none() {
                 emit(&format_args!("?? "));
-                ascii[i] = b'?';
+                *byte = b'?';
                 continue;
             }
 
             let value = unsafe { ptr::read_volatile(byte_addr as *const u8) };
             emit(&format_args!("{:02x} ", value));
-            ascii[i] = if value.is_ascii_graphic() || value == b' ' {
+            *byte = if value.is_ascii_graphic() || value == b' ' {
                 value
             } else {
                 b'.'
@@ -146,64 +146,12 @@ pub fn dump_virtual_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fm
         }
 
         emit(&format_args!(" |"));
-        for i in 0usize..16 {
+        for (i, byte) in ascii.iter_mut().enumerate() {
             let pos = offset + i;
             if pos >= len {
                 break;
             }
-            emit(&format_args!("{}", ascii[i] as char));
-        }
-        emit(&format_args!("|\n"));
-
-        offset = offset.saturating_add(16);
-    }
-}
-
-#[allow(dead_code)]
-pub fn dump_physical_memory(start_addr: u32, len: usize, mut emit: impl FnMut(&fmt::Arguments<'_>)) {
-    let end_addr = match (start_addr as usize).checked_add(len) {
-        Some(v) if v <= u32::MAX as usize => v as u32,
-        _ => {
-            emit(&format_args!("address range overflow\n"));
-            return;
-        }
-    };
-
-    emit(&format_args!(
-        "memdump: [{:#010x}, {:#010x}) len={}\n",
-        start_addr, end_addr, len
-    ));
-
-    let mut offset = 0usize;
-    while offset < len {
-        let line_addr = start_addr.wrapping_add(offset as u32);
-        emit(&format_args!("{:#010x}: ", line_addr));
-
-        let mut ascii = [b'.'; 16];
-        for i in 0usize..16 {
-            let pos = offset + i;
-            if pos >= len {
-                emit(&format_args!("   "));
-                continue;
-            }
-
-            let byte_addr = start_addr.wrapping_add(pos as u32);
-            let value = unsafe { ptr::read_volatile(byte_addr as *const u8) };
-            emit(&format_args!("{:02x} ", value));
-            ascii[i] = if value.is_ascii_graphic() || value == b' ' {
-                value
-            } else {
-                b'.'
-            };
-        }
-
-        emit(&format_args!(" |"));
-        for i in 0usize..16 {
-            let pos = offset + i;
-            if pos >= len {
-                break;
-            }
-            emit(&format_args!("{}", ascii[i] as char));
+            emit(&format_args!("{}", *byte as char));
         }
         emit(&format_args!("|\n"));
 
@@ -344,7 +292,7 @@ fn memtest_heap_roundtrip() -> KResult<()> {
     paging::ksize(ptr as *const u8)
         .is_ok_and(|size| size == 128)
         .then_some(())
-        .ok_or(KernelError::EINVAL)?;
+        .ok_or(KernelError::Inval)?;
     paging::kfree(ptr)
 }
 

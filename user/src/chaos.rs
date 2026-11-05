@@ -4,10 +4,10 @@
 
 use crate::io::{parse_dec, print_dec, print_str};
 use crate::syscall::{
-    sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd, sys_getdents, sys_getpid,
-    sys_getppid, sys_getuid, sys_getusername, sys_kill, sys_mmap, sys_munmap,
-    sys_open, sys_pipe, sys_raw, sys_read, sys_sbrk, sys_socket, sys_unlink, sys_wait,
-    sys_write, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, sys_chdir, sys_close, sys_exit, sys_fork,
+    sys_getcwd, sys_getdents, sys_getpid, sys_getppid, sys_getuid, sys_getusername, sys_kill,
+    sys_mmap, sys_munmap, sys_open, sys_pipe, sys_raw, sys_read, sys_sbrk, sys_socket, sys_unlink,
+    sys_wait, sys_write,
 };
 
 /// Deterministic 32-bit XorShift PRNG for reproducible chaos across processes.
@@ -38,7 +38,7 @@ impl ChaosRng {
     }
 }
 
-fn format_worker_file<'a>(id: usize, buf: &'a mut [u8; 32]) -> &'a [u8] {
+fn format_worker_file(id: usize, buf: &mut [u8; 32]) -> &[u8] {
     let prefix = b"/tmp/ch_w";
     buf[..prefix.len()].copy_from_slice(prefix);
     let mut pos = prefix.len();
@@ -69,6 +69,37 @@ fn format_worker_file<'a>(id: usize, buf: &'a mut [u8; 32]) -> &'a [u8] {
 // Probes for Detecting Specific Unnoticed Kernel Bugs
 // -----------------------------------------------------------------------------
 
+unsafe fn store_u32(addr: u32) {
+    unsafe { core::arch::asm!("mov dword ptr [{0}], 1", in(reg) addr, options(nostack)) };
+}
+
+unsafe fn load_u32(addr: u32) -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("mov {0}, dword ptr [{1}]", out(reg) value, in(reg) addr, options(nostack))
+    };
+    value
+}
+
+/// Forks a child that `fault` must kill. A child the kernel leaves spinning
+/// in the fault handler, or a parent it never wakes, stalls the probe run.
+fn probe_fatal_fault(name: &str, fault: fn()) {
+    let child = sys_fork();
+    if child == 0 {
+        fault();
+        print_str("  [!] DETECTED BUG #6: process survived ");
+        print_str(name);
+        print_str("\n");
+        sys_exit(0);
+    }
+    if child > 0 {
+        let _ = sys_wait();
+        print_str("  [~] Fault probe reaped: ");
+        print_str(name);
+        print_str("\n");
+    }
+}
+
 fn run_kernel_diagnostic_probes() {
     print_str("[PROBE] Running targeted diagnostic probes for kernel anomalies...\n");
 
@@ -78,7 +109,9 @@ fn run_kernel_diagnostic_probes() {
     if pipe_ret >= 0 {
         let write_ret = sys_write(pipe_fds[1] as usize, b"test_pipe_data");
         if write_ret < 0 {
-            print_str("  [!] DETECTED BUG #1: sys_pipe creates VfsNodeType::Fifo, but sys_write rejects Fifo with -EINVAL\n");
+            print_str(
+                "  [!] DETECTED BUG #1: sys_pipe creates VfsNodeType::Fifo, but sys_write rejects Fifo with -EINVAL\n",
+            );
         } else {
             print_str("  [✓] Pipe write succeeded\n");
         }
@@ -89,12 +122,13 @@ fn run_kernel_diagnostic_probes() {
     }
 
     // Probe 2: Memory Boundary Protection (Kernel Space Access from Ring 3)
-    let kernel_ptr = unsafe {
-        core::slice::from_raw_parts(0xC000_1000 as *const u8, 16)
-    };
+    let kernel_ptr = unsafe { core::slice::from_raw_parts(0xC000_1000 as *const u8, 16) };
     let bad_write = sys_write(1, kernel_ptr);
-    if bad_write == -14 { // -EFAULT
-        print_str("  [✓] Memory protection: Kernel higher-half address (0xC0001000) correctly rejected with -EFAULT\n");
+    if bad_write == -14 {
+        // -EFAULT
+        print_str(
+            "  [✓] Memory protection: Kernel higher-half address (0xC0001000) correctly rejected with -EFAULT\n",
+        );
     } else {
         print_str("  [!] DETECTED BUG #2: Kernel space pointer was not rejected with -EFAULT\n");
     }
@@ -118,7 +152,9 @@ fn run_kernel_diagnostic_probes() {
             *ptr = 0xAA;
             let val = *ptr;
             if val == 0xAA {
-                print_str("  [✓] Demand paging: Page fault successfully allocated zeroed page at {0x");
+                print_str(
+                    "  [✓] Demand paging: Page fault successfully allocated zeroed page at {0x",
+                );
                 print_dec(mmap_base as usize);
                 print_str("}\n");
             } else {
@@ -147,15 +183,34 @@ fn run_kernel_diagnostic_probes() {
         // Test kill with non-existent PID: should return -ESRCH (-3)
         let esrch_ret = sys_kill(999, 0);
         if esrch_ret == -3 {
-            print_str("  [✓] Signals: kill(999, 0) on non-existent PID correctly returned -ESRCH\n");
+            print_str(
+                "  [✓] Signals: kill(999, 0) on non-existent PID correctly returned -ESRCH\n",
+            );
         }
         // Test kill with invalid signal number: should return -EINVAL (-22)
         let einval_ret = sys_kill(probe_child as usize, 99);
         if einval_ret == -22 {
-            print_str("  [✓] Signals: kill(pid, 99) with invalid signal correctly returned -EINVAL\n");
+            print_str(
+                "  [✓] Signals: kill(pid, 99) with invalid signal correctly returned -EINVAL\n",
+            );
         }
         // Reap probe child
         let _ = sys_wait();
+    }
+
+    // Probe 6: Fatal Page Faults (each must kill the process and wake its parent)
+    probe_fatal_fault("null write", || unsafe { store_u32(0) });
+    probe_fatal_fault("kernel write", || unsafe { store_u32(0xC000_1000) });
+    probe_fatal_fault("read above heap", || {
+        let _ = unsafe { load_u32(0x6000_0000) };
+    });
+    probe_fatal_fault("write at stack top", || unsafe { store_u32(0xBFFF_F000) });
+
+    // Probe 7: mmap Slot Bounds
+    if sys_mmap(0, 0x10_0001) > 0 {
+        print_str("  [!] DETECTED BUG #7: sys_mmap accepted a length larger than its slot\n");
+    } else {
+        print_str("  [✓] mmap: oversized length rejected\n");
     }
 }
 
@@ -363,16 +418,8 @@ pub fn run_chaos_test(args: &str) {
     }
 
     let mut parts = trimmed_args.split_whitespace();
-    let num_procs = parts
-        .next()
-        .and_then(parse_dec)
-        .unwrap_or(4)
-        .clamp(2, 10);
-    let num_rounds = parts
-        .next()
-        .and_then(parse_dec)
-        .unwrap_or(10)
-        .clamp(5, 50);
+    let num_procs = parts.next().and_then(parse_dec).unwrap_or(4).clamp(2, 10);
+    let num_rounds = parts.next().and_then(parse_dec).unwrap_or(10).clamp(5, 50);
 
     print_str("\n=======================================================\n");
     print_str("[CHAOS] Launching Kernel Limit-Test & Chaos Simulation\n");

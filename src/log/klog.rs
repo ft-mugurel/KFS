@@ -1,5 +1,5 @@
+use super::KernelLogLevel;
 use crate::locks::Spinlock;
-use crate::printk::KernelLogLevel;
 use core::fmt::{self, Write};
 
 pub const KLOG_BUFFER_SIZE: usize = 65536;
@@ -45,7 +45,7 @@ impl<'a> Write for AnsiFilterWriter<'a> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
             if self.in_escape {
-                if b == b'm' || (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') {
+                if b.is_ascii_alphabetic() {
                     self.in_escape = false;
                 }
             } else if b == 0x1B {
@@ -61,9 +61,10 @@ impl<'a> Write for AnsiFilterWriter<'a> {
 pub fn record_log(level: KernelLogLevel, pid: u32, ticks: usize, args: &fmt::Arguments<'_>) {
     let mut klog = KLOG.lock();
 
-    let hz = crate::startup_config::power::CONFIG_HZ as usize;
-    let sec = ticks / hz;
-    let millis = ticks % hz;
+    let hz = crate::interrupts::timer::tick_frequency_hz().max(1) as u64;
+    let ms = ticks as u64 * 1000 / hz;
+    let sec = ms / 1000;
+    let millis = ms % 1000;
 
     let mut writer = AnsiFilterWriter { buf: &mut klog, in_escape: false };
 
@@ -75,7 +76,7 @@ pub fn record_log(level: KernelLogLevel, pid: u32, ticks: usize, args: &fmt::Arg
         level_tag_str(level),
         pid
     );
-    let _ = write!(writer, "{}", args);
+    let _ = writeln!(writer, "{}", args);
 }
 
 pub fn head() -> usize {
@@ -98,18 +99,14 @@ pub fn read_range(start: usize, dest: &mut [u8]) -> usize {
     }
 
     let oldest_valid = current_head.saturating_sub(KLOG_BUFFER_SIZE);
-    let actual_start = if start < oldest_valid {
-        oldest_valid
-    } else {
-        start
-    };
+    let actual_start = if start < oldest_valid { oldest_valid } else { start };
 
     let available = current_head - actual_start;
     let to_read = available.min(dest.len());
 
-    for i in 0..to_read {
-        let pos = actual_start + i;
-        dest[i] = klog.data[pos % KLOG_BUFFER_SIZE];
+    for (ndx, slot) in dest.iter_mut().enumerate().take(to_read) {
+        let pos = actual_start + ndx;
+        *slot = klog.data[pos % KLOG_BUFFER_SIZE];
     }
 
     to_read
@@ -130,9 +127,9 @@ pub fn read_kmsg(dest: &mut [u8], offset: u32) -> usize {
     let available = current_head - actual_start;
     let to_read = available.min(dest.len());
 
-    for i in 0..to_read {
-        let pos = actual_start + i;
-        dest[i] = klog.data[pos % KLOG_BUFFER_SIZE];
+    for (ndx, slot) in dest.iter_mut().enumerate().take(to_read) {
+        let pos = actual_start + ndx;
+        *slot = klog.data[pos % KLOG_BUFFER_SIZE];
     }
 
     to_read

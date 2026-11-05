@@ -47,10 +47,37 @@ pub struct PhysicalMemoryRegion {
 
 pub const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BADB002;
 pub const MULTIBOOT_INFO_HAS_BASIC_MEMORY: u32 = 1 << 0;
+pub const MULTIBOOT_INFO_HAS_CMDLINE: u32 = 1 << 2;
 pub const MULTIBOOT_INFO_HAS_MMAP: u32 = 1 << 6;
 pub const MULTIBOOT_MEMORY_AVAILABLE: u32 = 1;
 
 static mut BOOT_MULTIBOOT_INFO_ADDR: u32 = 0;
+
+const BOOT_CMDLINE_MAX: usize = 256;
+static mut BOOT_CMDLINE: [u8; BOOT_CMDLINE_MAX] = [0; BOOT_CMDLINE_MAX];
+static mut BOOT_CMDLINE_LEN: usize = 0;
+
+pub fn capture_boot_cmdline(info: &MultibootInfo) {
+    if (info.flags & MULTIBOOT_INFO_HAS_CMDLINE) == 0 || info.cmdline == 0 {
+        return;
+    }
+    let src = info.cmdline as usize as *const u8;
+    unsafe {
+        let mut len = 0;
+        while len < BOOT_CMDLINE_MAX && *src.add(len) != 0 {
+            BOOT_CMDLINE[len] = *src.add(len);
+            len += 1;
+        }
+        BOOT_CMDLINE_LEN = len;
+    }
+}
+
+pub fn boot_cmdline() -> &'static str {
+    unsafe {
+        let bytes = &*core::ptr::addr_of!(BOOT_CMDLINE);
+        core::str::from_utf8(&bytes[..BOOT_CMDLINE_LEN]).unwrap_or("")
+    }
+}
 
 pub fn multiboot_info_from_addr(addr: u32) -> &'static MultibootInfo {
     unsafe { &*(addr as usize as *const MultibootInfo) }

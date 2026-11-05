@@ -1,33 +1,59 @@
 use core::fmt::Write;
 
 use crate::{
-    drivers, fs, interrupts, paging, smp,
+    drivers,
+    error::{KResult, KernelError},
+    fs, interrupts, paging, sched, smp,
 };
 
 use super::BufferWriter;
 
 pub fn generate_version(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
-    let _ = writeln!(writer, "kernel: KFS");
-    let _ = writeln!(writer, "release: 0.6.0");
-    let _ = writeln!(writer, "arch: i686 (32-bit x86 Protected Mode)");
-    let _ = writeln!(writer, "compiler: rustc (nightly 2026-09-22)");
     let _ = writeln!(
         writer,
-        "subsystems: SMP, ACPI, Ext2, Paging, DAC, PBKDF2-HMAC-SHA256, Procfs"
+        "KFS version {} ({}) ({} build) #1 SMP i686",
+        env!("CARGO_PKG_VERSION"),
+        env!("KFS_RUSTC_VERSION"),
+        env!("KFS_BUILD_PROFILE"),
     );
     writer.written()
 }
 
+fn uptime_ms() -> u64 {
+    match crate::modules::time_now() {
+        Ok(now) => now.uptime_ms,
+        Err(_) => {
+            let ticks = interrupts::timer::get_ticks() as u64;
+            let hz = interrupts::timer::tick_frequency_hz() as u64;
+            ticks * 1000 / hz.max(1)
+        }
+    }
+}
+
+fn ticks_to_clock(ticks: u32) -> u64 {
+    let hz = interrupts::timer::tick_frequency_hz().max(1) as u64;
+    ticks as u64 * 100 / hz
+}
+
+fn online_cpus() -> impl Iterator<Item = usize> {
+    (0..smp::MAX_CPUS).filter(|&cpu| smp::cpu::is_online(cpu))
+}
+
 pub fn generate_uptime(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
-    let ticks = interrupts::timer::get_ticks();
-    let hz = 100;
-    let sec = ticks / hz;
-    let centisec = ((ticks % hz) * 100) / hz;
-    let _ = writeln!(writer, "uptime_seconds: {}.{:02}", sec, centisec);
-    let _ = writeln!(writer, "uptime_ticks: {}", ticks);
-    let _ = writeln!(writer, "timer_frequency_hz: {}", hz);
+    let uptime_cs = uptime_ms() / 10;
+    let idle_cs: u64 = online_cpus()
+        .map(|cpu| ticks_to_clock(sched::stats::cpu_times(cpu).idle))
+        .sum();
+    let _ = writeln!(
+        writer,
+        "{}.{:02} {}.{:02}",
+        uptime_cs / 100,
+        uptime_cs % 100,
+        idle_cs / 100,
+        idle_cs % 100
+    );
     writer.written()
 }
 
@@ -62,8 +88,16 @@ pub fn generate_meminfo(buf: &mut [u8]) -> usize {
     let _ = writeln!(writer);
     let _ = writeln!(writer, "VMemRangeStart: {:#010X}", vstats.range_start);
     let _ = writeln!(writer, "VMemRangeEnd: {:#010X}", vstats.range_end);
-    let _ = writeln!(writer, "VMemTotal: {} KiB", (vstats.total_bytes as usize) / 1024);
-    let _ = writeln!(writer, "VMemFree: {} KiB", (vstats.free_bytes as usize) / 1024);
+    let _ = writeln!(
+        writer,
+        "VMemTotal: {} KiB",
+        (vstats.total_bytes as usize) / 1024
+    );
+    let _ = writeln!(
+        writer,
+        "VMemFree: {} KiB",
+        (vstats.free_bytes as usize) / 1024
+    );
     let _ = writeln!(writer, "VMemAllocations: {}", vstats.alloc_count);
     let _ = writeln!(writer, "VMemFreeRanges: {}", vstats.free_ranges);
 
@@ -102,24 +136,60 @@ pub fn generate_cpuinfo(buf: &mut [u8]) -> usize {
 
         // Feature flags string
         let _ = write!(writer, "features:");
-        if f_edx & (1 << 0) != 0 { let _ = write!(writer, " fpu"); }
-        if f_edx & (1 << 1) != 0 { let _ = write!(writer, " vme"); }
-        if f_edx & (1 << 2) != 0 { let _ = write!(writer, " de"); }
-        if f_edx & (1 << 3) != 0 { let _ = write!(writer, " pse"); }
-        if f_edx & (1 << 4) != 0 { let _ = write!(writer, " tsc"); }
-        if f_edx & (1 << 5) != 0 { let _ = write!(writer, " msr"); }
-        if f_edx & (1 << 6) != 0 { let _ = write!(writer, " pae"); }
-        if f_edx & (1 << 8) != 0 { let _ = write!(writer, " cx8"); }
-        if f_edx & (1 << 9) != 0 { let _ = write!(writer, " apic"); }
-        if f_edx & (1 << 11) != 0 { let _ = write!(writer, " sep"); }
-        if f_edx & (1 << 13) != 0 { let _ = write!(writer, " pge"); }
-        if f_edx & (1 << 15) != 0 { let _ = write!(writer, " cmov"); }
-        if f_edx & (1 << 19) != 0 { let _ = write!(writer, " clflush"); }
-        if f_edx & (1 << 23) != 0 { let _ = write!(writer, " mmx"); }
-        if f_edx & (1 << 24) != 0 { let _ = write!(writer, " fxsr"); }
-        if f_edx & (1 << 25) != 0 { let _ = write!(writer, " sse"); }
-        if f_edx & (1 << 26) != 0 { let _ = write!(writer, " sse2"); }
-        if f_ecx & (1 << 0) != 0 { let _ = write!(writer, " sse3"); }
+        if f_edx & (1 << 0) != 0 {
+            let _ = write!(writer, " fpu");
+        }
+        if f_edx & (1 << 1) != 0 {
+            let _ = write!(writer, " vme");
+        }
+        if f_edx & (1 << 2) != 0 {
+            let _ = write!(writer, " de");
+        }
+        if f_edx & (1 << 3) != 0 {
+            let _ = write!(writer, " pse");
+        }
+        if f_edx & (1 << 4) != 0 {
+            let _ = write!(writer, " tsc");
+        }
+        if f_edx & (1 << 5) != 0 {
+            let _ = write!(writer, " msr");
+        }
+        if f_edx & (1 << 6) != 0 {
+            let _ = write!(writer, " pae");
+        }
+        if f_edx & (1 << 8) != 0 {
+            let _ = write!(writer, " cx8");
+        }
+        if f_edx & (1 << 9) != 0 {
+            let _ = write!(writer, " apic");
+        }
+        if f_edx & (1 << 11) != 0 {
+            let _ = write!(writer, " sep");
+        }
+        if f_edx & (1 << 13) != 0 {
+            let _ = write!(writer, " pge");
+        }
+        if f_edx & (1 << 15) != 0 {
+            let _ = write!(writer, " cmov");
+        }
+        if f_edx & (1 << 19) != 0 {
+            let _ = write!(writer, " clflush");
+        }
+        if f_edx & (1 << 23) != 0 {
+            let _ = write!(writer, " mmx");
+        }
+        if f_edx & (1 << 24) != 0 {
+            let _ = write!(writer, " fxsr");
+        }
+        if f_edx & (1 << 25) != 0 {
+            let _ = write!(writer, " sse");
+        }
+        if f_edx & (1 << 26) != 0 {
+            let _ = write!(writer, " sse2");
+        }
+        if f_ecx & (1 << 0) != 0 {
+            let _ = write!(writer, " sse3");
+        }
         let _ = writeln!(writer);
         let _ = writeln!(writer);
     }
@@ -129,28 +199,44 @@ pub fn generate_cpuinfo(buf: &mut [u8]) -> usize {
 
 pub fn generate_stat(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
-    let mut active_count = 0usize;
-    let mut running_count = 0usize;
-    let mut sleeping_count = 0usize;
 
-    for process in crate::sched::PROCESS_TABLE.lock().iter().flatten() {
-        active_count += 1;
-        match process.state {
-            crate::sched::ProcessState::Running => running_count += 1,
-            crate::sched::ProcessState::Sleeping | crate::sched::ProcessState::Waiting => {
-                sleeping_count += 1
-            }
-            _ => {}
-        }
+    let write_cpu =
+        |writer: &mut BufferWriter, label: &dyn core::fmt::Display, t: sched::stats::CpuTimes| {
+            // user nice system idle iowait irq softirq steal guest guest_nice
+            let _ = writeln!(
+                writer,
+                "{} {} 0 {} {} 0 0 0 0 0 0",
+                label,
+                ticks_to_clock(t.user),
+                ticks_to_clock(t.system),
+                ticks_to_clock(t.idle)
+            );
+        };
+
+    let mut total = sched::stats::CpuTimes::default();
+    for cpu in online_cpus() {
+        let t = sched::stats::cpu_times(cpu);
+        total.user = total.user.wrapping_add(t.user);
+        total.system = total.system.wrapping_add(t.system);
+        total.idle = total.idle.wrapping_add(t.idle);
+    }
+    write_cpu(&mut writer, &"cpu ", total);
+    for cpu in online_cpus() {
+        write_cpu(
+            &mut writer,
+            &format_args!("cpu{}", cpu),
+            sched::stats::cpu_times(cpu),
+        );
     }
 
-    let ticks = interrupts::timer::get_ticks();
-    let _ = writeln!(writer, "cpu_cores_total: {}", smp::MAX_CPUS);
-    let _ = writeln!(writer, "cpu_cores_online: {}", smp::cpu::online_count());
-    let _ = writeln!(writer, "processes_total: {}", active_count);
-    let _ = writeln!(writer, "processes_running: {}", running_count);
-    let _ = writeln!(writer, "processes_sleeping: {}", sleeping_count);
-    let _ = writeln!(writer, "timer_ticks: {}", ticks);
+    let uptime_secs = (uptime_ms() / 1000) as u32;
+
+    let _ = writeln!(writer, "intr {}", interrupts::stats::total());
+    let _ = writeln!(writer, "ctxt {}", sched::stats::context_switches());
+    let _ = writeln!(writer, "btime {}", drivers::rtc::boot_time(uptime_secs));
+    let _ = writeln!(writer, "processes {}", sched::stats::processes_created());
+    let _ = writeln!(writer, "procs_running {}", sched::stats::running_now());
+    let _ = writeln!(writer, "procs_blocked 0"); /* we don't support this for now */
     writer.written()
 }
 
@@ -158,8 +244,8 @@ pub fn generate_partitions(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
     let _ = writeln!(
         writer,
-        "{:<3} {:<10} {:<10} {:<7} {:<10} {}",
-        "ID", "NAME", "KIND", "PARENT", "START_LBA", "SECTORS"
+        "{:<3} {:<10} {:<10} {:<7} {:<10} SECTORS",
+        "ID", "NAME", "KIND", "PARENT", "START_LBA"
     );
 
     for device_id in 0..drivers::MAX_BLOCK_DEVICES {
@@ -172,11 +258,7 @@ pub fn generate_partitions(buf: &mut [u8]) -> usize {
             .position(|&b| b == 0)
             .unwrap_or(device.name.len());
         let name = core::str::from_utf8(&device.name[..name_len]).unwrap_or("?");
-        let kind = if device.partition {
-            "partition"
-        } else {
-            "disk"
-        };
+        let kind = if device.partition { "partition" } else { "disk" };
         let parent_str = if device.partition {
             let parent_id = device.parent;
             let _ = writeln!(
@@ -198,92 +280,151 @@ pub fn generate_partitions(buf: &mut [u8]) -> usize {
     writer.written()
 }
 
+struct DeviceName([u8; 32]);
+
+impl core::fmt::Display for DeviceName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let len = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
+        f.write_str(core::str::from_utf8(&self.0[..len]).unwrap_or("?"))
+    }
+}
+
+fn device_name(device_id: drivers::BlockDeviceId) -> Option<DeviceName> {
+    drivers::device_at(device_id).map(|device| DeviceName(device.name))
+}
+
 pub fn generate_mounts(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
-    let _ = writeln!(
-        writer,
-        "{:<12} {:<10} {:<10} {}",
-        "device", "mountpoint", "filesystem", "options"
-    );
-
     fs::for_each_mount(|mount| {
-        let (dev_name, mount_point, fs_type, opts) = match mount.private_data {
-            fs::MountPrivate::Ext2(_) => ("/dev/hda1", "/", "ext2", "rw,relatime"),
-            fs::MountPrivate::Procfs => ("procfs", "/proc", "procfs", "ro,nosuid,nodev"),
-            fs::MountPrivate::Sysfs => ("sysfs", "/sys", "sysfs", "ro,nosuid,nodev"),
-            fs::MountPrivate::Raw => ("raw", "/mnt", "raw", "rw"),
+        let (fs_type, opts) = match mount.private_data {
+            fs::MountPrivate::Ext2(_) => ("ext2", "rw,relatime"),
+            fs::MountPrivate::Procfs => ("proc", "rw,nosuid,nodev,noexec"),
+            fs::MountPrivate::Sysfs => ("sysfs", "rw,nosuid,nodev,noexec"),
         };
-        let _ = writeln!(
-            writer,
-            "{:<12} {:<10} {:<10} {}",
-            dev_name, mount_point, fs_type, opts
-        );
+        let _ = match mount.private_data {
+            fs::MountPrivate::Ext2(_) => match device_name(mount.device) {
+                Some(name) => write!(writer, "/dev/{}", name),
+                None => write!(writer, "/dev/unknown"),
+            },
+            _ => write!(writer, "{}", fs_type),
+        };
+        let _ = writeln!(writer, " {} {} {} 0 0", mount.mount_point, fs_type, opts);
     });
-
     writer.written()
 }
 
 pub fn generate_interrupts(buf: &mut [u8]) -> usize {
+    use interrupts::stats::{IrqLabel, IrqSource};
+
     let mut writer = BufferWriter::new(buf);
-    let _ = writeln!(
-        writer,
-        "{:<5} {:<10} {:<16} {}",
-        "IRQ", "CONTROLLER", "DEVICE", "STATUS"
-    );
-    let _ = writeln!(
-        writer,
-        "{:<5} {:<10} {:<16} {}",
-        "0", "PIC/APIC", "timer", "enabled"
-    );
-    let _ = writeln!(
-        writer,
-        "{:<5} {:<10} {:<16} {}",
-        "1", "PIC", "keyboard", "enabled"
-    );
-    let _ = writeln!(
-        writer,
-        "{:<5} {:<10} {:<16} {}",
-        "14", "PCI/IDE", "ata_primary", "enabled"
-    );
-    let _ = writeln!(
-        writer,
-        "{:<5} {:<10} {:<16} {}",
-        "15", "PCI/IDE", "ata_secondary", "enabled"
-    );
+    let _ = write!(writer, "    ");
+    for cpu in online_cpus() {
+        // Width doesn't apply to format_args!, so pad by hand
+        let digits = if cpu >= 10 { 2 } else { 1 };
+        let _ = write!(writer, "{:>width$}CPU{}", "", cpu, width = 11 - 3 - digits);
+    }
+    let _ = writeln!(writer);
+
+    for source in IrqSource::ALL {
+        if !interrupts::stats::is_installed(source) {
+            continue;
+        }
+        let _ = match source.label() {
+            IrqLabel::Line(line) => write!(writer, "{:>3}:", line),
+            IrqLabel::Tag(tag) => write!(writer, "{:>3}:", tag),
+        };
+        for cpu in online_cpus() {
+            let _ = write!(writer, " {:>10}", interrupts::stats::count_on(source, cpu));
+        }
+        let _ = writeln!(writer, "   {}", source.description());
+    }
     writer.written()
 }
 
 pub fn generate_cmdline(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
-    let _ = writeln!(writer, "BOOT_IMAGE=/boot/kernel.bin quiet root=/dev/hda1");
+    let _ = writeln!(writer, "{}", paging::boot_cmdline());
     writer.written()
 }
 
 pub fn generate_devices(buf: &mut [u8]) -> usize {
     let mut writer = BufferWriter::new(buf);
     let _ = writeln!(writer, "Character devices:");
-    let _ = writeln!(writer, "  1 tty (virtual screens 1-6)");
-    let _ = writeln!(writer, "  5 /dev/tty");
+    for (major, name) in fs::dev::CHAR_DRIVERS {
+        let _ = writeln!(writer, "{:>3} {}", major, name);
+    }
     let _ = writeln!(writer);
     let _ = writeln!(writer, "Block devices:");
-    let _ = writeln!(writer, "  3 ide (ATA IDE Controller)");
+    let mut disk_index = 0;
+    for device_id in 0..drivers::MAX_BLOCK_DEVICES {
+        let Some(device) = drivers::device_at(device_id) else {
+            continue;
+        };
+        if device.partition {
+            continue;
+        }
+        if let (Some(major), Some(name)) =
+            (fs::dev::IDE_MAJORS.get(disk_index), device_name(device_id))
+        {
+            let _ = writeln!(writer, "{:>3} {}", major, name);
+        }
+        disk_index += 1;
+    }
     writer.written()
 }
 
 pub fn generate_loadavg(buf: &mut [u8]) -> usize {
-    let mut writer = BufferWriter::new(buf);
-    let mut running = 0usize;
-    let mut total = 0usize;
+    use sched::stats::{FIXED_1, FSHIFT};
 
-    for p in crate::sched::PROCESS_TABLE.lock().iter().flatten() {
-        total += 1;
-        if p.state == crate::sched::ProcessState::Running {
-            running += 1;
-        }
+    let mut writer = BufferWriter::new(buf);
+    for avg in sched::stats::load_averages() {
+        let avg = avg + FIXED_1 / 200;
+        let whole = avg >> FSHIFT;
+        let frac = ((avg & (FIXED_1 - 1)) * 100) >> FSHIFT;
+        let _ = write!(writer, "{}.{:02} ", whole, frac);
     }
 
-    let _ = writeln!(writer, "0.00 0.00 0.00 {}/{}", running, total);
+    let tasks = sched::PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .filter(|process| process.pid >= smp::MAX_CPUS as u32)
+        .count();
+    let _ = writeln!(
+        writer,
+        "{}/{} {}",
+        sched::stats::running_now(),
+        tasks,
+        sched::stats::last_pid()
+    );
     writer.written()
+}
+
+pub fn generate_printk(buf: &mut [u8]) -> usize {
+    let mut writer: BufferWriter<'_> = BufferWriter::new(buf);
+    let level = crate::log::LOG_LEVEL.load(core::sync::atomic::Ordering::Relaxed);
+    let _ = writeln!(writer, "{}", level);
+    writer.written()
+}
+
+pub fn write_printk(buffer: &[u8]) -> KResult<()> {
+    use crate::log::printk::KernelLogLevel;
+
+    let value = core::str::from_utf8(buffer).map_err(|_| KernelError::Inval)?;
+    let first = value.split_whitespace().next().ok_or(KernelError::Inval)?;
+    let level = match first.parse::<u8>().map_err(|_| KernelError::Inval)? {
+        0 => KernelLogLevel::Emerg,
+        1 => KernelLogLevel::Alert,
+        2 => KernelLogLevel::Crit,
+        3 => KernelLogLevel::Err,
+        4 => KernelLogLevel::Warning,
+        5 => KernelLogLevel::Notice,
+        6 => KernelLogLevel::Info,
+        7 => KernelLogLevel::Debug,
+        _ => return Err(KernelError::Inval),
+    };
+    crate::log::printk::set_log_level(level);
+    Ok(())
 }
 
 #[inline(always)]

@@ -5,10 +5,12 @@ pub(crate) struct KeyEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Modifiers(pub(crate) u16);
+#[repr(transparent)]
+pub struct Modifiers(pub(crate) u16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeyCode {
+#[repr(u8)]
+pub enum KeyCode {
     Backspace,
     Tab,
     Enter,
@@ -91,26 +93,4 @@ pub(crate) enum KeyCode {
     F10,
     F11,
     F12,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum KeyboardLayout {
-    UsQwerty = 0,
-    TrQwerty = 1,
-    GbQwerty = 2,
-
-    LayoutEnd = 3,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct Glyph {
-    pub(crate) base: char,
-    pub(crate) lvl2: char,
-    pub(crate) is_letter: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputMode {
-    EventDriven = 0,
-    Blocking = 1,
 }

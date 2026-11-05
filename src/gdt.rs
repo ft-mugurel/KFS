@@ -2,7 +2,10 @@ use core::{arch::asm, mem::size_of};
 
 use crate::smp::MAX_CPUS;
 
-use super::{KERNEL_CODE_SEL, KERNEL_DATA_SEL};
+pub const KERNEL_CODE_SEL: u16 = 1 << 3;
+pub const KERNEL_DATA_SEL: u16 = 2 << 3;
+pub const USER_CODE_SEL: u16 = (4 << 3) | 3;
+pub const USER_DATA_SEL: u16 = (5 << 3) | 3;
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -124,8 +127,8 @@ const DESC_TSS32: u16 = _DESC_PRESENT | _DESC_TSS_AVAIL;
 const fn make_entry(flags: u16, base: u32, limit: u32) -> GdtEntry {
     // Equivalent to Linux's GDT_ENTRY_INIT(flags, base, limit).
     GdtEntry {
-        limit0: ((limit >> 0) & 0xFFFF) as u16,
-        base0: ((base >> 0) & 0xFFFF) as u16,
+        limit0: (limit & 0xFFFF) as u16,
+        base0: (base & 0xFFFF) as u16,
         base1_flags: (((base >> 16) & 0x00FF) as u16) | ((flags & 0x00FF) << 8),
         limit1_flags_base2: (((limit >> 16) & 0x000F) as u16)
             | ((flags >> 8) & 0x00F0)
@@ -152,11 +155,10 @@ const fn build_gdt() -> [GdtEntry; GDT_ENTRIES_COUNT] {
 #[unsafe(link_section = ".gdt")]
 #[used]
 static mut GDT: [GdtEntry; GDT_ENTRIES_COUNT] = build_gdt();
-
-pub(crate) static mut TSS: [TaskStateSegment; MAX_CPUS] = [TaskStateSegment::new(); MAX_CPUS];
+static mut TSS: [TaskStateSegment; MAX_CPUS] = [TaskStateSegment::new(); MAX_CPUS];
 
 #[inline]
-pub fn tss_selector(cpu_id: usize) -> u16 {
+fn tss_selector(cpu_id: usize) -> u16 {
     ((GDT_TSS_BASE_INDEX + cpu_id) as u16) << 3
 }
 
@@ -164,31 +166,39 @@ pub fn tss_selector(cpu_id: usize) -> u16 {
 
 #[unsafe(link_section = ".init.text")]
 pub unsafe fn load_gdt_bsp() {
+    let tss_limit = (size_of::<TaskStateSegment>() - 1) as u32;
     for cpu in 0..MAX_CPUS {
-        let tss_base = &raw const TSS[cpu] as u32;
-        let tss_limit = (size_of::<TaskStateSegment>() - 1) as u32;
-        GDT[GDT_TSS_BASE_INDEX + cpu] = make_entry(DESC_TSS32, tss_base, tss_limit);
-        TSS[cpu].ss0 = KERNEL_DATA_SEL as u32;
-        TSS[cpu].iomap_base = size_of::<TaskStateSegment>() as u16;
+        unsafe {
+            let tss_base = &raw const TSS[cpu] as u32;
+            GDT[GDT_TSS_BASE_INDEX + cpu] = make_entry(DESC_TSS32, tss_base, tss_limit);
+            TSS[cpu].ss0 = KERNEL_DATA_SEL as u32;
+            TSS[cpu].iomap_base = size_of::<TaskStateSegment>() as u16;
+        }
     }
 
-    lgdt_and_reload_segments();
-    asm!(
-        "ltr ax",
-        in("ax") tss_selector(0),
-        options(nostack, preserves_flags)
-    );
+    unsafe { lgdt_and_reload_segments() };
+    // SAFETY: CPU 0's TSS descriptor was written above and the GDT is loaded.
+    // `ltr` marks it busy, which is why each CPU loads its own TSS once.
+    unsafe {
+        asm!(
+            "ltr ax",
+            in("ax") tss_selector(0),
+            options(nostack, preserves_flags)
+        );
+    }
     // BSP = cpu 0
 }
 
 #[unsafe(link_section = ".init.text")]
 pub unsafe fn load_gdt_ap(cpu_id: usize) {
-    lgdt_and_reload_segments();
-    asm!(
-        "ltr ax",
-        in("ax") tss_selector(cpu_id),
-        options(nostack, preserves_flags)
-    );
+    unsafe { lgdt_and_reload_segments() };
+    unsafe {
+        asm!(
+            "ltr ax",
+            in("ax") tss_selector(cpu_id),
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 #[unsafe(link_section = ".init.text")]
@@ -197,33 +207,36 @@ unsafe fn lgdt_and_reload_segments() {
         limit: (size_of::<[GdtEntry; GDT_ENTRIES_COUNT]>() - 1) as u16,
         base: &raw const GDT as u32,
     };
-    asm!("lgdt [{}]",
-    in(reg) &gdt_ptr,
-    options(nostack, preserves_flags));
-    asm!(
-        "mov ds, {kd:x}",
-        "mov es, {kd:x}",
-        "mov fs, {kd:x}",
-        "mov gs, {kd:x}",
-        "mov ss, {kd:x}",
-        "push {kc}",
-        "lea eax, [2f]",
-        "push eax",
-        "retf",
-        "2:",
-        kd = in(reg) KERNEL_DATA_SEL,
-        kc = const KERNEL_CODE_SEL,
-        out("eax") _,
-    );
+    unsafe {
+        asm!("lgdt [{}]",
+        in(reg) &gdt_ptr,
+        options(nostack, preserves_flags));
+        asm!(
+            "mov ds, {kd:x}",
+            "mov es, {kd:x}",
+            "mov fs, {kd:x}",
+            "mov gs, {kd:x}",
+            "mov ss, {kd:x}",
+            "push {kc}",
+            "lea eax, [2f]",
+            "push eax",
+            "retf",
+            "2:",
+            kd = in(reg) KERNEL_DATA_SEL,
+            kc = const KERNEL_CODE_SEL,
+            out("eax") _,
+        );
+    }
 }
 
 #[unsafe(link_section = ".init.text")]
-pub unsafe fn gdt_pointer_bytes() -> [u8; 6] {
-    let gdt_ptr = GdtPointer {
-        limit: (size_of::<[GdtEntry; GDT_ENTRIES_COUNT]>() - 1) as u16,
-        base: &raw const GDT as u32,
-    };
-    core::mem::transmute(gdt_ptr)
+pub fn gdt_pointer_bytes() -> [u8; 6] {
+    let limit = (size_of::<[GdtEntry; GDT_ENTRIES_COUNT]>() - 1) as u16;
+    let base = &raw const GDT as u32;
+    let mut bytes = [0u8; 6];
+    bytes[..2].copy_from_slice(&limit.to_le_bytes());
+    bytes[2..].copy_from_slice(&base.to_le_bytes());
+    bytes
 }
 
 pub fn set_kernel_stack_for_cpu(cpu_id: usize, esp0: u32) {

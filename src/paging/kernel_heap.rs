@@ -2,7 +2,7 @@ use super::page_table;
 use super::physical;
 use super::{KERNEL_SPACE_START, PAGE_SIZE, PAGE_WRITABLE};
 use crate::error::{KResult, KernelError};
-use crate::{pr_warn, pr_debug};
+use crate::{pr_debug, pr_warn};
 use core::mem::size_of;
 use core::ptr;
 
@@ -65,6 +65,8 @@ pub struct HeapStats {
 
 use crate::locks::Spinlock;
 
+// TODO: Move these into a wrapper.
+
 static HEAP_LOCK: Spinlock<()> = Spinlock::new(());
 static mut HEAP_READY: bool = false;
 static mut HEAP_CHUNKS: *mut HeapChunk = ptr::null_mut();
@@ -116,15 +118,13 @@ fn pages_for(size: usize) -> Option<usize> {
 
 fn pages_to_bytes(pages: usize) -> Option<u32> {
     let bytes = pages.checked_mul(PAGE_SIZE)?;
-    if bytes > u32::MAX as usize {
-        None
-    } else {
-        Some(bytes as u32)
-    }
+    if bytes > u32::MAX as usize { None } else { Some(bytes as u32) }
 }
 
 fn allocate_heap_virtual_span(span: u32) -> Option<u32> {
     unsafe {
+        #[allow(clippy::explicit_counter_loop)]
+        #[allow(clippy::needless_range_loop)]
         for i in 0usize..HEAP_FREE_RANGE_COUNT {
             let range = HEAP_FREE_RANGES[i];
             if range.size >= span {
@@ -167,7 +167,6 @@ fn insert_heap_virtual_span(mut base: u32, mut size: u32) -> bool {
             };
 
             if end == range.base {
-                base = range.base;
                 size = size.saturating_add(range.size);
                 let mut j = i;
                 while j + 1 < HEAP_FREE_RANGE_COUNT {
@@ -232,9 +231,8 @@ fn map_heap_pages(size: usize) -> Option<*mut u8> {
     let page_count = pages_for(size)?;
     let span = pages_to_bytes(page_count)?;
     let base = allocate_heap_virtual_span(span)?;
-    let mut mapped_pages = 0usize;
 
-    for i in 0usize..page_count {
+    for (mapped_pages, i) in (0usize..page_count).enumerate() {
         let frame = match physical::alloc_physical_page() {
             Ok(frame) => frame,
             Err(_) => {
@@ -251,8 +249,6 @@ fn map_heap_pages(size: usize) -> Option<*mut u8> {
             let _ = insert_heap_virtual_span(base, span);
             return None;
         }
-
-        mapped_pages += 1;
     }
 
     Some(base as *mut u8)
@@ -293,7 +289,7 @@ fn provision_heap_chunk(min_block_total_size: usize) -> bool {
         Some(size) => size,
         None => {
             pr_warn!(
-                "kernel heap chunk size overflow min_block_total_size={}\n",
+                "kernel heap chunk size overflow min_block_total_size={}",
                 min_block_total_size
             );
             return false;
@@ -304,7 +300,7 @@ fn provision_heap_chunk(min_block_total_size: usize) -> bool {
         Some(ptr) => ptr as *mut HeapChunk,
         None => {
             pr_warn!(
-                "kernel heap failed to provision chunk size={}\n",
+                "kernel heap failed to provision chunk size={}",
                 chunk_total_size
             );
             return false;
@@ -327,7 +323,7 @@ fn provision_heap_chunk(min_block_total_size: usize) -> bool {
 
         if first_block_total_size < minimum_free_block_size() {
             pr_warn!(
-                "kernel heap chunk too small chunk_size={} first_block_total={}\n",
+                "kernel heap chunk too small chunk_size={} first_block_total={}",
                 chunk_total_size,
                 first_block_total_size
             );
@@ -348,7 +344,7 @@ fn provision_heap_chunk(min_block_total_size: usize) -> bool {
         free_list_push(first_block);
 
         pr_debug!(
-            "kernel heap provisioned chunk base={:#x} size={} free_block_total={}\n",
+            "kernel heap provisioned chunk base={:#x} size={} free_block_total={}",
             chunk as usize,
             chunk_total_size,
             first_block_total_size
@@ -542,11 +538,11 @@ fn release_chunk_if_empty(block: *mut BlockHeader) -> bool {
         let first_block = (chunk as *mut u8).add(chunk_header_size()) as *mut BlockHeader;
         let full_free_span = (*chunk).total_size - chunk_header_size();
 
-        if block as usize == first_block as usize && (*block).total_size == full_free_span {
+        if core::ptr::eq(block, first_block) && (*block).total_size == full_free_span {
             chunk_list_remove(chunk);
             if !unmap_heap_pages(chunk as *mut u8, (*chunk).total_size) {
                 pr_warn!(
-                    "kernel heap failed to return chunk pages base={:#x}\n",
+                    "kernel heap failed to return chunk pages base={:#x}",
                     chunk as usize
                 );
             }
@@ -557,20 +553,15 @@ fn release_chunk_if_empty(block: *mut BlockHeader) -> bool {
     false
 }
 
-pub fn init_kernel_heap() {
+pub unsafe fn init_kernel_heap() {
     unsafe {
-        HEAP_READY = true;
-        HEAP_CHUNKS = ptr::null_mut();
-        HEAP_FREE_LIST = ptr::null_mut();
-        for i in 0usize..HEAP_MAX_FREE_RANGES {
-            HEAP_FREE_RANGES[i] = HeapFreeRange { base: 0, size: 0 };
-        }
         HEAP_FREE_RANGES[0] =
             HeapFreeRange { base: HEAP_VM_START, size: HEAP_VM_END - HEAP_VM_START };
         HEAP_FREE_RANGE_COUNT = 1;
+        HEAP_READY = true;
     }
 
-    pr_debug!("kernel heap initialized\n");
+    pr_debug!("kernel heap initialized");
 }
 
 fn ensure_heap_ready() {
@@ -584,25 +575,25 @@ fn ensure_heap_ready() {
 #[inline(never)]
 pub fn kmalloc(size: usize) -> KResult<*mut u8> {
     if size == 0 {
-        pr_warn!("kmalloc rejected zero-sized request\n");
-        return Err(KernelError::EINVAL);
+        pr_warn!("kmalloc rejected zero-sized request");
+        return Err(KernelError::Inval);
     }
 
     let _guard = HEAP_LOCK.lock();
     ensure_heap_ready();
 
     let payload_size = align_up(size, HEAP_ALIGNMENT).ok_or_else(|| {
-        pr_warn!("kmalloc size overflow size={}\n", size);
-        KernelError::ENOMEM
+        pr_warn!("kmalloc size overflow size={}", size);
+        KernelError::NoMem
     })?;
     let total_size = align_up(block_alignment_overhead() + payload_size, HEAP_ALIGNMENT)
         .ok_or_else(|| {
             pr_warn!(
-                "kmalloc total size overflow size={} payload={}\n",
+                "kmalloc total size overflow size={} payload={}",
                 size,
                 payload_size
             );
-            KernelError::ENOMEM
+            KernelError::NoMem
         })?;
 
     unsafe {
@@ -610,11 +601,11 @@ pub fn kmalloc(size: usize) -> KResult<*mut u8> {
         if block.is_none() {
             if !provision_heap_chunk(total_size) {
                 pr_debug!(
-                    "\x1b\x04mkmalloc\x1bm: no free block found for size={} total_size={}\n",
+                    "\x1b\x04mkmalloc\x1bm: no free block found for size={} total_size={}",
                     size,
                     total_size
                 );
-                return Err(KernelError::ENOMEM);
+                return Err(KernelError::NoMem);
             }
             block = find_free_block(total_size);
         }
@@ -623,11 +614,11 @@ pub fn kmalloc(size: usize) -> KResult<*mut u8> {
             Some(block) => block,
             None => {
                 pr_warn!(
-                    "kmalloc allocator inconsistency size={} total_size={}\n",
+                    "kmalloc allocator inconsistency size={} total_size={}",
                     size,
                     total_size
                 );
-                return Err(KernelError::EFAULT);
+                return Err(KernelError::Fault);
             }
         };
         free_list_remove(block);
@@ -643,7 +634,7 @@ pub fn kmalloc(size: usize) -> KResult<*mut u8> {
 
         let user_ptr = (block as *mut u8).add(block_header_size());
         pr_debug!(
-            "kmalloc size={} usable={} total={} ptr={:#x}\n",
+            "kmalloc size={} usable={} total={} ptr={:#x}",
             size,
             payload_size,
             (*block).total_size,
@@ -656,8 +647,8 @@ pub fn kmalloc(size: usize) -> KResult<*mut u8> {
 #[inline(never)]
 pub fn kfree(ptr: *mut u8) -> KResult<()> {
     if ptr.is_null() {
-        pr_warn!("kfree rejected null pointer\n");
-        return Err(KernelError::EINVAL);
+        pr_warn!("kfree rejected null pointer");
+        return Err(KernelError::Inval);
     }
 
     let _guard = HEAP_LOCK.lock();
@@ -666,20 +657,20 @@ pub fn kfree(ptr: *mut u8) -> KResult<()> {
     unsafe {
         let block = ptr.sub(block_header_size()) as *mut BlockHeader;
         if (*block).magic != BLOCK_MAGIC {
-            pr_warn!("kfree rejected unknown pointer={:#x}\n", ptr as usize);
-            return Err(KernelError::EINVAL);
+            pr_warn!("kfree rejected unknown pointer={:#x}", ptr as usize);
+            return Err(KernelError::Inval);
         }
 
         if (*block).free != 0 {
-            pr_warn!("kfree rejected double free ptr={:#x}\n", ptr as usize);
-            return Err(KernelError::EINVAL);
+            pr_warn!("kfree rejected double free ptr={:#x}", ptr as usize);
+            return Err(KernelError::Inval);
         }
 
         let chunk = match heap_chunk_from_block(block) {
             Some(chunk) => chunk,
             None => {
-                pr_warn!("kfree rejected corrupted chunk ptr={:#x}\n", ptr as usize);
-                return Err(KernelError::EINVAL);
+                pr_warn!("kfree rejected corrupted chunk ptr={:#x}", ptr as usize);
+                return Err(KernelError::Inval);
             }
         };
 
@@ -689,25 +680,27 @@ pub fn kfree(ptr: *mut u8) -> KResult<()> {
 
         let mut merged = block;
 
-        if let Some(next) = next_block_ptr(merged) {
-            if (*next).magic == BLOCK_MAGIC && (*next).free != 0 {
-                free_list_remove(next);
-                (*merged).total_size += (*next).total_size;
-                (*merged).usable_size = (*merged).total_size - block_alignment_overhead();
-                write_footer(merged);
-            }
+        if let Some(next) = next_block_ptr(merged)
+            && (*next).magic == BLOCK_MAGIC
+            && (*next).free != 0
+        {
+            free_list_remove(next);
+            (*merged).total_size += (*next).total_size;
+            (*merged).usable_size = (*merged).total_size - block_alignment_overhead();
+            write_footer(merged);
         }
 
-        if let Some(prev) = prev_block_ptr(merged) {
-            if (*prev).magic == BLOCK_MAGIC && (*prev).free != 0 {
-                free_list_remove(prev);
-                (*prev).total_size += (*merged).total_size;
-                (*prev).usable_size = (*prev).total_size - block_alignment_overhead();
-                (*prev).free = 1;
-                (*prev).requested_size = 0;
-                write_footer(prev);
-                merged = prev;
-            }
+        if let Some(prev) = prev_block_ptr(merged)
+            && (*prev).magic == BLOCK_MAGIC
+            && (*prev).free != 0
+        {
+            free_list_remove(prev);
+            (*prev).total_size += (*merged).total_size;
+            (*prev).usable_size = (*prev).total_size - block_alignment_overhead();
+            (*prev).free = 1;
+            (*prev).requested_size = 0;
+            write_footer(prev);
+            merged = prev;
         }
 
         if release_chunk_if_empty(merged) {
@@ -718,7 +711,7 @@ pub fn kfree(ptr: *mut u8) -> KResult<()> {
         free_list_push(merged);
         write_footer(merged);
         pr_debug!(
-            "kfree ptr={:#x} total={} merged_block={:#x}\n",
+            "kfree ptr={:#x} total={} merged_block={:#x}",
             ptr as usize,
             (*merged).total_size,
             merged as usize
@@ -730,7 +723,7 @@ pub fn kfree(ptr: *mut u8) -> KResult<()> {
 #[inline(never)]
 pub fn ksize(ptr: *const u8) -> KResult<usize> {
     if ptr.is_null() {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let _guard = HEAP_LOCK.lock();
@@ -739,12 +732,12 @@ pub fn ksize(ptr: *const u8) -> KResult<usize> {
     unsafe {
         let block = ptr.sub(block_header_size()) as *const BlockHeader;
         if (*block).magic != BLOCK_MAGIC || (*block).free != 0 {
-            return Err(KernelError::EFAULT);
+            return Err(KernelError::Fault);
         }
 
         let chunk = (*block).chunk;
         if chunk.is_null() || (*chunk).magic != HEAP_MAGIC {
-            return Err(KernelError::EFAULT);
+            return Err(KernelError::Fault);
         }
 
         Ok((*block).requested_size)
@@ -824,6 +817,74 @@ pub fn debug_stats() -> HeapStats {
     }
 }
 
+pub(crate) fn span_coalesce_selftest(check: &mut dyn FnMut(&'static str, bool)) {
+    const B: u32 = 0x1000_0000;
+    const P: u32 = PAGE_SIZE as u32;
+
+    fn only_range(base: u32, size: u32) -> bool {
+        unsafe {
+            HEAP_FREE_RANGE_COUNT == 1
+                && HEAP_FREE_RANGES[0].base == base
+                && HEAP_FREE_RANGES[0].size == size
+        }
+    }
+
+    fn set_ranges(ranges: &[(u32, u32)]) {
+        unsafe {
+            for (i, &(base, size)) in ranges.iter().enumerate() {
+                HEAP_FREE_RANGES[i] = HeapFreeRange { base, size };
+            }
+            HEAP_FREE_RANGE_COUNT = ranges.len();
+        }
+    }
+
+    let _guard = HEAP_LOCK.lock();
+    // SAFETY: HEAP_LOCK is held, so nothing else touches the free-range table
+    // until it is restored at the end; the fake addresses are never mapped.
+    unsafe {
+        let saved = HEAP_FREE_RANGES;
+        let saved_count = HEAP_FREE_RANGE_COUNT;
+
+        // Freed span directly below a free range: the merge keeps the lower base.
+        set_ranges(&[(B + 3 * P, P)]);
+        check(
+            "heap span merges with following range",
+            insert_heap_virtual_span(B, 3 * P) && only_range(B, 4 * P),
+        );
+        check(
+            "heap merged span allocatable from its base",
+            allocate_heap_virtual_span(4 * P) == Some(B) && HEAP_FREE_RANGE_COUNT == 0,
+        );
+
+        // Freed span directly above a free range.
+        set_ranges(&[(B, P)]);
+        check(
+            "heap span merges with preceding range",
+            insert_heap_virtual_span(B + P, 2 * P) && only_range(B, 3 * P),
+        );
+
+        // Freed span filling the hole between two free ranges.
+        set_ranges(&[(B, P), (B + 2 * P, P)]);
+        check(
+            "heap span fills hole between ranges",
+            insert_heap_virtual_span(B + P, P) && only_range(B, 3 * P),
+        );
+
+        // Non-adjacent span stays separate and sorted.
+        set_ranges(&[(B + 4 * P, P)]);
+        check(
+            "heap disjoint span inserted sorted",
+            insert_heap_virtual_span(B, P)
+                && HEAP_FREE_RANGE_COUNT == 2
+                && HEAP_FREE_RANGES[0].base == B
+                && HEAP_FREE_RANGES[1].base == B + 4 * P,
+        );
+
+        HEAP_FREE_RANGES = saved;
+        HEAP_FREE_RANGE_COUNT = saved_count;
+    }
+}
+
 pub struct HeapBuffer {
     ptr: *mut u8,
     size: usize,
@@ -843,12 +904,6 @@ impl HeapBuffer {
     #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn size(&self) -> usize {
-        self.size
     }
 }
 

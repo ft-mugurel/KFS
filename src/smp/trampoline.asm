@@ -1,9 +1,6 @@
 BITS 16
 ORG 0x8000
 
-%define MAX_CPUS 8
-%define STACK_SIZE 4096
-
 trampoline_start:
     cli
     xor ax, ax
@@ -28,20 +25,16 @@ trampoline_pm32:
     mov gs, ax
     mov ss, ax
 
-    ; temporary stack, just enough to call into Rust, real per-cpu stack gets
-    ; swapped in immediately inside ap_entry()
-    mov eax, [tr_cpu_id]
-    inc eax
-    imul eax, eax, STACK_SIZE
-    add eax, tr_tmp_stack
-    mov esp, eax
-
     mov eax, [tr_cr3]          ; physical addr of the SAME page directory the BSP uses
     mov cr3, eax
 
     mov eax, cr0
     or eax, 0x80000000
     mov cr0, eax               ; PG=1, paging on, using existing kernel mapping
+
+    ; this CPU's idle stack, ThreadInfo already set up by the BSP in start_ap();
+    ; loaded only after PG=1 so it stays valid if the kernel moves to higher half
+    mov esp, [tr_stack_top]
 
     mov eax, [tr_cpu_id]       ; which slot in acpi cpu list this core corresponds to
     push eax
@@ -58,7 +51,6 @@ tr_gdt_ptr:       dw 0            ; filled in at runtime: same GdtPointer as gdt
 tr_cr3:           dd 0
 tr_cpu_id:        dd 0
 tr_ap_entry_addr: dd 0
-tr_tmp_stack:     times (MAX_CPUS * STACK_SIZE) db 0
-tr_tmp_stack_top:
+tr_stack_top:     dd 0
 
 trampoline_end:

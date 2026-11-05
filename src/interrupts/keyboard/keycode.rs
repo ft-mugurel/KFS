@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::types::{KeyCode, KeyEvent, Modifiers};
 
 impl Modifiers {
@@ -26,20 +24,8 @@ impl Modifiers {
         (self.0 & Self::ALT) != 0
     }
 
-    pub fn super_key(self) -> bool {
-        (self.0 & Self::SUPER) != 0
-    }
-
     pub fn caps_lock(self) -> bool {
         (self.0 & Self::CAPS_LOCK) != 0
-    }
-
-    pub fn alt_gr(self) -> bool {
-        (self.0 & Self::ALT_GR) != 0
-    }
-
-    pub fn has_text_blocking_modifier(self) -> bool {
-        self.ctrl() || self.alt() || self.super_key() || self.alt_gr()
     }
 
     fn set_flag(&mut self, flag: u16, enabled: bool) {

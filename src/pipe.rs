@@ -49,72 +49,77 @@ pub(crate) fn create_pipe() -> KResult<PipeId> {
             return Ok(i);
         }
     }
-    Err(KernelError::ENFILE)
+    Err(KernelError::NFile)
 }
 
+/// Reads buffered bytes from the pipe. When it is empty but still has
+/// writers, puts the current task on the pipe's read queue (Waiting) and
+/// returns `EAGAIN`. When no writers left it returns 0 (EOF).
 pub(crate) unsafe fn pipe_read(pipe_id: PipeId, buf: &mut [u8]) -> KResult<usize> {
     if pipe_id >= MAX_PIPES {
-        return Err(KernelError::EBADF);
+        return Err(KernelError::BadF);
     }
 
     let mut pipes = PIPES.lock();
     let pipe = &mut pipes[pipe_id];
 
     if !pipe.in_use {
-        return Err(KernelError::EBADF);
+        return Err(KernelError::BadF);
     }
 
     if pipe.count == 0 {
         if pipe.writers == 0 {
             return Ok(0);
         }
-        pipe.read_wq.sleep();
+        unsafe { pipe.read_wq.sleep() };
         drop(pipes);
-        return Err(KernelError::EAGAIN);
+        return Err(KernelError::Again);
     }
 
     let to_read = buf.len().min(pipe.count);
-    for i in 0..to_read {
-        buf[i] = pipe.data[pipe.read_pos];
+    for buf_pos in buf.iter_mut().take(to_read) {
+        *buf_pos = pipe.data[pipe.read_pos];
         pipe.read_pos = (pipe.read_pos + 1) % PIPE_BUF_SIZE;
     }
     pipe.count -= to_read;
 
-    pipe.write_wq.wake_one();
+    // SAFETY: waking only takes PROCESS_TABLE, which nests inside PIPES.
+    unsafe { pipe.write_wq.wake_one() };
 
     Ok(to_read)
 }
 
 pub(crate) unsafe fn pipe_write(pipe_id: PipeId, buf: &[u8]) -> KResult<usize> {
     if pipe_id >= MAX_PIPES {
-        return Err(KernelError::EBADF);
+        return Err(KernelError::BadF);
     }
 
     let mut pipes = PIPES.lock();
     let pipe = &mut pipes[pipe_id];
 
     if !pipe.in_use {
-        return Err(KernelError::EBADF);
+        return Err(KernelError::BadF);
     }
 
     if pipe.readers == 0 {
-        return Err(KernelError::EPIPE);
+        return Err(KernelError::Pipe);
     }
 
     if pipe.count >= PIPE_BUF_SIZE {
-        pipe.write_wq.sleep();
+        unsafe { pipe.write_wq.sleep() };
         drop(pipes);
-        return Err(KernelError::EAGAIN);
+        return Err(KernelError::Again);
     }
 
     let space = PIPE_BUF_SIZE - pipe.count;
     let to_write = buf.len().min(space);
-    for i in 0..to_write {
-        pipe.data[pipe.write_pos] = buf[i];
+
+    for buf_pos in buf.iter().take(to_write) {
+        pipe.data[pipe.write_pos] = *buf_pos;
         pipe.write_pos = (pipe.write_pos + 1) % PIPE_BUF_SIZE;
     }
     pipe.count += to_write;
-    pipe.read_wq.wake_one();
+    unsafe { pipe.read_wq.wake_one() };
 
     Ok(to_write)
 }

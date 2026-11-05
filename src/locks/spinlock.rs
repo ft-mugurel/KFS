@@ -21,20 +21,18 @@ impl<T> Spinlock<T> {
 
     #[inline(never)]
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
-        unsafe {
-            let flags = read_eflags();
-            disable_interrupts();
+        let flags = read_eflags();
+        disable_interrupts();
 
-            while self
-                .is_locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-
-            SpinlockGuard { lock: self, saved_flags: flags }
+        while self
+            .is_locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
         }
+
+        SpinlockGuard { lock: self, saved_flags: flags }
     }
 }
 

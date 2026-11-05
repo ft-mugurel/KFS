@@ -12,16 +12,18 @@ static PARKED_CORES: AtomicU32 = AtomicU32::new(0);
 #[unsafe(link_section = ".init.text")]
 pub fn init_ipi() {
     interrupts::register_interrupt_handler(SHUTDOWN_VECTOR, shutdown_ipi_handler);
+    interrupts::stats::mark_installed(interrupts::stats::IrqSource::ShutdownIpi);
 }
 
 pub unsafe fn send_shutdown_ipi_to_others() {
-    lapic::send_ipi_all_excluding_self(SHUTDOWN_VECTOR);
+    unsafe { lapic::send_ipi_all_excluding_self(SHUTDOWN_VECTOR) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shutdown_ipi_handler() {
+    interrupts::stats::count(interrupts::stats::IrqSource::ShutdownIpi);
     PARKED_CORES.fetch_add(1, Ordering::SeqCst);
-    lapic::send_eoi();
+    unsafe { lapic::send_eoi() };
     x86::disable_interrupts();
     loop {
         x86::hlt();
@@ -29,10 +31,10 @@ pub unsafe extern "C" fn shutdown_ipi_handler() {
 }
 
 pub unsafe fn request_shutdown() {
-    let _ = crate::printk::file_logger::flush_to_file();
-    let _ = crate::fs::buffer_cache::bsync();
+    let _ = crate::log::file_logger::flush_to_file();
+    let _ = unsafe { crate::fs::buffer_cache::bsync() };
 
-    send_shutdown_ipi_to_others();
+    unsafe { send_shutdown_ipi_to_others() };
 
     let expected = super::cpu::online_count() as u32 - 1;
     let mut waited = 0u32;
@@ -40,9 +42,9 @@ pub unsafe fn request_shutdown() {
         waited += 1;
     }
     if waited >= 1_000_000 {
-        pr_warn!("shutdown: not all cores parked in time, powering off anyway\n");
+        pr_warn!("shutdown: not all cores parked in time, powering off anyway");
     }
 
     x86::disable_interrupts();
-    outw(0x604, 0x2000);
+    unsafe { outw(0x604, 0x2000) };
 }

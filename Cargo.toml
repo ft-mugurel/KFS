@@ -18,9 +18,9 @@ test = false
 bench = false
 
 [dependencies]
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-sha2 = { version = "0.10", default-features = false }
-
+kfs-abi = { path = "abi" }
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11.1", default-features = false }
 
 [build-dependencies]
-rustc-demangle = "0.1"
+rustc-demangle = "0.1.28"

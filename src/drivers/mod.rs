@@ -1,14 +1,15 @@
 mod block_device;
 mod ide;
 mod pci;
+pub mod rtc;
 
 use crate::error::KResult;
 
 pub const SECTOR_SIZE: usize = 512;
 
 pub use block_device::{
-    device_at, read_from_device, read_sectors, write_sectors, write_to_device, BlockDevice,
-    BlockDeviceId, MAX_BLOCK_DEVICES,
+    BlockDevice, BlockDeviceId, MAX_BLOCK_DEVICES, device_at, read_from_device, read_sectors,
+    write_sectors, write_to_device,
 };
 
 pub fn first_ext2_partition() -> Option<BlockDeviceId> {
@@ -43,7 +44,7 @@ pub fn init() -> KResult<()> {
         let device_count = block_device::discover_mbr_partitions(device_id)?;
         if device_count == 0 {
             crate::pr_warn!(
-                "No MBR partitions discovered on block device {}\n",
+                "No MBR partitions discovered on block device {}",
                 device_id
             );
         }
@@ -52,4 +53,3 @@ pub fn init() -> KResult<()> {
 }
 
 crate::arch_initcall!(init);
-

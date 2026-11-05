@@ -1,1 +1,5 @@
+edition = "2024"
+style_edition = "2024"
 struct_lit_width = 55
+single_line_if_else_max_width = 65
+single_line_let_else_max_width = 65

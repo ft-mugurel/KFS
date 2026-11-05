@@ -2,6 +2,7 @@ use crate::{
     drivers::{self, SECTOR_SIZE},
     error::{KResult, KernelError},
     locks::Spinlock,
+    pr_warn,
 };
 
 pub const CACHE_SIZE: usize = 128;
@@ -56,7 +57,7 @@ const MAX_WAIT_CYCLES: usize = 50_000_000;
 
 pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<*mut BufferHead> {
     if block_size == 0 || (block_size as usize) > BUFFER_SIZE {
-        return Err(KernelError::EINVAL);
+        return Err(KernelError::Inval);
     }
 
     let mut attempts = 0;
@@ -67,23 +68,24 @@ pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<
         let counter = state.access_counter;
 
         // 1. Check if the block is already in the cache
-        let mut found_idx = None;
-        let mut in_progress = false;
+        // let mut found_idx = None;
+        // let mut in_progress = false;
 
-        for i in 0..CACHE_SIZE {
-            let bh = &state.buffers[i];
-            if bh.device_id == device_id
-                && bh.block_num == block_num
-                && (bh.is_valid || bh.io_in_progress)
-            {
-                if bh.io_in_progress {
-                    in_progress = true;
-                } else if bh.is_valid {
-                    found_idx = Some(i);
-                }
-                break;
-            }
-        }
+        let (in_progress, found_bh) = state
+            .buffers
+            .iter_mut()
+            .find(|bh| {
+                bh.device_id == device_id
+                    && bh.block_num == block_num
+                    && (bh.is_valid || bh.io_in_progress)
+            })
+            .map(|bh| {
+                (
+                    bh.io_in_progress,
+                    if bh.io_in_progress { None } else { Some(bh) },
+                )
+            })
+            .unwrap_or((false, None));
 
         if in_progress {
             drop(state);
@@ -91,17 +93,16 @@ pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<
             attempts += 1;
             if attempts > MAX_WAIT_CYCLES {
                 crate::pr_err!(
-                    "Buffer Cache: Timeout waiting for block {} on device {}\n",
+                    "Buffer Cache: Timeout waiting for block {} on device {}",
                     block_num,
                     device_id
                 );
-                return Err(KernelError::EBUSY);
+                return Err(KernelError::Busy);
             }
             continue;
         }
 
-        if let Some(idx) = found_idx {
-            let bh = &mut state.buffers[idx];
+        if let Some(bh) = found_bh {
             bh.ref_count += 1;
             bh.last_accessed = counter;
             let ptr = bh as *mut BufferHead;
@@ -113,16 +114,15 @@ pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<
         let mut eviction_idx = None;
         let mut oldest_access = u64::MAX;
 
-        for i in 0..CACHE_SIZE {
-            let bh = &state.buffers[i];
+        for (ndx, bh) in state.buffers.iter().enumerate() {
             if bh.ref_count == 0 && !bh.io_in_progress {
                 if !bh.is_valid {
-                    eviction_idx = Some(i);
+                    eviction_idx = Some(ndx);
                     break;
                 }
                 if bh.last_accessed < oldest_access {
                     oldest_access = bh.last_accessed;
-                    eviction_idx = Some(i);
+                    eviction_idx = Some(ndx);
                 }
             }
         }
@@ -133,10 +133,10 @@ pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<
             attempts += 1;
             if attempts > MAX_WAIT_CYCLES {
                 crate::pr_err!(
-                    "Buffer Cache: All {} buffers locked, deadlock avoided\n",
+                    "Buffer Cache: All {} buffers locked, deadlock avoided",
                     CACHE_SIZE
                 );
-                return Err(KernelError::ENOMEM);
+                return Err(KernelError::NoMem);
             }
             continue;
         };
@@ -169,7 +169,7 @@ pub unsafe fn bread(device_id: u32, block_num: u32, block_size: u32) -> KResult<
             bh.io_in_progress = false;
             bh.ref_count = 0;
             if let Err(e) = res {
-                crate::pr_err!("Buffer Cache: Failed to flush victim block {}\n", old_block);
+                crate::pr_err!("Buffer Cache: Failed to flush victim block {}", old_block);
                 return Err(e);
             }
             bh.is_dirty = false;
@@ -233,10 +233,11 @@ pub unsafe fn brelse(bh: *mut BufferHead) {
         return;
     }
     let _guard = BUFFER_CACHE.lock();
-    if (*bh).ref_count > 0 {
-        (*bh).ref_count -= 1;
+    let bh = &mut *bh;
+    if bh.ref_count > 0 {
+        bh.ref_count -= 1;
     } else {
-        crate::pr_warn!("Buffer Cache: Attempted to release unreferenced buffer.\n");
+        pr_warn!("Buffer Cache: Attempted to release unreferenced buffer.");
     }
 }
 
@@ -287,14 +288,14 @@ pub unsafe fn bsync() -> KResult<()> {
 
 pub unsafe fn bforget(device_id: u32, block_num: u32) {
     let mut state = BUFFER_CACHE.lock();
-    for i in 0..CACHE_SIZE {
-        let bh = &mut state.buffers[i];
-        if bh.is_valid && bh.device_id == device_id && bh.block_num == block_num {
-            bh.is_valid = false;
-            bh.is_dirty = false;
-            bh.ref_count = 0;
-            break;
-        }
+    if let Some(buffer_head) = state
+        .buffers
+        .iter_mut()
+        .find(|bh| bh.is_valid && bh.device_id == device_id && bh.block_num == block_num)
+    {
+        buffer_head.is_valid = false;
+        buffer_head.is_dirty = false;
+        buffer_head.ref_count = 0;
     }
 }
 
